@@ -1,7 +1,11 @@
 import os
+import re
 import glob
 import pandas as pd
 from functools import reduce
+
+# TODO: 存檔時依照座標分數個資料夾存
+
 
 # 定義檢查並刪除高比例零值的函數
 def remove_high_zero_columns(df, threshold=0.05):
@@ -25,7 +29,6 @@ ext_df['hoilday'] = pd.to_numeric(ext_df['hoilday'], errors='coerce').fillna(0).
 ext_df['降水量'] = ext_df['降水量'].replace('T', 0.1)
 ext_df['降水量'] = pd.to_numeric(ext_df['降水量'])
 
-# TODO: 檢查ext_df，針對每個時間欄，有缺失值則直接拿掉該欄
 ext_df = ext_df.fillna(0)
 
 # 假設外部檔案第一欄標題為「時間」，轉換為 datetime 格式
@@ -80,6 +83,32 @@ final_df['時'] = final_df['時間'].dt.hour
 # 依據時間排序並重設索引
 final_df.sort_values("時間", inplace=True)
 final_df.reset_index(drop=True, inplace=True)
+
+def fix_coordinate_column_names(df):
+    # 建立新的欄位映射字典
+    new_columns = {}
+    # 正規表達式：第一組捕捉正確格式的座標，第二組捕捉可能存在的後綴
+    pattern = re.compile(r"(\(.*?\))(_.*)?")
+    for col in df.columns:
+        # 嘗試完全匹配欄位名稱
+        match = pattern.fullmatch(col)
+        if match:
+            # 使用第一組 (正確的座標部分) 作為新的名稱
+            correct_name = match.group(1)
+            # 若新名稱與原名稱不同，則記錄映射關係
+            if correct_name != col:
+                new_columns[col] = correct_name
+    # 重新命名 DataFrame 的欄位
+    df.rename(columns=new_columns, inplace=True)
+    return df
+
+# 在輸出 final_df 之前先修正座標欄位名稱
+final_df = fix_coordinate_column_names(final_df)
+
+# TODO: 檢查座標是否有格式不對的
+
+# TODO: 拿掉2020以後的資料
+
 
 # 輸出最終合併結果至單一檔案
 output_file = os.path.join(folder_path, "all_merged_5X5.csv")

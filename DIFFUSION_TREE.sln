@@ -1,0 +1,23 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.12.35209.166
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{888888A0-9F3D-457C-B088-3A5042F75D52}") = "DIFFUSION_TREE", "DIFFUSION_TREE.pyproj", "{734638C2-4D71-4079-9CFC-8364A61D10D4}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{734638C2-4D71-4079-9CFC-8364A61D10D4}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{734638C2-4D71-4079-9CFC-8364A61D10D4}.Release|Any CPU.ActiveCfg = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {6FB7973B-798F-4812-8C93-B62A6925B4C1}
+	EndGlobalSection
+EndGlobal

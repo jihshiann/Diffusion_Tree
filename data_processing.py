@@ -1,20 +1,32 @@
 import os
-import re
 import glob
+import re
 import pandas as pd
 from functools import reduce
 
-# TODO: 存檔時依照座標分數個資料夾存
-
-
 # 定義檢查並刪除高比例零值的函數
 def remove_high_zero_columns(df, threshold=0.05):
-    # 計算每列中零值的比例
+    # 計算每欄中零值的比例
     zero_ratio = (df == 0).mean(axis=0)
-    # 找出零值比例超過閾值的列
+    # 找出零值比例超過閾值的欄位
     columns_to_remove = zero_ratio[zero_ratio > threshold].index
-    # 刪除這些列
+    # 刪除這些欄位
     df.drop(columns=columns_to_remove, inplace=True)
+    return df
+
+# 定義針對每個座標欄位，將0或空值改成該座標欄位前一筆的值(前一小時)
+def fill_zero_with_previous(df):
+    # 對除了「時間」之外的所有欄位進行處理
+    cols = df.columns.drop("時間")
+    for col in cols:
+        # 將0值替換成NA
+        df[col] = df[col].replace(0, pd.NA)
+        # 用前一筆資料填補
+        df[col] = df[col].ffill()
+        # 若仍有缺失值（例如第一筆），以0填補
+        df[col] = df[col].fillna(0)
+        # 轉為整數
+        df[col] = df[col].astype(int)
     return df
 
 # 讀取外部天氣資料 (External.txt)
@@ -29,7 +41,8 @@ ext_df['hoilday'] = pd.to_numeric(ext_df['hoilday'], errors='coerce').fillna(0).
 ext_df['降水量'] = ext_df['降水量'].replace('T', 0.1)
 ext_df['降水量'] = pd.to_numeric(ext_df['降水量'])
 
-ext_df = ext_df.fillna(0)
+# 檢查 ext_df，針對每個時間資料（除「時間」欄之外），若有缺失值則直接拿掉該列
+ext_df = ext_df.dropna()
 
 # 假設外部檔案第一欄標題為「時間」，轉換為 datetime 格式
 ext_df['時間'] = pd.to_datetime(ext_df['時間'])
@@ -45,24 +58,19 @@ dfs = []
 for file_path in csv_files:
     df = pd.read_csv(file_path)
     
-    # 假設第一欄即為時間，取出第一欄名稱，轉換為 datetime 格式，並重新命名為 "時間"
+    # 假設第一欄即為時間，轉換為 datetime 格式，並重新命名為 "時間"
     time_col = df.columns[0]
     df[time_col] = pd.to_datetime(df[time_col])
     df.rename(columns={time_col: "時間"}, inplace=True)
     
-    # 針對每個座標列，移除零值比例過高的列
+    # 針對每個座標欄位，移除零值比例過高的欄位（columns）
     df = remove_high_zero_columns(df)
-
-    # 針對每個時間欄，移除零值比例過高的欄
+    
+    # 針對每個時間列，移除零值比例過高的資料列（rows）
     zero_ratio_rows = (df.drop(columns=['時間']) == 0).mean(axis=1)
     df = df[zero_ratio_rows <= 0.1].reset_index(drop=True)
-
-    # 針對每個座標列，將0的資料改為該座標列的平均值
-    numeric_cols = df.columns.drop('時間')
-    col_means = df[numeric_cols].replace(0, pd.NA).mean()
-    for col in numeric_cols:
-        df[col] = df[col].replace(0, col_means[col]).round(0).astype(int)
-
+    
+    # 針對每個座標欄位，將0或空值改成該座標欄位前一筆的值(前一小時)
     dfs.append(df)
 
 # 先依據「時間」欄位合併所有流量檔案（以 outer join 保留所有時間）
@@ -71,8 +79,38 @@ if dfs:
 else:
     merged_flow_df = pd.DataFrame()
 
-# inner join
+# 以外部天氣資料 ext_df 為基準，僅保留外部資料中存在的時間（inner join）
 final_df = pd.merge(merged_flow_df, ext_df, on="時間", how="inner")
+
+# 在輸出前先檢查並修正座標欄位名稱：若有誤格式如 "(121.525, 25.105)_x" 則修正為 "(121.525, 25.105)"
+def fix_coordinate_column_names(df):
+    new_columns = {}
+    pattern = re.compile(r"(\(.*?\))(_.*)?")
+    for col in df.columns:
+        match = pattern.fullmatch(col)
+        if match:
+            correct_name = match.group(1)
+            if correct_name != col:
+                new_columns[col] = correct_name
+    df.rename(columns=new_columns, inplace=True)
+    return df
+
+final_df = fix_coordinate_column_names(final_df)
+
+
+# TODO: 檢查座標是否有重複，重複的話只保留一個
+def remove_duplicate_columns_keep_first(df):
+    """
+    只保留第一次出現的欄位，對於重複出現的欄位名稱，只保留第一個，
+    使用 df.loc[:, ~df.columns.duplicated()] 可直接解決此問題。
+    """
+    return df.loc[:, ~df.columns.duplicated()]
+
+final_df = remove_duplicate_columns_keep_first(final_df)
+
+
+# 拿掉2020以後的資料
+final_df = final_df[final_df['時間'].dt.year < 2020].reset_index(drop=True)
 
 # 新增年、月、日、時欄位
 final_df['年'] = final_df['時間'].dt.year
@@ -84,30 +122,10 @@ final_df['時'] = final_df['時間'].dt.hour
 final_df.sort_values("時間", inplace=True)
 final_df.reset_index(drop=True, inplace=True)
 
-def fix_coordinate_column_names(df):
-    # 建立新的欄位映射字典
-    new_columns = {}
-    # 正規表達式：第一組捕捉正確格式的座標，第二組捕捉可能存在的後綴
-    pattern = re.compile(r"(\(.*?\))(_.*)?")
-    for col in df.columns:
-        # 嘗試完全匹配欄位名稱
-        match = pattern.fullmatch(col)
-        if match:
-            # 使用第一組 (正確的座標部分) 作為新的名稱
-            correct_name = match.group(1)
-            # 若新名稱與原名稱不同，則記錄映射關係
-            if correct_name != col:
-                new_columns[col] = correct_name
-    # 重新命名 DataFrame 的欄位
-    df.rename(columns=new_columns, inplace=True)
-    return df
-
-# 在輸出 final_df 之前先修正座標欄位名稱
-final_df = fix_coordinate_column_names(final_df)
-
-# TODO: 檢查座標是否有格式不對的
-
-# TODO: 拿掉2020以後的資料
+flow_cols = final_df.columns.drop(["時間", "年", "月", "日", "時"])  # 排除時間和年、月、日、時
+for col in flow_cols:
+    final_df[col] = final_df[col].ffill()  # 將 NaN 的位置用「前一筆資料」填補
+    final_df[col] = final_df[col].fillna(0).astype(int)  # 若最前面仍是 NaN，就用 0
 
 
 # 輸出最終合併結果至單一檔案

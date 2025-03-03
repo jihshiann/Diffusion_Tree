@@ -2,26 +2,31 @@ import os
 import pickle
 import pandas as pd
 import numpy as np
-import lightgbm as lgb
-import shap
 import matplotlib.pyplot as plt
 from collections import deque
 from sklearn.model_selection import train_test_split
+from sklearn.tree import DecisionTreeRegressor, plot_tree
+from sklearn.metrics import mean_squared_error
+import shap
 
 # ---------------------------
-# 設定與數據讀取
+# 設定與資料讀取
 plt.rcParams['font.sans-serif'] = ['Microsoft JhengHei']
 plt.rcParams['axes.unicode_minus'] = False
 
 data_path = r"C:\thesis\code\Taipei_5x5\all_merged_5X5.csv"
 df = pd.read_csv(data_path)
-result_dir = r"C:\thesis\code\result"
+result_dir = r"C:\thesis\code\result_cart"
 os.makedirs(result_dir, exist_ok=True)
 
-# 處理角度變數
+# 處理角度變數：對「最大陣風風向」和「風向」分別計算正弦與餘弦值
 for col in ['最大陣風風向', '風向']:
     df[f'sin_{col}'] = np.sin(np.deg2rad(df[col]))
     df[f'cos_{col}'] = np.cos(np.deg2rad(df[col]))
+
+# 處理類別特徵：將 'hoilday' 與 '月' 轉換為類別型並以 .cat.codes 處理
+for col in ['hoilday', '月']:
+    df[col] = df[col].astype('category').cat.codes
 
 # 建立特徵名稱翻譯對應表
 feature_mapping = {
@@ -32,8 +37,10 @@ feature_mapping = {
     '相對溼度': 'Relative_Humidity',
     '風速': 'Wind_Speed',
     '風向': 'Wind_Direction',
-    '最大陣風': 'Max_Gust',
-    '最大陣風風向': 'Max_Gust_Direction',
+    'sin_最大陣風風向': 'sin_Max_Gust_Direction',
+    'cos_最大陣風風向': 'cos_Max_Gust_Direction',
+    'sin_風向': 'sin_Wind_Direction',
+    'cos_風向': 'cos_Wind_Direction',
     '降水量': 'Precipitation',
     '降水時數': 'Precipitation_Hours',
     '日照時數': 'Sunshine_Hours',
@@ -51,48 +58,32 @@ feature_mapping = {
 
 df_original = df.copy()
 
-# 提取座標欄位（假設格式為 "(經度, 緯度)"）
+# 提取座標欄位（格式為 "(經度, 緯度)"，全部 target）
 target_columns = [col for col in df.columns if '(' in col and ')' in col]
 print("所有座標點：", target_columns)
 
-# 替換 DataFrame 欄位名稱為英文供 LightGBM 使用
+# 替換欄位名稱為英文供模型使用
 df_tree = df.rename(columns=feature_mapping)
 
 # 定義 X 與 y
+# 如需加入處理後的角度特徵，可自行擴充此處特徵清單
 X = df_original[list(feature_mapping.keys())]
 y = df_original[target_columns]
 
-# 切分訓練集與測試集
+# 切分資料
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 X_train_tree = X_train.rename(columns=feature_mapping)
 X_test_tree = X_test.rename(columns=feature_mapping)
 
-cat_features = ['Holiday', 'Month']
-
-# 解析座標字串函式
-def parse_coord_string(coord_str):
-    coord_str = coord_str.strip("() ")
-    lon_str, lat_str = coord_str.split(",")
-    return float(lon_str), float(lat_str)
-
 # ---------------------------
 # 定義輔助函式
 
-def get_feature_gain_vector(node, vector):
-    if "split_feature" in node:
-        feat_index = node["split_feature"]
-        gain = node.get("split_gain", 0)
-        vector[feat_index] += gain
-    if "left_child" in node:
-        get_feature_gain_vector(node["left_child"], vector)
-    if "right_child" in node:
-        get_feature_gain_vector(node["right_child"], vector)
-    return vector
-
-def get_breadth_first_path(tree_structure):
-    """以廣度優先順序遍歷樹，返回所有節點的 (split_feature, threshold) 規則"""
+def get_breadth_first_path(tree_dict):
+    """
+    以廣度優先順序遍歷樹（字典結構），返回所有節點的 (split_feature, threshold) 規則。
+    """
     path = []
-    q = deque([tree_structure])
+    q = deque([tree_dict])
     while q:
         node = q.popleft()
         if "split_feature" in node:
@@ -104,10 +95,32 @@ def get_breadth_first_path(tree_structure):
                 q.append(node["right_child"])
     return path
 
+def extract_tree_structure(dt_model):
+    """
+    將 DecisionTreeRegressor 的內部樹結構轉換為字典形式。
+    """
+    tree = dt_model.tree_
+    def recurse(node_index):
+        # 如果該節點為葉節點
+        if tree.children_left[node_index] == -1 and tree.children_right[node_index] == -1:
+            return {}
+        node_dict = {
+            "split_feature": tree.feature[node_index],
+            "threshold": tree.threshold[node_index]
+        }
+        left_index = tree.children_left[node_index]
+        right_index = tree.children_right[node_index]
+        if left_index != -1:
+            node_dict["left_child"] = recurse(left_index)
+        if right_index != -1:
+            node_dict["right_child"] = recurse(right_index)
+        return node_dict
+    return recurse(0)
+
 def assign_group_by_feature_prefix(rule_paths, threshold):
     """
-    根據每個 target 的規則路徑（只取 split_feature）進行分組，
-    若某前綴下 target 數超過 threshold，則嘗試用更長前綴細分。
+    根據每個 target 的規則路徑（僅取 split_feature 部分）進行分組，
+    若某前綴下 target 數超過 threshold，則用更長前綴細分。
     """
     groups_temp = {}
     for target, path in rule_paths.items():
@@ -128,106 +141,67 @@ def assign_group_by_feature_prefix(rule_paths, threshold):
     return final_groups
 
 # ---------------------------
-# 主循環：對每個 target 訓練模型、提取規則
+# 主循環：使用 CART 決策樹進行模型訓練與規則提取
+
 predictions = {}
 grid_ids = []
-tree_vectors = []
-geo_coords = []
-root_rules = {}    # 儲存每個 target 的根部規則 (僅根節點)
-rule_paths = {}    # 儲存每個 target 的廣度優先規則路徑
-
-# 新增：記錄每個 target 的最佳 RMSE、模型物件及最佳樹索引
+rule_paths = {}  # 儲存每個 target 的廣度優先規則路徑
 target_rmse = {}
 target_models = {}
 target_best_tree_index = {}
+geo_coords = []
 
 for target in target_columns:
-    print(f"訓練與預測 {target} 的決策樹...")
-    train_data = lgb.Dataset(X_train_tree, label=y_train[target], categorical_feature=cat_features)
-    test_data = lgb.Dataset(X_test_tree, label=y_test[target], reference=train_data, categorical_feature=cat_features)
-    params = {
-        'objective': 'regression',
-        'metric': 'rmse',
-        'boosting_type': 'gbdt',
-        'num_leaves': 31,
-        'learning_rate': 0.05,
-        'feature_fraction': 0.9,
-        'seed': 42
-    }
-    evals_result = {}
-    lgb_model = lgb.train(
-        params,
-        train_data,
-        num_boost_round=100,
-        valid_sets=[test_data],
-        valid_names=["valid_0"],
-        callbacks=[lgb.early_stopping(stopping_rounds=10, verbose=True),
-                   lgb.record_evaluation(evals_result),
-                   lgb.log_evaluation(10)]
-    )
-    y_pred = lgb_model.predict(X_test_tree, num_iteration=lgb_model.best_iteration)
+    print(f"訓練與預測 {target} 的 CART 決策樹...")
+    # 使用 DecisionTreeRegressor 訓練模型
+    dt_model = DecisionTreeRegressor(random_state=42, max_leaf_nodes=31, max_depth=10, min_samples_split=10, min_samples_leaf=10)
+    dt_model.fit(X_train_tree, y_train[target])
+    y_pred = dt_model.predict(X_test_tree)
+    rmse = np.sqrt(np.mean((y_test[target] - y_pred)**2))
     predictions[target] = y_pred
-    print(f"LightGBM 總樹數: {lgb_model.num_trees()}")
-    if "valid_0" in evals_result and "rmse" in evals_result["valid_0"]:
-        plt.figure(figsize=(8, 5))
-        plt.plot(evals_result['valid_0']['rmse'], label="Validation RMSE", color="blue")
-        plt.xlabel("Iterations")
-        plt.ylabel("RMSE")
-        plt.title(f"Learning Curve ({target})")
-        plt.legend()
-        learning_curve_path = os.path.join(result_dir, f"learning_curve_{target.replace(',', '_').replace(' ', '')}.png")
-        plt.savefig(learning_curve_path, dpi=300, bbox_inches="tight")
-        plt.close()
-        print(f"學習曲線已儲存至: {learning_curve_path}")
-    else:
-        print(f"無法繪製 {target} 的學習曲線。")
-
-    model_dict = lgb_model.dump_model()
-    tree_info = model_dict["tree_info"]
-    # 找出最佳決策樹 (以驗證集 RMSE 最低的那棵)
-    best_tree_index = np.argmin(evals_result["valid_0"]["rmse"])
-    # 記錄 RMSE、模型與最佳樹索引
-    target_rmse[target] = evals_result["valid_0"]["rmse"][best_tree_index]
-    target_models[target] = lgb_model
-    target_best_tree_index[target] = best_tree_index
-
+    target_rmse[target] = rmse
+    target_models[target] = dt_model
+    target_best_tree_index[target] = 0  # CART 為單棵樹，索引為 0
+    print(f"{target} 的 RMSE: {rmse}")
+    
+    # 繪製 CART 決策樹圖
     plt.figure(figsize=(30, 18))
-    lgb.plot_tree(lgb_model, tree_index=best_tree_index, show_info=['split_gain'])
-    plt.title(f"Best Decision Tree for {target} (RMSE最低)")
-    tree_plot_path = os.path.join(result_dir, f"best_tree_{target.replace(',', '_').replace(' ', '')}.png")
+    plot_tree(dt_model, feature_names=list(X_train_tree.columns), filled=True)
+    plt.title(f"Decision Tree for {target} (RMSE最低)")
+    tree_plot_path = os.path.join(result_dir, f"tree_{target.replace(',', '_').replace(' ', '')}.png")
     plt.savefig(tree_plot_path, dpi=900, bbox_inches="tight")
     plt.close()
-    print(f"最佳決策樹圖（RMSE最低）已儲存至: {tree_plot_path}")
-
-    explainer = shap.TreeExplainer(lgb_model)
-    shap_values = explainer.shap_values(X_test)
+    print(f"CART 決策樹圖已儲存至: {tree_plot_path}")
+    
+    # SHAP 分析 (使用 shap.TreeExplainer 適用於 scikit-learn 決策樹)
+    explainer = shap.TreeExplainer(dt_model)
+    shap_values = explainer.shap_values(X_test_tree)
     shap_summary_path = os.path.join(result_dir, f"shap_summary_{target.replace(',', '_').replace(' ', '')}.png")
     plt.figure(figsize=(10, 6))
-    shap.summary_plot(shap_values, X_test, show=False)
+    shap.summary_plot(shap_values, X_test_tree, show=False)
     plt.savefig(shap_summary_path, dpi=300, bbox_inches="tight")
     plt.close()
     print(f"SHAP 特徵重要性圖已儲存至: {shap_summary_path}")
-
+    
     shap_bar_path = os.path.join(result_dir, f"shap_bar_{target.replace(',', '_').replace(' ', '')}.png")
     plt.figure(figsize=(10, 6))
-    shap.summary_plot(shap_values, X_test, plot_type="bar", show=False)
+    shap.summary_plot(shap_values, X_test_tree, plot_type="bar", show=False)
     plt.savefig(shap_bar_path, dpi=300, bbox_inches="tight")
     plt.close()
     print(f"SHAP 特徵影響條形圖已儲存至: {shap_bar_path}")
-
-    # 提取最佳決策樹的根部規則（僅取根節點）
-    best_tree = tree_info[best_tree_index]["tree_structure"]
-    root_rule = (best_tree.get("split_feature"), best_tree.get("threshold"))
-    root_rules[target] = root_rule
-    # 提取廣度優先規則路徑（整棵樹，廣度順序）
-    path = get_breadth_first_path(best_tree)
+    
+    # 提取 CART 決策樹結構（轉換為字典格式）
+    tree_dict = extract_tree_structure(dt_model)
+    # 提取廣度優先規則路徑
+    path = get_breadth_first_path(tree_dict)
     rule_paths[target] = path
-    # 直接取該 target 的代表經緯度（target 本身為座標字串）
+    # 將 target 本身（座標字串）作為代表經緯度
     geo_coords.append(target)
     grid_ids.append(target)
 
-# ------------------------
-# 分群規則：
+# ---------------------------
+# 分群：拓展規則
+# 規則：
 # 1) 初步以根部規則 (split_feature) 分組
 # 2) 如果某組 target 數量超過總數的 1/10，
 #    則對該組 target 進一步依據廣度優先規則路徑的前綴細分分組（只使用 split_feature，不考慮 threshold）
@@ -236,61 +210,23 @@ threshold = total_targets / 10.0
 
 final_groups = assign_group_by_feature_prefix(rule_paths, threshold)
 
-
-# 將每個群中RMSE最低的座標選為群代表
+# 將每個群中 RMSE 最低的 target 選為群代表
 group_to_targets = {}
 for target, group_prefix in final_groups.items():
     group_to_targets.setdefault(group_prefix, []).append(target)
-
 group_representative = {}
 for group_prefix, targets in group_to_targets.items():
     best_target = min(targets, key=lambda t: target_rmse[t])
     group_representative[group_prefix] = best_target
 
-
 # 存群代表的模型檔
 for group_prefix, rep_target in group_representative.items():
     model = target_models[rep_target]
-    # 利用座標字串處理檔名中的特殊字元
     safe_target = rep_target.replace("(", "").replace(")", "").replace(",", "_").replace(" ", "")
     model_file = os.path.join(result_dir, f"model_{safe_target}.pkl")
     with open(model_file, "wb") as f:
         pickle.dump(model, f)
     print(f"群代表 {rep_target} 的模型已存至: {model_file}")
-
-
-# 將群代表的模型視覺化
-for group_prefix, rep_target in group_representative.items():
-    model = target_models[rep_target]
-    best_tree_index = target_best_tree_index[rep_target]
-    plt.figure(figsize=(30, 18))
-    lgb.plot_tree(model, tree_index=best_tree_index, show_info=['split_gain'])
-    plt.title(f"Group Representative Decision Tree for {rep_target}")
-    safe_target = rep_target.replace("(", "").replace(")", "").replace(",", "_").replace(" ", "")
-    rep_tree_plot_path = os.path.join(result_dir, f"group_representative_tree_{safe_target}.png")
-    plt.savefig(rep_tree_plot_path, dpi=900, bbox_inches="tight")
-    plt.close()
-    print(f"群代表 {rep_target} 的決策樹圖已存至: {rep_tree_plot_path}")
-
-# 進一步分析群代表的規則路徑，提取規則並解釋
-reverse_mapping = {v: k for k, v in feature_mapping.items()}
-for group_prefix, rep_target in group_representative.items():
-    rule_path = rule_paths[rep_target]
-    explanation_lines = [f"群代表座標: {rep_target}", "決策樹規則路徑解釋:"]
-    for idx, rule in enumerate(rule_path):
-        feature_index, threshold_val = rule
-        if feature_index < len(X_train_tree.columns):
-            feature_eng = list(X_train_tree.columns)[feature_index]
-        else:
-            feature_eng = str(feature_index)
-        feature_ch = reverse_mapping.get(feature_eng, feature_eng)
-        explanation_lines.append(f"  {idx+1}. 分割特徵：{feature_ch} (閾值: {threshold_val})")
-    explanation_text = "\n".join(explanation_lines)
-    safe_target = rep_target.replace("(", "").replace(")", "").replace(",", "_").replace(" ", "")
-    rules_file = os.path.join(result_dir, f"group_representative_rules_{safe_target}.txt")
-    with open(rules_file, "w", encoding="utf-8") as f:
-        f.write(explanation_text)
-    print(f"群代表 {rep_target} 的規則解釋已存至: {rules_file}")
 
 # 建立 target -> 分組標籤對照表：將唯一前綴映射到數值標籤
 unique_prefixes = {v for v in final_groups.values()}
@@ -298,6 +234,7 @@ prefix_to_label = {prefix: idx for idx, prefix in enumerate(unique_prefixes)}
 group_labels = {target: prefix_to_label[final_groups[target]] for target in final_groups}
 
 # 輸出分群結果到 CSV：僅顯示分組時使用的特徵名稱 (中文)
+reverse_mapping = {v: k for k, v in feature_mapping.items()}
 group_rows = []
 for prefix, label in prefix_to_label.items():
     rules_str = []
@@ -310,8 +247,7 @@ for prefix, label in prefix_to_label.items():
         rules_str.append(f"{feature_ch}")
     prefix_str = "; ".join(rules_str)
     targets_in_prefix = [t for t, p in final_groups.items() if p == prefix]
-    count = len(targets_in_prefix)  # 座標數
-    # 取得該群代表及其 RMSE
+    count = len(targets_in_prefix)
     rep_target = group_representative[prefix]
     rep_rmse = target_rmse[rep_target]
     group_rows.append({
@@ -330,7 +266,6 @@ print("分群結果已儲存至:", excel_path)
 
 # 視覺化：將 geo_coords (存放 target 字串，格式 "(lon, lat)") 轉為數值型 tuple
 parsed_coords = [tuple(map(float, coord.strip("() ").split(","))) for coord in target_columns]
-# 建立分組標籤列表，依據 grid_ids (grid_ids 存放 target)
 group_label_list = [group_labels[t] for t in grid_ids]
 all_lons = [coord[0] for coord in parsed_coords]
 all_lats = [coord[1] for coord in parsed_coords]

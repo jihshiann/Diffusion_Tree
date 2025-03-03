@@ -4,7 +4,7 @@
     <SchemaVersion>2.0</SchemaVersion>
     <ProjectGuid>734638c2-4d71-4079-9cfc-8364a61d10d4</ProjectGuid>
     <ProjectHome>.</ProjectHome>
-    <StartupFile>decisionTree_lightgbm.py</StartupFile>
+    <StartupFile>decisionTree_CART.py</StartupFile>
     <SearchPath>
     </SearchPath>
     <WorkingDirectory>.</WorkingDirectory>
@@ -23,6 +23,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="data_processing.py" />
+    <Compile Include="decisionTree_CART.py" />
     <Compile Include="decisionTree_lightgbm.py" />
   </ItemGroup>
   <ItemGroup>

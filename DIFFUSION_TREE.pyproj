@@ -4,7 +4,7 @@
     <SchemaVersion>2.0</SchemaVersion>
     <ProjectGuid>734638c2-4d71-4079-9cfc-8364a61d10d4</ProjectGuid>
     <ProjectHome>.</ProjectHome>
-    <StartupFile>decisionTree_CART.py</StartupFile>
+    <StartupFile>decisionTree_lightgbm.py</StartupFile>
     <SearchPath>
     </SearchPath>
     <WorkingDirectory>.</WorkingDirectory>

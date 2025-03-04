@@ -7,6 +7,7 @@ import shap
 import matplotlib.pyplot as plt
 from collections import deque
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error
 
 # ---------------------------
 # 設定與數據讀取
@@ -15,8 +16,12 @@ plt.rcParams['axes.unicode_minus'] = False
 
 data_path = r"C:\thesis\code\Taipei_5x5\all_merged_5X5.csv"
 df = pd.read_csv(data_path)
-result_dir = r"C:\thesis\code\result"
+result_dir = r"C:\thesis\code\result_lgb"
 os.makedirs(result_dir, exist_ok=True)
+# 建立子目錄
+sub_dirs = ["learning_curve", "tree", "shap_summary", "shap_bar", "model", "group_tree"]
+for sub in sub_dirs:
+    os.makedirs(os.path.join(result_dir, sub), exist_ok=True)
 
 # 處理角度變數
 for col in ['最大陣風風向', '風向']:
@@ -136,8 +141,8 @@ geo_coords = []
 root_rules = {}    # 儲存每個 target 的根部規則 (僅根節點)
 rule_paths = {}    # 儲存每個 target 的廣度優先規則路徑
 
-# 新增：記錄每個 target 的最佳 RMSE、模型物件及最佳樹索引
-target_rmse = {}
+# 新增：記錄每個 target 的最佳 MSE、模型物件及最佳樹索引
+target_mse = {}
 target_models = {}
 target_best_tree_index = {}
 
@@ -145,9 +150,10 @@ for target in target_columns:
     print(f"訓練與預測 {target} 的決策樹...")
     train_data = lgb.Dataset(X_train_tree, label=y_train[target], categorical_feature=cat_features)
     test_data = lgb.Dataset(X_test_tree, label=y_test[target], reference=train_data, categorical_feature=cat_features)
+    # 將 metric 改為 "l2" (即 MSE)
     params = {
         'objective': 'regression',
-        'metric': 'rmse',
+        'metric': 'l2',
         'boosting_type': 'gbdt',
         'num_leaves': 31,
         'learning_rate': 0.05,
@@ -168,14 +174,14 @@ for target in target_columns:
     y_pred = lgb_model.predict(X_test_tree, num_iteration=lgb_model.best_iteration)
     predictions[target] = y_pred
     print(f"LightGBM 總樹數: {lgb_model.num_trees()}")
-    if "valid_0" in evals_result and "rmse" in evals_result["valid_0"]:
+    if "valid_0" in evals_result and "l2" in evals_result["valid_0"]:
         plt.figure(figsize=(8, 5))
-        plt.plot(evals_result['valid_0']['rmse'], label="Validation RMSE", color="blue")
+        plt.plot(evals_result['valid_0']['l2'], label="Validation MSE", color="blue")
         plt.xlabel("Iterations")
-        plt.ylabel("RMSE")
+        plt.ylabel("MSE")
         plt.title(f"Learning Curve ({target})")
         plt.legend()
-        learning_curve_path = os.path.join(result_dir, f"learning_curve_{target.replace(',', '_').replace(' ', '')}.png")
+        learning_curve_path = os.path.join(result_dir, "learning_curve", f"{target.replace(',', '_').replace(' ', '')}.png")
         plt.savefig(learning_curve_path, dpi=300, bbox_inches="tight")
         plt.close()
         print(f"學習曲線已儲存至: {learning_curve_path}")
@@ -184,31 +190,34 @@ for target in target_columns:
 
     model_dict = lgb_model.dump_model()
     tree_info = model_dict["tree_info"]
-    # 找出最佳決策樹 (以驗證集 RMSE 最低的那棵)
-    best_tree_index = np.argmin(evals_result["valid_0"]["rmse"])
-    # 記錄 RMSE、模型與最佳樹索引
-    target_rmse[target] = evals_result["valid_0"]["rmse"][best_tree_index]
+    # 取每棵樹根節點的 split_gain，若不存在則設為 0
+    split_gains = [tree_info[i]["tree_structure"].get("split_gain", 0) for i in range(len(tree_info))]
+    best_tree_index = np.argmax(split_gains)
+    # 記錄該樹對應的 MSE (僅供參考)
+    target_mse[target] = evals_result["valid_0"]["l2"][best_tree_index]
     target_models[target] = lgb_model
     target_best_tree_index[target] = best_tree_index
 
     plt.figure(figsize=(30, 18))
-    lgb.plot_tree(lgb_model, tree_index=best_tree_index, show_info=['split_gain'])
-    plt.title(f"Best Decision Tree for {target} (RMSE最低)")
-    tree_plot_path = os.path.join(result_dir, f"best_tree_{target.replace(',', '_').replace(' ', '')}.png")
+    # 移除 feature_names 參數
+    lgb.plot_tree(lgb_model, tree_index=best_tree_index, show_info=['split_gain'], filled=True)
+    plt.title(f"Best Decision Tree for {target} (Highest split_gain)")
+    tree_plot_path = os.path.join(result_dir, "tree", f"{target.replace(',', '_').replace(' ', '')}.png")
     plt.savefig(tree_plot_path, dpi=900, bbox_inches="tight")
     plt.close()
-    print(f"最佳決策樹圖（RMSE最低）已儲存至: {tree_plot_path}")
+    print(f"最佳決策樹圖（Highest split_gain）已儲存至: {tree_plot_path}")
+
 
     explainer = shap.TreeExplainer(lgb_model)
     shap_values = explainer.shap_values(X_test)
-    shap_summary_path = os.path.join(result_dir, f"shap_summary_{target.replace(',', '_').replace(' ', '')}.png")
+    shap_summary_path = os.path.join(result_dir, "shap_summary", f"{target.replace(',', '_').replace(' ', '')}.png")
     plt.figure(figsize=(10, 6))
     shap.summary_plot(shap_values, X_test, show=False)
     plt.savefig(shap_summary_path, dpi=300, bbox_inches="tight")
     plt.close()
     print(f"SHAP 特徵重要性圖已儲存至: {shap_summary_path}")
 
-    shap_bar_path = os.path.join(result_dir, f"shap_bar_{target.replace(',', '_').replace(' ', '')}.png")
+    shap_bar_path = os.path.join(result_dir, "shap_bar", f"{target.replace(',', '_').replace(' ', '')}.png")
     plt.figure(figsize=(10, 6))
     shap.summary_plot(shap_values, X_test, plot_type="bar", show=False)
     plt.savefig(shap_bar_path, dpi=300, bbox_inches="tight")
@@ -222,75 +231,54 @@ for target in target_columns:
     # 提取廣度優先規則路徑（整棵樹，廣度順序）
     path = get_breadth_first_path(best_tree)
     rule_paths[target] = path
-    # 直接取該 target 的代表經緯度（target 本身為座標字串）
     geo_coords.append(target)
     grid_ids.append(target)
 
 # ------------------------
 # 分群規則：
-# 1) 初步以根部規則 (split_feature) 分組
-# 2) 如果某組 target 數量超過總數的 1/10，
-#    則對該組 target 進一步依據廣度優先規則路徑的前綴細分分組（只使用 split_feature，不考慮 threshold）
 total_targets = len(target_columns)
 threshold = total_targets / 10.0
 
 final_groups = assign_group_by_feature_prefix(rule_paths, threshold)
 
-
-# 將每個群中RMSE最低的座標選為群代表
+# 將每個群中 MSE 最低的座標選為群代表
 group_to_targets = {}
 for target, group_prefix in final_groups.items():
     group_to_targets.setdefault(group_prefix, []).append(target)
 
 group_representative = {}
 for group_prefix, targets in group_to_targets.items():
-    best_target = min(targets, key=lambda t: target_rmse[t])
+    best_target = min(targets, key=lambda t: target_mse[t])
     group_representative[group_prefix] = best_target
 
-
-# 存群代表的模型檔
-for group_prefix, rep_target in group_representative.items():
-    model = target_models[rep_target]
-    # 利用座標字串處理檔名中的特殊字元
-    safe_target = rep_target.replace("(", "").replace(")", "").replace(",", "_").replace(" ", "")
-    model_file = os.path.join(result_dir, f"model_{safe_target}.pkl")
-    with open(model_file, "wb") as f:
-        pickle.dump(model, f)
-    print(f"群代表 {rep_target} 的模型已存至: {model_file}")
-
-
-# 將群代表的模型視覺化
+# 將群代表的模型視覺化，同時標示出該群的規則
+reverse_mapping = {v: k for k, v in feature_mapping.items()}
 for group_prefix, rep_target in group_representative.items():
     model = target_models[rep_target]
     best_tree_index = target_best_tree_index[rep_target]
-    plt.figure(figsize=(30, 18))
-    lgb.plot_tree(model, tree_index=best_tree_index, show_info=['split_gain'])
-    plt.title(f"Group Representative Decision Tree for {rep_target}")
-    safe_target = rep_target.replace("(", "").replace(")", "").replace(",", "_").replace(" ", "")
-    rep_tree_plot_path = os.path.join(result_dir, f"group_representative_tree_{safe_target}.png")
-    plt.savefig(rep_tree_plot_path, dpi=900, bbox_inches="tight")
-    plt.close()
-    print(f"群代表 {rep_target} 的決策樹圖已存至: {rep_tree_plot_path}")
-
-# 進一步分析群代表的規則路徑，提取規則並解釋
-reverse_mapping = {v: k for k, v in feature_mapping.items()}
-for group_prefix, rep_target in group_representative.items():
-    rule_path = rule_paths[rep_target]
-    explanation_lines = [f"群代表座標: {rep_target}", "決策樹規則路徑解釋:"]
-    for idx, rule in enumerate(rule_path):
-        feature_index, threshold_val = rule
+    
+    # 只使用群規則前綴 (group_prefix)，組成解釋文字
+    rule_features = []
+    for feature_index in group_prefix:
         if feature_index < len(X_train_tree.columns):
             feature_eng = list(X_train_tree.columns)[feature_index]
         else:
             feature_eng = str(feature_index)
         feature_ch = reverse_mapping.get(feature_eng, feature_eng)
-        explanation_lines.append(f"  {idx+1}. 分割特徵：{feature_ch} (閾值: {threshold_val})")
-    explanation_text = "\n".join(explanation_lines)
+        rule_features.append(feature_ch)
+    rule_text = f"群代表座標: {rep_target}\n群規則: " + "; ".join(rule_features)
+    
+    # 繪製決策樹圖，並在圖上標示解釋文字
+    plt.figure(figsize=(30, 18))
+    lgb.plot_tree(model, tree_index=best_tree_index, show_info=['split_gain'])
+    plt.suptitle(rule_text, fontsize=20)
     safe_target = rep_target.replace("(", "").replace(")", "").replace(",", "_").replace(" ", "")
-    rules_file = os.path.join(result_dir, f"group_representative_rules_{safe_target}.txt")
-    with open(rules_file, "w", encoding="utf-8") as f:
-        f.write(explanation_text)
-    print(f"群代表 {rep_target} 的規則解釋已存至: {rules_file}")
+    rep_tree_plot_path = os.path.join(result_dir, "group_tree", f"group_representative_tree_{safe_target}.png")
+    plt.savefig(rep_tree_plot_path, dpi=900, bbox_inches="tight")
+    plt.close()
+    print(f"群代表 {rep_target} 的決策樹圖已存至: {rep_tree_plot_path}")
+
+
 
 # 建立 target -> 分組標籤對照表：將唯一前綴映射到數值標籤
 unique_prefixes = {v for v in final_groups.values()}
@@ -310,16 +298,19 @@ for prefix, label in prefix_to_label.items():
         rules_str.append(f"{feature_ch}")
     prefix_str = "; ".join(rules_str)
     targets_in_prefix = [t for t, p in final_groups.items() if p == prefix]
-    count = len(targets_in_prefix)  # 座標數
-    # 取得該群代表及其 RMSE
+    count = len(targets_in_prefix)
     rep_target = group_representative[prefix]
-    rep_rmse = target_rmse[rep_target]
+    rep_mse = target_mse[rep_target]
+    group_mse = np.mean([target_mse[t] for t in targets_in_prefix])
+    overall_mse = np.mean(list(target_mse.values()))
     group_rows.append({
         "規則": prefix_str,
         "座標數": count,
         "分組標籤": label,
         "群代表座標": rep_target,
-        "代表座標RMSE": rep_rmse,
+        "代表座標MSE": rep_mse,
+        "群平均MSE": group_mse,
+        "總平均MSE": overall_mse,
         "目標": ", ".join(targets_in_prefix)
     })
 
@@ -330,7 +321,6 @@ print("分群結果已儲存至:", excel_path)
 
 # 視覺化：將 geo_coords (存放 target 字串，格式 "(lon, lat)") 轉為數值型 tuple
 parsed_coords = [tuple(map(float, coord.strip("() ").split(","))) for coord in target_columns]
-# 建立分組標籤列表，依據 grid_ids (grid_ids 存放 target)
 group_label_list = [group_labels[t] for t in grid_ids]
 all_lons = [coord[0] for coord in parsed_coords]
 all_lats = [coord[1] for coord in parsed_coords]
@@ -346,3 +336,29 @@ grouping_path = os.path.join(result_dir, "geo_grouping_by_root_feature_refined.p
 plt.savefig(grouping_path, dpi=300, bbox_inches="tight")
 plt.close()
 print("基於決策樹根部規則(廣度分層)的地理分群圖已儲存至:", grouping_path)
+
+
+# 建立儲存群代表決策樹的子目錄
+group_tree_dir = os.path.join(result_dir, "group_tree")
+os.makedirs(group_tree_dir, exist_ok=True)
+
+# 對每個群代表進行繪圖與標示群規則
+for prefix, rep_target in group_representative.items():
+    # 從 group_rows 中找出對應群規則字串
+    rule_str = ""
+    for row in group_rows:
+        if row["群代表座標"] == rep_target:
+            rule_str = row["規則"]
+            break
+    # 取得該群代表的決策樹模型
+    model = target_models[rep_target]
+    plt.figure(figsize=(30, 18))
+    # 繪製決策樹，移除 feature_names 參數
+    lgb.plot_tree(model, tree_index=target_best_tree_index[rep_target], show_info=['split_gain'], filled=True)
+    # 在圖上標題處加入群代表與群規則說明
+    plt.suptitle(f"群代表: {rep_target}\n群規則: {rule_str}", fontsize=20)
+    safe_target = rep_target.replace("(", "").replace(")", "").replace(",", "_").replace(" ", "")
+    group_tree_path = os.path.join(group_tree_dir, f"group_representative_tree_{safe_target}.png")
+    plt.savefig(group_tree_path, dpi=900, bbox_inches="tight")
+    plt.close()
+    print(f"群代表 {rep_target} 的標註規則決策樹圖已存至: {group_tree_path}")

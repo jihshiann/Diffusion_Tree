@@ -14,7 +14,7 @@ import shap
 plt.rcParams['font.sans-serif'] = ['Microsoft JhengHei']
 plt.rcParams['axes.unicode_minus'] = False
 
-data_path = r"C:\thesis\code\Taipei_5x5\all_merged_5X5.csv"
+data_path = r"C:\thesis\code\Taipei_CF\all_merged.csv"
 df = pd.read_csv(data_path)
 result_dir = r"C:\thesis\code\result_cart"
 os.makedirs(result_dir, exist_ok=True)
@@ -60,6 +60,7 @@ df_original = df.copy()
 
 # 提取座標欄位（格式為 "(經度, 緯度)"，全部 target）
 target_columns = [col for col in df.columns if '(' in col and ')' in col]
+target_columns = target_columns[:22*22]
 print("所有座標點：", target_columns)
 
 # 替換欄位名稱為英文供模型使用
@@ -235,9 +236,8 @@ for target in target_columns:
 
 # ---------------------------
 # 分群: 以廣度優先規則路徑為基礎進行分群
-# TODO: 路徑規則改成用samples大到小的順序
 total_targets = len(target_columns)
-threshold = total_targets / 10.0
+threshold = total_targets / 5.0
 
 final_groups = assign_group_by_feature_prefix(rule_paths, threshold)
 

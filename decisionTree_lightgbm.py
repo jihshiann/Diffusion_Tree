@@ -14,7 +14,7 @@ from sklearn.metrics import mean_squared_error
 plt.rcParams['font.sans-serif'] = ['Microsoft JhengHei']
 plt.rcParams['axes.unicode_minus'] = False
 
-data_path = r"C:\thesis\code\Taipei_5x5\all_merged_5X5.csv"
+data_path = r"C:\thesis\code\Taipei_CF\all_merged.csv"
 df = pd.read_csv(data_path)
 result_dir = r"C:\thesis\code\result_lgb"
 os.makedirs(result_dir, exist_ok=True)
@@ -58,6 +58,7 @@ df_original = df.copy()
 
 # 提取座標欄位（假設格式為 "(經度, 緯度)"）
 target_columns = [col for col in df.columns if '(' in col and ')' in col]
+target_columns = target_columns[:22*22]
 print("所有座標點：", target_columns)
 
 # 替換 DataFrame 欄位名稱為英文供 LightGBM 使用
@@ -132,6 +133,8 @@ def assign_group_by_feature_prefix(rule_paths, threshold):
         final_groups[target] = assigned_prefix
     return final_groups
 
+print(len(target_columns))
+
 # ---------------------------
 # 主循環：對每個 target 訓練模型、提取規則
 predictions = {}
@@ -194,19 +197,17 @@ for target in target_columns:
     split_gains = [tree_info[i]["tree_structure"].get("split_gain", 0) for i in range(len(tree_info))]
     best_tree_index = np.argmax(split_gains)
     # 記錄該樹對應的 MSE (僅供參考)
-    target_mse[target] = evals_result["valid_0"]["l2"][best_tree_index]
+    target_mse[target] = mean_squared_error(y_test[target], y_pred)
     target_models[target] = lgb_model
     target_best_tree_index[target] = best_tree_index
 
     plt.figure(figsize=(30, 18))
-    # 移除 feature_names 參數
-    lgb.plot_tree(lgb_model, tree_index=best_tree_index, show_info=['split_gain'], filled=True)
+    lgb.plot_tree(lgb_model, tree_index=best_tree_index, show_info=['split_gain'])
     plt.title(f"Best Decision Tree for {target} (Highest split_gain)")
     tree_plot_path = os.path.join(result_dir, "tree", f"{target.replace(',', '_').replace(' ', '')}.png")
     plt.savefig(tree_plot_path, dpi=900, bbox_inches="tight")
     plt.close()
     print(f"最佳決策樹圖（Highest split_gain）已儲存至: {tree_plot_path}")
-
 
     explainer = shap.TreeExplainer(lgb_model)
     shap_values = explainer.shap_values(X_test)
@@ -237,7 +238,7 @@ for target in target_columns:
 # ------------------------
 # 分群規則：
 total_targets = len(target_columns)
-threshold = total_targets / 10.0
+threshold = total_targets / 5.0
 
 final_groups = assign_group_by_feature_prefix(rule_paths, threshold)
 
@@ -271,7 +272,7 @@ for group_prefix, rep_target in group_representative.items():
     # 繪製決策樹圖，並在圖上標示解釋文字
     plt.figure(figsize=(30, 18))
     lgb.plot_tree(model, tree_index=best_tree_index, show_info=['split_gain'])
-    plt.suptitle(rule_text, fontsize=20)
+    plt.suptitle(rule_text, fontsize=10)
     safe_target = rep_target.replace("(", "").replace(")", "").replace(",", "_").replace(" ", "")
     rep_tree_plot_path = os.path.join(result_dir, "group_tree", f"group_representative_tree_{safe_target}.png")
     plt.savefig(rep_tree_plot_path, dpi=900, bbox_inches="tight")
@@ -353,10 +354,18 @@ for prefix, rep_target in group_representative.items():
     # 取得該群代表的決策樹模型
     model = target_models[rep_target]
     plt.figure(figsize=(30, 18))
-    # 繪製決策樹，移除 feature_names 參數
-    lgb.plot_tree(model, tree_index=target_best_tree_index[rep_target], show_info=['split_gain'], filled=True)
+    # 繪製決策樹
+    lgb.plot_tree(
+    model, 
+    tree_index=target_best_tree_index[rep_target], 
+    show_info=['split_gain'],
+    graph_attr={
+        'ranksep': '0.75',  # 層與層之間的距離（預設約 0.75）
+        'nodesep': '0.25'   # 同層節點之間的距離（預設約 0.25）
+    })
     # 在圖上標題處加入群代表與群規則說明
-    plt.suptitle(f"群代表: {rep_target}\n群規則: {rule_str}", fontsize=20)
+    # 調整子圖布局，讓繪圖區域往上移
+    plt.suptitle(f"群代表: {rep_target}\n群規則: {rule_str}", fontsize=5)
     safe_target = rep_target.replace("(", "").replace(")", "").replace(",", "_").replace(" ", "")
     group_tree_path = os.path.join(group_tree_dir, f"group_representative_tree_{safe_target}.png")
     plt.savefig(group_tree_path, dpi=900, bbox_inches="tight")

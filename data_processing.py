@@ -242,6 +242,7 @@ def main():
         # 4. 根據總座標數量決定最大的正方形邊長
         total_coords = len(coord_dict)
         n = int(math.floor(math.sqrt(total_coords)))  # n 為邊長，例如 509 -> floor(sqrt(509)) = 22
+        n = 23
         
         logger.info(f"總共有 {total_coords} 個座標，將選取 {n}x{n}={n*n} 個座標")
         
@@ -332,9 +333,6 @@ def main():
         # 檢查最終結果是否達到預期
         if len(new_coord_order) < n*n:
             logger.warning(f"警告: 最終保留的座標數量({len(new_coord_order)})小於預期的({n*n})")
-            # 選取最接近的正方形
-            actual_n = int(math.floor(math.sqrt(len(new_coord_order))))
-            logger.info(f"將嘗試選擇最接近的正方形網格: {actual_n}x{actual_n}={actual_n*actual_n}")
         
         # 10. 重新排列 final_df 的欄位：將「時間」放最前面，其次為排序後的座標欄位，再接著其他非座標欄位
         non_coord_columns = [col for col in final_df.columns 

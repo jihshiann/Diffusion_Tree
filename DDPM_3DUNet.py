@@ -16,11 +16,32 @@ import logging
 logging.basicConfig(level=logging.INFO)
 
 # 定義時間嵌入的維度，後續模型中會用到此參數
-TIME_EMB_DIM = 32
+TIME_EMB_DIM = 128
 
 ######################################
 # 1. 資料前處理與數據集定義 (PeopleFlowDatasetCondition)
 ######################################
+def parse_lat_lon(column_name):
+            """
+            解析欄位名稱中的經緯度。
+    
+            Args:
+                column_name (str): 欄位名稱，格式如 "(lon,lat)"。
+    
+            Returns:
+                tuple: (經度, 緯度)，分別為浮點數。
+    
+            Raises:
+                ValueError: 若欄位名稱格式無效。
+            """
+            match = re.search(r'\(([\d.-]+),\s*([\d.-]+)\)', column_name)
+            if match:
+                lon = float(match.group(1))  # 提取經度
+                lat = float(match.group(2))  # 提取緯度
+                return lon, lat
+            else:
+                raise ValueError(f"欄位名稱格式無效：{column_name}")
+
 class PeopleFlowDatasetCondition(Dataset):
     """
     此類別負責從 CSV 檔案中讀取人流數據
@@ -44,27 +65,6 @@ class PeopleFlowDatasetCondition(Dataset):
         self.normalize = normalize
         
         flow_columns = [c for c in self.df.columns if '(' in c and ')' in c]
-
-        def parse_lat_lon(column_name):
-            """
-            解析欄位名稱中的經緯度。
-    
-            Args:
-                column_name (str): 欄位名稱，格式如 "(lon,lat)"。
-    
-            Returns:
-                tuple: (經度, 緯度)，分別為浮點數。
-    
-            Raises:
-                ValueError: 若欄位名稱格式無效。
-            """
-            match = re.search(r'\(([\d.-]+),\s*([\d.-]+)\)', column_name)
-            if match:
-                lon = float(match.group(1))  # 提取經度
-                lat = float(match.group(2))  # 提取緯度
-                return lon, lat
-            else:
-                raise ValueError(f"欄位名稱格式無效：{column_name}")
 
         # 將每個欄位名稱解析為 (名稱, 經度, 緯度) 的元組列表
         column_info = [(col, *parse_lat_lon(col)) for col in flow_columns]
@@ -158,7 +158,8 @@ class PeopleFlowDatasetCondition(Dataset):
 
         # 將網格展平並生成排序後的 flow_columns 列表
         sorted_indices = grid.flatten()
-        sorted_flow_columns = [column_info[idx][0] for idx in sorted_indices]
+        self.sorted_flow_columns = [column_info[idx][0] for idx in sorted_indices]
+        print("sorted_flow_columns:", self.sorted_flow_columns)
 
         import matplotlib.pyplot as plt
 
@@ -189,13 +190,13 @@ class PeopleFlowDatasetCondition(Dataset):
             plt.savefig(r"C:\thesis\code\result_ddpm\plot_grid.png", dpi=600, bbox_inches='tight', pad_inches=0.1)
 
         # 呼叫函數顯示靜態圖
-        plot_grid(sorted_flow_columns, H, W)
+        plot_grid(self.sorted_flow_columns, H, W)
 
         # 轉換成 HxW 的網格
-        grid_arrangement = np.array(sorted_flow_columns).reshape(H, W)
+        grid_arrangement = np.array(self.sorted_flow_columns).reshape(H, W)
         
         # 從 DataFrame 中提取數值，並轉換成 numpy 陣列，形狀為 (N, H*W)
-        flow_values = self.df[sorted_flow_columns].values
+        flow_values = self.df[self.sorted_flow_columns].values
         num_points = flow_values.shape[1]
         if H * W != num_points:
             raise ValueError(f"網格大小 H*W = {H * W} 不匹配欄位數量 {num_points}。")
@@ -220,17 +221,20 @@ class PeopleFlowDatasetCondition(Dataset):
         return self.max_index
 
     def __getitem__(self, idx):
-        # 根據索引取得條件序列與目標序列
-        cond_seq = self.data[idx : idx + self.condition_length]
-        target_seq = self.data[idx + self.condition_length : idx + self.total_length]
-        # 為了與模型輸入匹配，增加 channel 維度 (例如從 [T, H, W] -> [1, T, H, W])
-        cond_seq = cond_seq.unsqueeze(0)
-        target_seq = target_seq.unsqueeze(0)
-        # 若有額外轉換函數，則應用
-        if self.transform:
-            cond_seq = self.transform(cond_seq)
-            target_seq = self.transform(target_seq)
-        return cond_seq, target_seq
+        cond_seq = self.data[idx : idx + self.condition_length]  # (8,21,21)
+        target_seq = self.data[idx + self.condition_length : idx + self.total_length]  # (1,21,21)
+
+        # 調整維度，以滿足新的UNet通道需求 (9,1,21,21)
+        # 未來1小時資料(含噪聲，之後再加)：維度(1,1,21,21)
+        target_seq = target_seq.unsqueeze(0)  # (1,1,21,21)
+
+        # 歷史8小時資料（條件資料）：(8,1,21,21)
+        cond_seq = cond_seq.unsqueeze(1)  # (8,1,21,21)
+
+        # 結合為單一輸入Tensor：(9,1,21,21)
+        model_input = torch.cat([target_seq, cond_seq], dim=0)  
+
+        return model_input, target_seq
 
 # 定義 collate_fn 用於 DataLoader 批次處理，將單個樣本疊加成 batch
 def collate_fn(batch):
@@ -260,58 +264,105 @@ class DoubleConv3D(nn.Module):
         return self.conv(x)
 
 class UNet3D(nn.Module):
-    """
-    定義 3D UNet 模型，包含編碼器、解碼器、跳躍連接以及在瓶頸層中加入時間嵌入資訊
-    """
-    def __init__(self, in_channels=1, base_channels=32, time_emb_dim=TIME_EMB_DIM, dropout_rate=0.1):
+    def __init__(self, in_channels=9, base_channels=64, time_emb_dim=128, dropout_rate=0.0):
         super().__init__()
-        # 編碼器部分保持不變
-        self.enc1 = DoubleConv3D(in_channels, base_channels)
-        self.pool1 = nn.MaxPool3d(kernel_size=(1,2,2))
-        self.enc2 = DoubleConv3D(base_channels, base_channels * 2)
-        self.pool2 = nn.MaxPool3d(kernel_size=(1,2,2))
-        self.bottleneck = DoubleConv3D(base_channels * 2, base_channels * 4)
+        
+        # Encoder (下採樣) 部分
+        self.enc1 = DoubleConv3D(in_channels, base_channels)          # (9 → 64)
+        self.pool1 = nn.MaxPool3d((1, 2, 2))          # 21 → 10
+        
+        self.enc2 = DoubleConv3D(base_channels, base_channels * 2)      # (64 → 128)
+        self.pool2 = nn.MaxPool3d((1, 2, 2))          # 10 → 5
+        
+        self.enc3 = DoubleConv3D(base_channels * 2, base_channels * 4)  # (128 → 256)
+        self.pool3 = nn.MaxPool3d((1, 2, 2))          # 5 → 2
+        
+        self.enc4 = DoubleConv3D(base_channels * 4, base_channels * 8)  # (256 → 512)
+        self.pool4 = nn.MaxPool3d((1, 2, 2))          # 2 → 1
+        
+        # Bottleneck (瓶頸層)
+        self.bottleneck = DoubleConv3D(base_channels * 8, base_channels * 16)  # 512 → 1024
 
-        # 解碼器部分：調整上採樣層
-        self.up2 = nn.ConvTranspose3d(base_channels * 4, base_channels * 2, 
-                                     kernel_size=(1,2,2), stride=(1,2,2))
+        # Decoder (上採樣) 部分
+        self.up4 = nn.ConvTranspose3d(base_channels * 16, base_channels * 8, kernel_size=(1, 2, 2), stride=(1, 2, 2), output_padding=(0,1,1))
+        self.dec4 = DoubleConv3D(base_channels * 16, base_channels * 8)
+
+        self.up3 = nn.ConvTranspose3d(base_channels * 8, base_channels * 4, kernel_size=(1, 2, 2), stride=(1, 2, 2), output_padding=(0,1,1))
+        self.dec3 = DoubleConv3D(base_channels * 8, base_channels * 4)
+
+        self.up2 = nn.ConvTranspose3d(base_channels * 4, base_channels * 2, kernel_size=(1, 2, 2), stride=(1, 2, 2), output_padding=(0,1,1))
         self.dec2 = DoubleConv3D(base_channels * 4, base_channels * 2)
-        
-        # 在 self.up1 中添加 output_padding=(0,1,1)
-        self.up1 = nn.ConvTranspose3d(base_channels * 2, base_channels, 
-                                     kernel_size=(1,2,2), stride=(1,2,2), 
-                                     output_padding=(0,1,1))
+
+        self.up1 = nn.ConvTranspose3d(base_channels * 2, base_channels, kernel_size=(1, 2, 2), stride=(1, 2, 2), output_padding=(0,1,1))
         self.dec1 = DoubleConv3D(base_channels * 2, base_channels)
-        
-        # 輸出層保持不變
-        self.out_conv = nn.Conv3d(base_channels, in_channels, kernel_size=1)
+
+        # 輸出層
+        self.out_conv = nn.Conv3d(base_channels, 1, kernel_size=1)
+
+        # Dropout (暫時先設定為 0.0)
         self.dropout = nn.Dropout3d(dropout_rate)
+
+        # 時間嵌入
         self.time_proj = nn.Sequential(
-            nn.Linear(time_emb_dim, base_channels * 4),
+            nn.Linear(time_emb_dim, base_channels * 8),
             nn.SiLU()
         )
 
     def forward(self, x, t_emb):
-        # 編碼過程
-        e1 = self.enc1(x)     # (B, base_channels, T, 21, 21)
-        p1 = self.pool1(e1)   # (B, base_channels, T, 10, 10)
-        e2 = self.enc2(p1)    # (B, base_channels*2, T, 10, 10)
-        p2 = self.pool2(e2)   # (B, base_channels*2, T, 5, 5)
-        b = self.bottleneck(p2)  # (B, base_channels*4, T, 5, 5)
+        import torch.nn.functional as F
 
+        # Encoder
+        e1 = self.enc1(x)
+        p1 = self.pool1(e1)
+
+        e2 = self.enc2(p1)
+        p2 = self.pool2(e2)
+
+        e3 = self.enc3(p2)
+        p3 = self.pool3(e3)
+
+        e4 = self.enc4(p3)
+        p4 = self.pool4(e4)
+
+        # Bottleneck + 時間嵌入 (t_emb)
+        t_emb = self.time_proj(t_emb)[:, :, None, None, None]
+        b = self.bottleneck(p4 + t_emb)
         b = self.dropout(b)
-        t_emb_proj = self.time_proj(t_emb)
-        b = b + t_emb_proj.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
 
-        # 解碼過程
-        u2 = self.up2(b)      # (B, base_channels*2, T, 10, 10)
-        cat2 = torch.cat([u2, e2], dim=1)  # (B, base_channels*4, T, 10, 10)
-        d2 = self.dec2(cat2)  # (B, base_channels*2, T, 10, 10)
-        u1 = self.up1(d2)     # (B, base_channels, T, 21, 21) 因 output_padding
-        cat1 = torch.cat([u1, e1], dim=1)  # (B, base_channels*2, T, 21, 21)
-        d1 = self.dec1(cat1)  # (B, base_channels, T, 21, 21)
-        out = self.out_conv(d1)  # (B, in_channels, T, 21, 21)
-        return out
+        # Decoder (含 skip connections)
+
+        # 第一層上採樣 + skip connection (對應 e4)
+        d4 = self.up4(b)
+        if d4.shape[-3:] != e4.shape[-3:]:
+            d4 = F.interpolate(d4, size=e4.shape[-3:], mode='trilinear', align_corners=True)
+        d4 = torch.cat([d4, e4], dim=1)
+        d4 = self.dec4(d4)
+
+        # 第二層上採樣 + skip connection (對應 e3)
+        d3 = self.up3(d4)
+        if d3.shape[-3:] != e3.shape[-3:]:
+            d3 = F.interpolate(d3, size=e3.shape[-3:], mode='trilinear', align_corners=True)
+        d3 = torch.cat([d3, e3], dim=1)
+        d3 = self.dec3(d3)
+
+        # 第三層上採樣 + skip connection (對應 e2)
+        d2 = self.up2(d3)
+        if d2.shape[-3:] != e2.shape[-3:]:
+            d2 = F.interpolate(d2, size=e2.shape[-3:], mode='trilinear', align_corners=True)
+        d2 = torch.cat([d2, e2], dim=1)
+        d2 = self.dec2(d2)
+
+        # 第四層上採樣 + skip connection (對應 e1)
+        d1 = self.up1(d2)
+        if d1.shape[-3:] != e1.shape[-3:]:
+            d1 = F.interpolate(d1, size=e1.shape[-3:], mode='trilinear', align_corners=True)
+        d1 = torch.cat([d1, e1], dim=1)
+        d1 = self.dec1(d1)
+
+        output = self.out_conv(d1)
+        return output
+
+
 
 ######################################
 # 3. DDPM 模型定義 (DDPM3D)
@@ -336,12 +387,6 @@ class DDPM3D(nn.Module):
         self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
         # 1 - alpha 累積乘積的平方根
         self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
-        # 條件投影層：將條件數據 (通常來自歷史序列) 經全局平均池化後映射到 TIME_EMB_DIM 維度
-        self.cond_proj = nn.Sequential(
-            nn.AdaptiveAvgPool3d((1,1,1)),
-            nn.Flatten(),
-            nn.Linear(1, TIME_EMB_DIM)
-        ).to(device)
         # 預先計算時間嵌入中使用的頻率因子，避免在每次呼叫 get_time_embedding 時重複計算
         self.half_dim = TIME_EMB_DIM // 2
         self.freq_factor = torch.exp(torch.arange(self.half_dim, dtype=torch.float32) *
@@ -358,10 +403,7 @@ class DDPM3D(nn.Module):
         return torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
 
     def get_condition_embedding(self, cond):
-        """
-        將條件數據透過條件投影層轉換為 TIME_EMB_DIM 維度的向量
-        """
-        return self.cond_proj(cond)
+        return torch.zeros(cond.shape[0], TIME_EMB_DIM, device=cond.device)
 
     def q_sample(self, x0, t, noise=None):
         """
@@ -375,19 +417,26 @@ class DDPM3D(nn.Module):
         sqrt_one_minus_alpha = self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1, 1, 1)
         return sqrt_alpha * x0 + sqrt_one_minus_alpha * noise
 
-    def p_losses(self, cond, x0, t):
-        """
-        損失計算函數：先生成含噪數據，再由模型預測噪聲，最後以均方誤差 (MSE) 與真實噪聲比較
-        """
-        noise = torch.randn_like(x0)
-        x_t = self.q_sample(x0, t, noise=noise)
-        # 生成時間嵌入與條件嵌入，並將兩者相加
-        time_emb = self.get_time_embedding(t).to(self.device)
+    def p_losses(self, cond, target, t):
+        # 完整的9通道輸入（1個target + 8個歷史條件）
+        x_full = torch.cat([target, cond[:, 1:]], dim=1)  # (batch, 9, 1, 21, 21)
+
+        # 對第一個通道 (target channel) 加噪聲
+        noise = torch.randn_like(target)
+        x_noisy_target = self.q_sample(target, t, noise=noise)
+
+        # 將加噪後的target通道與8通道條件資料組合回來
+        x_t = torch.cat([x_noisy_target, cond[:, 1:]], dim=1)  # (batch, 9, 1, 21, 21)
+
+        # 不再使用條件embedding，回傳全零向量即可
         cond_emb = self.get_condition_embedding(cond)
+        time_emb = self.get_time_embedding(t).to(self.device)
         combined_emb = time_emb + cond_emb
-        # 模型預測噪聲
+
         pred_noise = self.model(x_t, combined_emb)
+
         return F.mse_loss(pred_noise, noise)
+
 
     @torch.no_grad()
     def p_sample(self, x_t, t, cond):
@@ -429,42 +478,42 @@ class DDPM3D(nn.Module):
 ######################################
 # 4. 訓練與評估函數
 ######################################
-def train_ddpm(diffusion, train_loader, val_loader, epochs=10, lr=1e-4, device='cuda', patience=3, 
-               lr_scheduler=True, weight_decay=1e-6):
-    """
-    訓練 DDPM 模型：
-    - diffusion：DDPM3D 模型
-    - train_loader：訓練數據 DataLoader
-    - val_loader：驗證數據 DataLoader
-    - epochs：訓練週期數
-    - lr：學習率
-    - patience：早停機制耐心值
-    """
-    # 使用整個 diffusion 模型 (包括 UNet3D 與條件投影層) 的參數進行更新
-    # 使用 weight_decay 減少過擬合
+import matplotlib.pyplot as plt
+
+import matplotlib.pyplot as plt
+import os
+
+def train_ddpm(diffusion, train_loader, val_loader, epochs=20, lr=1e-4, device='cuda', patience=3, 
+               lr_scheduler=True, weight_decay=1e-6, save_dir=r"C:\thesis\code\result_ddpm"):
+    
     optimizer = optim.AdamW(diffusion.parameters(), lr=lr, weight_decay=weight_decay)
     diffusion.to(device)
     best_val_loss = float('inf')
     patience_counter = 0
 
+    # 儲存損失記錄用
+    train_losses = []
+    val_losses = []
+
     for epoch in range(epochs):
         diffusion.train()
         total_train_loss = 0
-        # 逐批次訓練
         for cond, target in train_loader:
             cond = cond.to(device)
             target = target.to(device)
             optimizer.zero_grad()
-            # 隨機抽取一個時間步 t 作為當前步驟
             t = torch.randint(0, diffusion.timesteps, (target.shape[0],), device=device)
             loss = diffusion.p_losses(cond, target, t)
             loss.backward()
+            # 梯度裁剪 (Gradient Clipping)
+            torch.nn.utils.clip_grad_norm_(diffusion.parameters(), max_norm=1.0)
             optimizer.step()
             total_train_loss += loss.item()
+        
         avg_train_loss = total_train_loss / len(train_loader)
-        logging.info(f"Epoch [{epoch+1}/{epochs}] - Train Loss: {avg_train_loss:.4f}")
+        train_losses.append(avg_train_loss)
 
-        # 驗證階段：不更新參數，只計算驗證損失
+        # 驗證階段
         diffusion.eval()
         total_val_loss = 0
         with torch.no_grad():
@@ -474,14 +523,18 @@ def train_ddpm(diffusion, train_loader, val_loader, epochs=10, lr=1e-4, device='
                 t = torch.randint(0, diffusion.timesteps, (target.shape[0],), device=device)
                 loss = diffusion.p_losses(cond, target, t)
                 total_val_loss += loss.item()
+        
         avg_val_loss = total_val_loss / len(val_loader)
+        val_losses.append(avg_val_loss)
+
+        logging.info(f"Epoch [{epoch+1}/{epochs}] - Train Loss: {avg_train_loss:.4f}")
         logging.info(f"Epoch [{epoch+1}/{epochs}] - Val Loss: {avg_val_loss:.4f}")
 
-        # 根據驗證損失進行模型保存或早停
+        # 早停與儲存最佳模型
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             patience_counter = 0
-            torch.save(diffusion.state_dict(), 'best_model.pth')
+            torch.save(diffusion.state_dict(), os.path.join(save_dir, 'best_model.pth'))
         else:
             patience_counter += 1
             if patience_counter >= patience:
@@ -489,23 +542,43 @@ def train_ddpm(diffusion, train_loader, val_loader, epochs=10, lr=1e-4, device='
                 break
 
     logging.info("Training completed.")
+
+    # 建立儲存路徑
+    os.makedirs(save_dir, exist_ok=True)
+
+    # 視覺化損失並儲存圖檔
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, len(train_losses)+1), train_losses, label='Train Loss')
+    plt.plot(range(1, len(val_losses)+1), val_losses, label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training and Validation Loss Curve')
+    plt.legend()
+    plt.grid(True)
+
+    plt.savefig(os.path.join(save_dir, 'training_validation_loss.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
     return diffusion
 
+
+import random
 @torch.no_grad()
 def evaluate_model(diffusion, dataset, device='cuda', max_samples=100):
     """
     綜合評估模型性能：包括 MSE、MAE、SSIM 等多種指標
+    此處直接在原始數據尺度上計算，不進行反標準化處理
     """
     diffusion.eval()
     metrics = {
         'mse': 0.0,
         'mae': 0.0,
-        # 可添加其他指標
     }
     count = 0
     N = min(len(dataset), max_samples)
+    sample_indices = random.sample(range(len(dataset)), N)
     
-    for i in range(N):
+    for i in sample_indices:
         cond, target = dataset[i]
         cond = cond.unsqueeze(0).to(device)
         target = target.unsqueeze(0).to(device)
@@ -513,14 +586,12 @@ def evaluate_model(diffusion, dataset, device='cuda', max_samples=100):
         # 生成預測
         x_recon = diffusion.p_sample_loop(target.shape, cond)
         
-        # 計算多種評估指標
+        # 直接計算預測與目標之間的損失，不進行反標準化
         metrics['mse'] += F.mse_loss(x_recon, target).item()
         metrics['mae'] += F.l1_loss(x_recon, target).item()
-        # 可添加更多指標計算
         
         count += 1
     
-    # 計算平均值
     for key in metrics:
         metrics[key] /= count if count > 0 else 1.0
     
@@ -533,12 +604,13 @@ if __name__ == "__main__":
     # 網格尺寸與序列長度設定
     H = 21                     # 網格高度
     W = 21                     # 網格寬度
-    condition_length = 4       # 歷史條件序列長度 (小時數)
-    prediction_length = 2      # 預測序列長度 (小時數)
-    batch_size = 4             # 每個 batch 的樣本數
-    epochs = 10                # 訓練週期數
-    lr = 1e-4                  # 學習率
-    timesteps = 200            # 擴散步數
+    condition_length = 8       # 歷史條件序列長度 (小時數)
+    prediction_length = 1      # 預測序列長度 (小時數)
+    batch_size = 32             # 每個 batch 的樣本數
+    epochs = 100               # 訓練週期數
+    lr = 0.001                  # 學習率
+    timesteps = 1000            # 擴散步數
+    patience = 10
 
     # 設定種子以確保實驗可重複性
     torch.manual_seed(42)
@@ -554,7 +626,7 @@ if __name__ == "__main__":
         W=W,
         condition_length=condition_length,
         prediction_length=prediction_length,
-        normalize=True,
+        normalize=False,
         debug=True
     )
     dataset_size = len(full_dataset)
@@ -574,20 +646,206 @@ if __name__ == "__main__":
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
     # 初始化 3D UNet 模型，並建立 DDPM 模型
-    unet_3d = UNet3D(in_channels=1, base_channels=16, time_emb_dim=TIME_EMB_DIM)
+    unet_3d = UNet3D(
+        in_channels=9,          # 1未來 + 8過去
+        base_channels=64,       # 提高至64
+        time_emb_dim=TIME_EMB_DIM,
+        dropout_rate=0.0
+    )
     diffusion = DDPM3D(model=unet_3d, timesteps=timesteps, beta_start=1e-4, beta_end=0.02, device=device)
 
+
     # 開始訓練 DDPM 模型
-    trained_diffusion = train_ddpm(diffusion, train_loader, val_loader, epochs=epochs, lr=lr, device=device, patience=3)
+    trained_diffusion = train_ddpm(diffusion, train_loader, val_loader, epochs=epochs, lr=lr, device=device, patience=patience)
+
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    # 視覺化生成的預測結果與真實值比較
+    def visualize_predictions(cond, generated, target, sample_idx=0, save_dir=r"C:\thesis\code\result_ddpm"):
+        os.makedirs(save_dir, exist_ok=True)
+
+        pred_length = generated.shape[2]  # 預測序列長度
+
+        for t in range(pred_length):
+            plt.figure(figsize=(12, 4))
+
+            # 模型生成預測結果
+            plt.subplot(1, 3, 1)
+            plt.imshow(generated[sample_idx, 0, t].cpu().numpy(), cmap='viridis')
+            plt.colorbar()
+            plt.title(f'Generated Prediction (t={t})')
+
+            # 真實人流數據
+            plt.subplot(1, 3, 2)
+            plt.imshow(target[sample_idx, 0, t].cpu().numpy(), cmap='viridis')
+            plt.colorbar()
+            plt.title(f'True Data (t={t})')
+
+            # 誤差熱圖（差異圖）
+            plt.subplot(1, 3, 3)
+            error = np.abs(generated[sample_idx, 0, t].cpu().numpy() - target[sample_idx, 0, t].cpu().numpy())
+            plt.imshow(error, cmap='hot')
+            plt.colorbar()
+            plt.title(f'Absolute Error (t={t})')
+
+            plt.suptitle(f'Sample {sample_idx} - Time Step {t}', fontsize=16)
+            plt.tight_layout(rect=[0, 0, 1, 0.95])
+
+            # 儲存圖片
+            save_path = os.path.join(save_dir, f'prediction_sample{sample_idx}_t{t}.png')
+            plt.savefig(save_path, dpi=300)
+            plt.close()
 
     # 測試生成流程：根據部分條件數據生成預測結果
-    sample_shape = (2, 1, prediction_length, H, W)   # 生成 2 個樣本，每個樣本形狀為 (1, prediction_length, H, W)
+    sample_count = 8
+    sample_shape = (sample_count, 1, prediction_length, H, W)
     cond_batch, _ = next(iter(val_loader))
     cond_batch = cond_batch.to(device)
-    generated = trained_diffusion.p_sample_loop(sample_shape, cond_batch[:2])
+    generated = trained_diffusion.p_sample_loop(sample_shape, cond_batch[:sample_count])
     logging.info(f"Generated shape: {generated.shape}")
 
+    # 呼叫視覺化函數，選擇第一個樣本 (index=0) 做展示
+    _, target_batch = next(iter(val_loader))
+    visualize_predictions(cond_batch, generated, target_batch.to(device), sample_idx=0)
+
+    import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import numpy as np
+
+def truncate_colormap(cmap, minval=0.0, maxval=1.0, n=256):
+    """
+    返回一個截斷後的 colormap，只取原 colormap 的[minval, maxval]區間。
+    """
+    new_cmap = mcolors.LinearSegmentedColormap.from_list(
+        f'truncated({cmap.name},{minval:.2f},{maxval:.2f})',
+        cmap(np.linspace(minval, maxval, n))
+    )
+    return new_cmap
+
+def plot_grid_with_error(sorted_flow_columns, H, W, error_matrix, 
+                         save_path=r"C:\thesis\code\result_ddpm\plot_grid_with_error.png"):
+    """
+    顯示網格排列結果並將模型預測的均方誤差 (MSE) 標示於各網格座標，
+    使用橘色到紅色的色系（避免太淺的色調）。
+    
+    此處 error_matrix 是基於原始數據計算得到的平均絕對誤差，
+    並取平方以獲得每個網格點的 MSE。
+    
+    Args:
+        sorted_flow_columns (list): 排序後的欄位名稱列表，包含經緯度座標。
+        H (int): 網格高度。
+        W (int): 網格寬度。
+        error_matrix (np.ndarray): 誤差數值矩陣 (形狀應為 (H, W))。
+        save_path (str): 圖片儲存路徑。
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.colors as mcolors
+    import numpy as np
+
+    # 解析各個欄位的經緯度
+    locations = [parse_lat_lon(col) for col in sorted_flow_columns]
+    longitudes, latitudes = zip(*locations)
+    
+    # 將誤差取平方，得到 MSE
+    mse_matrix = error_matrix ** 2
+
+    plt.figure(figsize=(12, 12))
+    orig_cmap = plt.get_cmap('OrRd')
+    trunc_cmap = truncate_colormap(orig_cmap, 0.3, 1.0)
+    
+    scatter = plt.scatter(longitudes, latitudes, c=mse_matrix.flatten(), cmap=trunc_cmap, marker='o')
+    plt.colorbar(scatter, label='MSE')
+    plt.xlabel("Longitude")
+    plt.ylabel("Latitude")
+    plt.title("Grid with MSE")
+    plt.grid(True)
+    plt.savefig(save_path, dpi=600, bbox_inches='tight', pad_inches=0.1)
+    plt.close()
+
+    # 整理成表格
+    table_data = {
+        'Grid Index': [],
+        'Longitude': [],
+        'Latitude': [],
+        'MSE': []
+    }
+    
+    for i in range(H):
+        for j in range(W):
+            idx = i * W + j
+            table_data['Grid Index'].append(f'[{i},{j}]')
+            table_data['Longitude'].append(longitudes[idx])
+            table_data['Latitude'].append(latitudes[idx])
+            table_data['MSE'].append(mse_matrix[i, j])
+
+    # 創建 DataFrame
+    df = pd.DataFrame(table_data)
+    
+    # 保存表格為 CSV 文件
+    save_dir = os.path.dirname(save_path)
+    table_save_path = os.path.join(save_dir, 'mse_per_coordinate.csv')
+    df.to_csv(table_save_path, index=False)
+    logging.info(f"MSE per coordinate table saved to {table_save_path}")
+
+    # 可選：保存為 Excel 文件
+    excel_save_path = os.path.join(save_dir, 'mse_per_coordinate.xlsx')
+    df.to_excel(excel_save_path, index=False)
+    logging.info(f"MSE per coordinate table saved to {excel_save_path}")
+
+
+    # 範例：假設 generated 是預測結果，target_batch 為實際數據，取第一個樣本及第一個預測時間點
+    import numpy as np
+
+    generated_sample = generated[0, 0, 0].cpu().numpy()
+    target_sample = target_batch[0, 0, 0].cpu().numpy()
+
+    # 計算誤差矩陣
+    # 結果形狀為 (1, H, W)，接著取第一個通道得到 (H, W)
+    generated = trained_diffusion.p_sample_loop(sample_shape, cond_batch[:sample_count])
+    # 計算所有樣本與時間步的平均絕對誤差矩陣：
+    # 首先計算絕對誤差，再在 axis=(0, 2) 進行平均，得到形狀 (1, H, W)，取第一個通道得到 (H, W)
+    error_matrix = torch.abs(generated - target_batch[:sample_count].to(device)).cpu().numpy()
+    error_matrix = np.mean(error_matrix, axis=(0,2))[0]
+
+    # 視覺化到座標網格上
+    plot_grid_with_error(full_dataset.sorted_flow_columns, H, W, error_matrix)
+
+
     # 評估模型重構誤差 (MSE)，使用部分驗證數據進行測試
-    recon_mse = evaluate_model(trained_diffusion, val_dataset, device=device, max_samples=50)
-    logging.info(f"Reconstruction MSE (up to 50 samples): {recon_mse['mse']:.6f}")
+    max_samples = 100
+    recon_metrics = evaluate_model(trained_diffusion, val_dataset, device=device, max_samples=100)
+    logging.info(f"Reconstruction MSE : {recon_metrics['mse']:.6f}")
+    logging.info(f"Reconstruction MAE : {recon_metrics['mae']:.6f}")
+
+    # 保存評估結果到文件
+    save_dir = r"C:\thesis\code\result_ddpm"
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # 將評估指標保存為文本文件
+    metrics_file = os.path.join(save_dir, "evaluation_metrics.txt")
+    with open(metrics_file, 'w') as f:
+        f.write(f"Evaluation Metrics (computed on {max_samples} samples):\n")
+        f.write(f"Date: {pd.Timestamp.now()}\n")
+        f.write(f"Reconstruction MSE: {recon_metrics['mse']:.6f}\n")
+        f.write(f"Reconstruction MAE: {recon_metrics['mae']:.6f}\n")
+    
+    # 將評估指標保存為JSON文件（便於後續程式讀取）
+    import json
+    metrics_json_file = os.path.join(save_dir, "evaluation_metrics.json")
+    with open(metrics_json_file, 'w') as f:
+        json.dump({
+            "mse": recon_metrics['mse'],
+            "mae": recon_metrics['mae'],
+            "sample_size": max_samples,
+            "timestamp": pd.Timestamp.now().isoformat()
+        }, f, indent=4)
+
+    logging.info(f"Evaluation metrics saved to {metrics_file} and {metrics_json_file}")
+
+    # # 可選：保存生成的樣本數據為numpy檔案
+    # generated_np = generated.cpu().numpy()
+    # np.save(os.path.join(save_dir, "generated_samples.npy"), generated_np)
+    # logging.info(f"Generated samples saved to {os.path.join(save_dir, 'generated_samples.npy')}")
+
 

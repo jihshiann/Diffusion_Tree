@@ -1,5 +1,4 @@
 import os
-import pickle
 import pandas as pd
 import numpy as np
 import lightgbm as lgb
@@ -7,7 +6,7 @@ import shap
 import matplotlib.pyplot as plt
 from collections import deque
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error
+from sklearn.metrics import mean_squared_error, mean_absolute_error
 
 # ---------------------------
 # 設定與數據讀取
@@ -58,7 +57,6 @@ df_original = df.copy()
 
 # 提取座標欄位（假設格式為 "(經度, 緯度)"）
 target_columns = [col for col in df.columns if '(' in col and ')' in col]
-target_columns = target_columns[:22*22]
 print("所有座標點：", target_columns)
 
 # 替換 DataFrame 欄位名稱為英文供 LightGBM 使用
@@ -144,7 +142,8 @@ geo_coords = []
 root_rules = {}    # 儲存每個 target 的根部規則 (僅根節點)
 rule_paths = {}    # 儲存每個 target 的廣度優先規則路徑
 
-# 新增：記錄每個 target 的最佳 MSE、模型物件及最佳樹索引
+# 新增：記錄每個 target 的最佳 MAE、模型物件及最佳樹索引
+target_mae = {}
 target_mse = {}
 target_models = {}
 target_best_tree_index = {}
@@ -153,13 +152,13 @@ for target in target_columns:
     print(f"訓練與預測 {target} 的決策樹...")
     train_data = lgb.Dataset(X_train_tree, label=y_train[target], categorical_feature=cat_features)
     test_data = lgb.Dataset(X_test_tree, label=y_test[target], reference=train_data, categorical_feature=cat_features)
-    # 將 metric 改為 "l2" (即 MSE)
+    # 將 metric 改為同時計算 "l2" (MSE) 與 "l1" (MAE)
     params = {
         'objective': 'regression',
-        'metric': 'l2',
+        'metric': ['l2', 'l1'],
         'boosting_type': 'gbdt',
         'num_leaves': 31,
-        'learning_rate': 0.05,
+        'learning_rate': 0.01,
         'feature_fraction': 0.9,
         'seed': 42
     }
@@ -179,9 +178,10 @@ for target in target_columns:
     print(f"LightGBM 總樹數: {lgb_model.num_trees()}")
     if "valid_0" in evals_result and "l2" in evals_result["valid_0"]:
         plt.figure(figsize=(8, 5))
+        # 繪製 MSE 學習曲線
         plt.plot(evals_result['valid_0']['l2'], label="Validation MSE", color="blue")
         plt.xlabel("Iterations")
-        plt.ylabel("MSE")
+        plt.ylabel("Error")
         plt.title(f"Learning Curve ({target})")
         plt.legend()
         learning_curve_path = os.path.join(result_dir, "learning_curve", f"{target.replace(',', '_').replace(' ', '')}.png")
@@ -196,7 +196,8 @@ for target in target_columns:
     # 取每棵樹根節點的 split_gain，若不存在則設為 0
     split_gains = [tree_info[i]["tree_structure"].get("split_gain", 0) for i in range(len(tree_info))]
     best_tree_index = np.argmax(split_gains)
-    # 記錄該樹對應的 MSE (僅供參考)
+    # 使用 MAE 計算模型表現
+    target_mae[target] = mean_absolute_error(y_test[target], y_pred)
     target_mse[target] = mean_squared_error(y_test[target], y_pred)
     target_models[target] = lgb_model
     target_best_tree_index[target] = best_tree_index
@@ -242,14 +243,15 @@ threshold = total_targets / 5.0
 
 final_groups = assign_group_by_feature_prefix(rule_paths, threshold)
 
-# 將每個群中 MSE 最低的座標選為群代表
+# 將每個群中 MAE 最低的座標選為群代表
 group_to_targets = {}
 for target, group_prefix in final_groups.items():
     group_to_targets.setdefault(group_prefix, []).append(target)
 
 group_representative = {}
+# 這裡使用 target_mae 作為選擇群代表的標準
 for group_prefix, targets in group_to_targets.items():
-    best_target = min(targets, key=lambda t: target_mse[t])
+    best_target = min(targets, key=lambda t: target_mae[t])
     group_representative[group_prefix] = best_target
 
 # 將群代表的模型視覺化，同時標示出該群的規則
@@ -279,8 +281,6 @@ for group_prefix, rep_target in group_representative.items():
     plt.close()
     print(f"群代表 {rep_target} 的決策樹圖已存至: {rep_tree_plot_path}")
 
-
-
 # 建立 target -> 分組標籤對照表：將唯一前綴映射到數值標籤
 unique_prefixes = {v for v in final_groups.values()}
 prefix_to_label = {prefix: idx for idx, prefix in enumerate(unique_prefixes)}
@@ -301,14 +301,23 @@ for prefix, label in prefix_to_label.items():
     targets_in_prefix = [t for t, p in final_groups.items() if p == prefix]
     count = len(targets_in_prefix)
     rep_target = group_representative[prefix]
+    
+    # 同時計算 MAE 與 MSE 的群體指標
+    rep_mae = target_mae[rep_target]
     rep_mse = target_mse[rep_target]
+    group_mae = np.mean([target_mae[t] for t in targets_in_prefix])
     group_mse = np.mean([target_mse[t] for t in targets_in_prefix])
+    overall_mae = np.mean(list(target_mae.values()))
     overall_mse = np.mean(list(target_mse.values()))
+    
     group_rows.append({
         "規則": prefix_str,
         "座標數": count,
         "分組標籤": label,
         "群代表座標": rep_target,
+        "代表座標MAE": rep_mae,
+        "群平均MAE": group_mae,
+        "總平均MAE": overall_mae,
         "代表座標MSE": rep_mse,
         "群平均MSE": group_mse,
         "總平均MSE": overall_mse,
@@ -356,15 +365,14 @@ for prefix, rep_target in group_representative.items():
     plt.figure(figsize=(30, 18))
     # 繪製決策樹
     lgb.plot_tree(
-    model, 
-    tree_index=target_best_tree_index[rep_target], 
-    show_info=['split_gain'],
-    graph_attr={
-        'ranksep': '0.75',  # 層與層之間的距離（預設約 0.75）
-        'nodesep': '0.25'   # 同層節點之間的距離（預設約 0.25）
-    })
+        model, 
+        tree_index=target_best_tree_index[rep_target], 
+        show_info=['split_gain'],
+        graph_attr={
+            'ranksep': '0.75',  # 層與層之間的距離（預設約 0.75）
+            'nodesep': '0.25'   # 同層節點之間的距離（預設約 0.25）
+        })
     # 在圖上標題處加入群代表與群規則說明
-    # 調整子圖布局，讓繪圖區域往上移
     plt.suptitle(f"群代表: {rep_target}\n群規則: {rule_str}", fontsize=5)
     safe_target = rep_target.replace("(", "").replace(")", "").replace(",", "_").replace(" ", "")
     group_tree_path = os.path.join(group_tree_dir, f"group_representative_tree_{safe_target}.png")

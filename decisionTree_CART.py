@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 from collections import deque
 from sklearn.model_selection import train_test_split, learning_curve
 from sklearn.tree import DecisionTreeRegressor, plot_tree
-from sklearn.metrics import mean_squared_error
+from sklearn.metrics import mean_squared_error, mean_absolute_error
 import shap
 
 # ---------------------------
@@ -150,6 +150,7 @@ predictions = {}
 grid_ids = []
 rule_paths = {}  # 儲存每個 target 的廣度優先規則路徑
 target_mse = {}  # 使用 MSE 作為評估指標
+target_mae = {}  # 使用 MAE 作為評估指標
 target_models = {}
 target_best_tree_index = {}
 geo_coords = []
@@ -167,11 +168,16 @@ for target in target_columns:
     )
     dt_model.fit(X_train_tree, y_train[target])
     y_pred = dt_model.predict(X_test_tree)
+    
     mse = mean_squared_error(y_test[target], y_pred)
+    mae = mean_absolute_error(y_test[target], y_pred)  # 計算 MAE
+    
     predictions[target] = y_pred
     target_mse[target] = mse
+    target_mae[target] = mae
     target_models[target] = dt_model
     print(f"{target} 的 MSE: {mse}")
+    print(f"{target} 的 MAE: {mae}")
     
     # 使用 learning_curve 計算不同訓練樣本量下的得分，這裡採用 neg_mean_squared_error
     train_sizes, train_scores, test_scores = learning_curve(
@@ -181,7 +187,7 @@ for target in target_columns:
         cv=5,
         scoring='neg_mean_squared_error',
         train_sizes=np.linspace(0.1, 1.0, 10),
-        random_state=42  # 若版本支持
+        random_state=42
     )
     # 取負值轉為正的 MSE
     train_scores_mean = -np.mean(train_scores, axis=1)
@@ -198,7 +204,7 @@ for target in target_columns:
     plt.savefig(learning_curve_path, dpi=300, bbox_inches="tight")
     plt.close()
     print(f"學習曲線圖已儲存至: {learning_curve_path}")
-
+    
     # 繪製 CART 決策樹圖
     plt.figure(figsize=(30, 18))
     plot_tree(dt_model, feature_names=list(X_train_tree.columns), filled=True)
@@ -241,13 +247,13 @@ threshold = total_targets / 5.0
 
 final_groups = assign_group_by_feature_prefix(rule_paths, threshold)
 
-# 選群代表：以 MSE 最低者為群代表
+# 選群代表：以 MAE 最低者為群代表
 group_to_targets = {}
 for target, group_prefix in final_groups.items():
     group_to_targets.setdefault(group_prefix, []).append(target)
 group_representative = {}
 for group_prefix, targets in group_to_targets.items():
-    best_target = min(targets, key=lambda t: target_mse[t])
+    best_target = min(targets, key=lambda t: target_mae[t])
     group_representative[group_prefix] = best_target
 
 # 存群代表的模型檔
@@ -265,7 +271,7 @@ unique_prefixes = {v for v in final_groups.values()}
 prefix_to_label = {prefix: idx for idx, prefix in enumerate(unique_prefixes)}
 group_labels = {target: prefix_to_label[final_groups[target]] for target in final_groups}
 
-# 輸出分群結果到 CSV：僅顯示分組時使用的特徵名稱 (中文)
+# 輸出分群結果到 CSV：同時列出 MAE 與 MSE
 reverse_mapping = {v: k for k, v in feature_mapping.items()}
 group_rows = []
 for prefix, label in prefix_to_label.items():
@@ -281,20 +287,30 @@ for prefix, label in prefix_to_label.items():
     targets_in_prefix = [t for t, p in final_groups.items() if p == prefix]
     count = len(targets_in_prefix)
     rep_target = group_representative[prefix]
+    
+    rep_mae = target_mae[rep_target]
+    group_mae = np.mean([target_mae[t] for t in targets_in_prefix])
+    overall_mae = np.mean(list(target_mae.values()))
+    
     rep_mse = target_mse[rep_target]
     group_mse = np.mean([target_mse[t] for t in targets_in_prefix])
     overall_mse = np.mean(list(target_mse.values()))
+    
     group_rows.append({
         "規則": prefix_str,
         "座標數": count,
         "分組標籤": label,
         "群代表座標": rep_target,
+        "代表座標MAE": rep_mae,
+        "群平均MAE": group_mae,
+        "所有座標平均MAE": overall_mae,
         "代表座標MSE": rep_mse,
         "群平均MSE": group_mse,
         "所有座標平均MSE": overall_mse,
         "目標": ", ".join(targets_in_prefix)
     })
 
+print("所有座標平均 MAE:", overall_mae)
 print("所有座標平均 MSE:", overall_mse)
 group_df = pd.DataFrame(group_rows)
 excel_path = os.path.join(result_dir, "grouping_results.csv")

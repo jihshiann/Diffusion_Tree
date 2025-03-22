@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DDPM 3D U-Net 模型訓練流程</title>
+    <style>
+        :root {
+            --primary-color: #4a6fa5;
+            --secondary-color: #6c9bcf;
+            --accent-color: #5d8aa8;
+            --light-bg: #f5f9ff;
+            --border-color: #d1e0f0;
+            --text-color: #333;
+            --section-bg: #edf2f9;
+        }
+        
+        body {
+            font-family: 'Arial', sans-serif;
+            line-height: 1.6;
+            color: var(--text-color);
+            background-color: var(--light-bg);
+            margin: 0;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background-color: white;
+            box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        
+        header {
+            background-color: var(--primary-color);
+            color: white;
+            padding: 20px;
+            text-align: center;
+        }
+        
+        h1 {
+            margin: 0;
+            font-size: 28px;
+        }
+        
+        h2 {
+            color: var(--primary-color);
+            border-bottom: 2px solid var(--border-color);
+            padding-bottom: 10px;
+            margin-top: 30px;
+        }
+        
+        h3 {
+            color: var(--accent-color);
+        }
+        
+        .content {
+            padding: 20px;
+        }
+        
+        .flow-section {
+            background-color: var(--section-bg);
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 25px;
+            border-left: 5px solid var(--primary-color);
+        }
+        
+        .flow-title {
+            display: flex;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+        
+        .step-number {
+            background-color: var(--primary-color);
+            color: white;
+            width: 35px;
+            height: 35px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            margin-right: 15px;
+        }
+        
+        .details {
+            margin-top: 15px;
+            border-top: 1px solid var(--border-color);
+            padding-top: 15px;
+        }
+        
+        .diagram {
+            background-color: white;
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 20px;
+            margin: 20px 0;
+            text-align: center;
+        }
+        
+        .diagram img {
+            max-width: 100%;
+            height: auto;
+        }
+        
+        ul {
+            padding-left: 20px;
+        }
+        
+        li {
+            margin-bottom: 8px;
+        }
+        
+        .code-container {
+            margin: 20px 0;
+        }
+        
+        .code-header {
+            background-color: var(--secondary-color);
+            color: white;
+            padding: 8px 15px;
+            border-radius: 8px 8px 0 0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .code-content {
+            background-color: #f8f9fa;
+            border: 1px solid var(--border-color);
+            border-top: none;
+            border-radius: 0 0 8px 8px;
+            padding: 15px;
+            max-height: 200px;
+            overflow: auto;
+            font-family: monospace;
+            white-space: pre;
+            font-size: 14px;
+            display: none;
+        }
+        
+        .toggle-btn {
+            background-color: rgba(255, 255, 255, 0.3);
+            border: none;
+            color: white;
+            padding: 4px 8px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        
+        .toggle-btn:hover {
+            background-color: rgba(255, 255, 255, 0.5);
+        }
+        
+        .architecture-diagram {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            margin: 30px 0;
+        }
+        
+        .network-layer {
+            display: flex;
+            align-items: center;
+            margin-bottom: 15px;
+            width: 100%;
+        }
+        
+        .layer-box {
+            background-color: var(--secondary-color);
+            color: white;
+            padding: 10px 15px;
+            border-radius: 6px;
+            margin: 0 5px;
+            text-align: center;
+            flex: 1;
+        }
+        
+        .arrow-down {
+            text-align: center;
+            font-size: 24px;
+            color: var(--primary-color);
+            margin: 5px 0;
+        }
+        
+        .dataset-display {
+            display: flex;
+            justify-content: space-between;
+            margin: 20px 0;
+            gap: 20px;
+        }
+        
+        .data-sample {
+            flex: 1;
+            background-color: white;
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 15px;
+            text-align: center;
+        }
+        
+        .data-sample h4 {
+            margin-top: 0;
+            color: var(--primary-color);
+        }
+        
+        .data-grid {
+            display: grid;
+            grid-template-columns: repeat(5, 1fr);
+            gap: 5px;
+            margin-top: 10px;
+        }
+        
+        .grid-cell {
+            background-color: #e9f0f8;
+            padding: 10px 5px;
+            font-size: 12px;
+            border-radius: 4px;
+        }
+        
+        .evaluation-metrics {
+            display: flex;
+            justify-content: space-around;
+            margin: 20px 0;
+        }
+        
+        .metric-card {
+            background-color: white;
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 20px;
+            text-align: center;
+            flex: 1;
+            margin: 0 10px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
+        }
+        
+        .metric-value {
+            font-size: 24px;
+            font-weight: bold;
+            color: var(--primary-color);
+            margin: 10px 0;
+        }
+        
+        .summary {
+            background-color: #f0f4f8;
+            border-radius: 8px;
+            padding: 20px;
+            margin-top: 30px;
+        }
+        
+        @media (max-width: 768px) {
+            .dataset-display {
+                flex-direction: column;
+            }
+            
+            .evaluation-metrics {
+                flex-direction: column;
+            }
+            
+            .metric-card {
+                margin: 10px 0;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>DDPM 3D U-Net 模型訓練流程</h1>
+        </header>
+        
+        <div class="content">
+            <p>本圖解將帶您了解使用擴散概率模型（DDPM）結合 3D U-Net 架構的模型訓練流程，用於人流預測任務。此模型能夠根據歷史人流數據，預測未來的人流分布情況。</p>
+            
+            <!-- 概述 -->
+            <h2>模型概述</h2>
+            <div class="diagram">
+                <svg width="700" height="200" viewBox="0 0 700 200">
+                    <!-- 概述圖 -->
+                    <rect x="50" y="40" width="150" height="80" rx="10" fill="#4a6fa5" />
+                    <text x="125" y="85" text-anchor="middle" fill="white" font-size="14">輸入條件</text>
+                    <text x="125" y="105" text-anchor="middle" fill="white" font-size="12">歷史人流數據</text>
+                    
+                    <path d="M200 80 L250 80" stroke="#333" stroke-width="2" marker-end="url(#arrow)" />
+                    
+                    <rect x="250" y="40" width="200" height="80" rx="10" fill="#5d8aa8" />
+                    <text x="350" y="75" text-anchor="middle" fill="white" font-size="14">DDPM 3D U-Net</text>
+                    <text x="350" y="95" text-anchor="middle" fill="white" font-size="12">擴散與去噪過程</text>
+                    
+                    <path d="M450 80 L500 80" stroke="#333" stroke-width="2" marker-end="url(#arrow)" />
+                    
+                    <rect x="500" y="40" width="150" height="80" rx="10" fill="#4a6fa5" />
+                    <text x="575" y="85" text-anchor="middle" fill="white" font-size="14">輸出預測</text>
+                    <text x="575" y="105" text-anchor="middle" fill="white" font-size="12">未來人流分布</text>
+                    
+                    <!-- 箭頭定義 -->
+                    <defs>
+                        <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+                            <path d="M0,0 L0,6 L9,3 z" fill="#333" />
+                        </marker>
+                    </defs>
+                </svg>
+            </div>
+            
+            <!-- 數據準備 -->
+            <div class="flow-section">
+                <div class="flow-title">
+                    <div class="step-number">1</div>
+                    <h3>數據準備與預處理</h3>
+                </div>
+                <p>首先，我們需要加載和處理人流數據，根據經緯度坐標組織成網格數據。</p>
+                
+                <div class="details">
+                    <ul>
+                        <li><strong>數據加載</strong>：從 CSV 文件讀取人流數據</li>
+                        <li><strong>網格結構化</strong>：將經緯度坐標組織成 21x21 的網格</li>
+                        <li><strong>數據標準化</strong>：對數據進行標準化處理</li>
+                        <li><strong>時間窗口設置</strong>：設置條件長度（condition_length=8）和預測長度（prediction_length=1）</li>
+                    </ul>
+                    
+                    <div class="code-container">
+                        <div class="code-header">
+                            <span>PeopleFlowDatasetCondition 類（數據處理）</span>
+                            <button class="toggle-btn" onclick="toggleCode('dataset-code')">顯示/隱藏代碼</button>
+                        </div>
+                        <div id="dataset-code" class="code-content">
+class PeopleFlowDatasetCondition(Dataset):
+    def __init__(self, csv_path, H, W, condition_length, prediction_length, transform=None, normalize=True):
+        self.df = pd.read_csv(csv_path)
+        self.condition_length = condition_length
+        self.prediction_length = prediction_length
+        self.total_length = condition_length + prediction_length
+        self.normalize = normalize
+        self.H, self.W = H, W
+        # 構建網格結構...
+        
+        # 數據標準化處理
+        if normalize:
+            self.mean_val = self.data.mean()
+            self.std_val = self.data.std() + 1e-5
+            self.data = (self.data - self.mean_val) / self.std_val
+                        </div>
+                    </div>
+                    
+                    <div class="dataset-display">
+                        <div class="data-sample">
+                            <h4>輸入條件（歷史數據）</h4>
+                            <div class="data-grid">
+                                <div class="grid-cell">t-8</div>
+                                <div class="grid-cell">t-7</div>
+                                <div class="grid-cell">t-6</div>
+                                <div class="grid-cell">t-5</div>
+                                <div class="grid-cell">t-4</div>
+                                <div class="grid-cell">t-3</div>
+                                <div class="grid-cell">t-2</div>
+                                <div class="grid-cell">t-1</div>
+                            </div>
+                            <p>8個時間步的歷史人流</p>
+                        </div>
+                        <div class="data-sample">
+                            <h4>預測目標（未來數據）</h4>
+                            <div class="data-grid">
+                                <div class="grid-cell">t</div>
+                            </div>
+                            <p>下一個時間步的人流預測</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- 模型架構 -->
+            <div class="flow-section">
+                <div class="flow-title">
+                    <div class="step-number">2</div>
+                    <h3>模型架構設計</h3>
+                </div>
+                <p>設計 3D U-Net 網絡架構，結合擴散概率模型（DDPM）框架。</p>
+                
+                <div class="details">
+                    <div class="architecture-diagram">
+                        <div class="network-layer">
+                            <div class="layer-box">輸入層<br>人流數據 + 噪聲</div>
+                        </div>
+                        <div class="arrow-down">↓</div>
+                        <div class="network-layer">
+                            <div class="layer-box">編碼器 1<br>Conv3D → BN → ReLU</div>
+                        </div>
+                        <div class="arrow-down">↓</div>
+                        <div class="network-layer">
+                            <div class="layer-box">編碼器 2-4<br>MaxPool → Conv3D → BN → ReLU</div>
+                        </div>
+                        <div class="arrow-down">↓</div>
+                        <div class="network-layer">
+                            <div class="layer-box">瓶頸層<br>時間嵌入融合</div>
+                        </div>
+                        <div class="arrow-down">↓</div>
+                        <div class="network-layer">
+                            <div class="layer-box">解碼器 4-1<br>TransConv → Conv3D → BN → ReLU</div>
+                        </div>
+                        <div class="arrow-down">↓</div>
+                        <div class="network-layer">
+                            <div class="layer-box">輸出層<br>預測噪聲</div>
+                        </div>
+                    </div>
+                    
+                    <ul>
+                        <li><strong>3D U-Net</strong>：使用三維卷積處理時空數據</li>
+                        <li><strong>跳躍連接</strong>：編碼器和解碼器之間的連接，保留空間細節</li>
+                        <li><strong>時間嵌入</strong>：將擴散時間步嵌入到模型中</li>
+                        <li><strong>條件嵌入</strong>：融合歷史人流數據作為條件</li>
+                    </ul>
+                    
+                    <div class="code-container">
+                        <div class="code-header">
+                            <span>UNet3D 模型架構</span>
+                            <button class="toggle-btn" onclick="toggleCode('unet-code')">顯示/隱藏代碼</button>
+                        </div>
+                        <div id="unet-code" class="code-content">
+class UNet3D(nn.Module):
+    def __init__(self, in_channels=1, base_channels=64, time_emb_dim=128, dropout_rate=0.0):
+        super().__init__()
+        self.enc1 = DoubleConv3D(in_channels, base_channels)
+        self.pool1 = nn.MaxPool3d((2, 2, 2))
+        self.enc2 = DoubleConv3D(base_channels, base_channels * 2)
+        self.pool2 = nn.MaxPool3d((2, 2, 2))
+        self.enc3 = DoubleConv3D(base_channels * 2, base_channels * 4)
+        self.pool3 = nn.MaxPool3d((2, 2, 2))
+        self.enc4 = DoubleConv3D(base_channels * 4, base_channels * 8)
+        self.pool4 = nn.MaxPool3d(kernel_size=(2, 2, 2), stride=(1, 2, 2), padding=(1, 0, 0))
+        self.bottleneck = DoubleConv3D(base_channels * 8, base_channels * 16)
+        self.up4 = nn.ConvTranspose3d(base_channels * 16, base_channels * 8, kernel_size=(2, 2, 2), stride=(1, 2, 2), output_padding=(0, 1, 1))
+        self.dec4 = DoubleConv3D(base_channels * 16, base_channels * 8)
+        # ... 解碼器部分 ...
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- DDPM 框架 -->
+            <div class="flow-section">
+                <div class="flow-title">
+                    <div class="step-number">3</div>
+                    <h3>DDPM 擴散模型設計</h3>
+                </div>
+                <p>實現擴散概率模型（Denoising Diffusion Probabilistic Models）框架，用於從噪聲中生成人流數據。</p>
+                
+                <div class="details">
+                    <div class="diagram">
+                        <svg width="700" height="250" viewBox="0 0 700 250">
+                            <!-- DDPM 流程圖 -->
+                            <rect x="50" y="50" width="120" height="60" rx="10" fill="#4a6fa5" />
+                            <text x="110" y="85" text-anchor="middle" fill="white" font-size="14">原始數據 x₀</text>
+                            
+                            <path d="M170 80 L220 80" stroke="#333" stroke-width="2" marker-end="url(#arrow2)" />
+                            <text x="195" y="70" text-anchor="middle" font-size="12">添加噪聲</text>
+                            
+                            <rect x="220" y="50" width="120" height="60" rx="10" fill="#5d8aa8" />
+                            <text x="280" y="85" text-anchor="middle" fill="white" font-size="14">噪聲數據 xₜ</text>
+                            
+                            <path d="M340 80 L390 80" stroke="#333" stroke-width="2" marker-end="url(#arrow2)" />
+                            <text x="365" y="70" text-anchor="middle" font-size="12">送入模型</text>
+                            
+                            <rect x="390" y="50" width="140" height="60" rx="10" fill="#6c9bcf" />
+                            <text x="460" y="85" text-anchor="middle" fill="white" font-size="14">UNet 預測噪聲</text>
+                            
+                            <path d="M530 80 L580 80" stroke="#333" stroke-width="2" marker-end="url(#arrow2)" />
+                            <text x="555" y="70" text-anchor="middle" font-size="12">去噪</text>
+                            
+                            <rect x="580" y="50" width="120" height="60" rx="10" fill="#4a6fa5" />
+                            <text x="640" y="85" text-anchor="middle" fill="white" font-size="14">重建數據 x₀</text>
+                            
+                            <!-- 前向過程 -->
+                            <path d="M110 110 L110 150 L590 150 L590 110" stroke="#333" stroke-width="2" stroke-dasharray="5,5" />
+                            <text x="350" y="170" text-anchor="middle" font-size="14">前向過程（逐步增加噪聲）</text>
+                            
+                            <!-- 反向過程 -->
+                            <path d="M640 110 L640 190 L160 190 L160 110" stroke="#333" stroke-width="2" stroke-dasharray="5,5" />
+                            <text x="350" y="210" text-anchor="middle" font-size="14">反向過程（逐步去除噪聲）</text>
+                            
+                            <!-- 箭頭定義 -->
+                            <defs>
+                                <marker id="arrow2" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+                                    <path d="M0,0 L0,6 L9,3 z" fill="#333" />
+                                </marker>
+                            </defs>
+                        </svg>
+                    </div>
+                    
+                    <ul>
+                        <li><strong>擴散過程</strong>：逐步向數據添加高斯噪聲</li>
+                        <li><strong>去噪過程</strong>：訓練模型學習如何移除噪聲</li>
+                        <li><strong>條件生成</strong>：基於歷史數據的條件生成</li>
+                        <li><strong>時間步設置</strong>：總共使用 1000 個時間步</li>
+                    </ul>
+                    
+                    <div class="code-container">
+                        <div class="code-header">
+                            <span>DDPM3D 類（擴散模型實現）</span>
+                            <button class="toggle-btn" onclick="toggleCode('ddpm-code')">顯示/隱藏代碼</button>
+                        </div>
+                        <div id="ddpm-code" class="code-content">
+class DDPM3D(nn.Module):
+    def __init__(self, model, timesteps=1000, beta_start=1e-4, beta_end=0.02, device='cuda'):
+        super().__init__()
+        self.model = model
+        self.timesteps = timesteps
+        self.device = device
+        # 設置噪聲調度（noise schedule）
+        self.betas = torch.linspace(beta_start, beta_end, timesteps).to(device)
+        self.alphas = 1.0 - self.betas
+        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
+        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
+        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
+        # ...
+
+    def q_sample(self, x0, t, noise=None):
+        # 添加噪聲的前向過程
+        if noise is None:
+            noise = torch.randn_like(x0)
+        sqrt_alpha = self.sqrt_alphas_cumprod[t].view(-1, 1, 1, 1, 1)
+        sqrt_one_minus_alpha = self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1, 1, 1)
+        return sqrt_alpha * x0 + sqrt_one_minus_alpha * noise
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- 訓練過程 -->
+            <div class="flow-section">
+                <div class="flow-title">
+                    <div class="step-number">4</div>
+                    <h3>模型訓練流程</h3>
+                </div>
+                <p>執行模型訓練，包括數據批次加載、損失計算、優化器配置和提前停止機制。</p>
+                
+                <div class="details">
+                    <ul>
+                        <li><strong>數據分割</strong>：將數據集分為訓練集（70%）、驗證集（15%）和測試集（15%）</li>
+                        <li><strong>批次大小</strong>：100</li>
+                        <li><strong>學習率</strong>：0.0001</li>
+                        <li><strong>優化器</strong>：AdamW 優化器</li>
+                        <li><strong>早停機制</strong>：當驗證損失連續 10 個 epoch 未改善時停止訓練</li>
+                        <li><strong>梯度裁剪</strong>：防止梯度爆炸</li>
+                    </ul>
+                    
+                    <div class="diagram">
+                        <svg width="700" height="320" viewBox="0 0 700 320">
+                            <!-- 訓練流程圖 -->
+                            <rect x="50" y="30" width="600" height="60" rx="10" fill="#4a6fa5" />
+                            <text x="350" y="65" text-anchor="middle" fill="white" font-size="16">初始化模型與優化器</text>
+                            
+                            <path d="M350 90 L350 120" stroke="#333" stroke-width="2" marker-end="url(#arrow3)" />
+                            
+                            <rect x="50" y="120" width="600" height="60" rx="10" fill="#5d8aa8" />
+                            <text x="350" y="155" text-anchor="middle" fill="white" font-size="16">每個 Epoch 迭代</text>
+                            
+                            <path d="M150 180 L150 210" stroke="#333" stroke-width="2" marker-end="url(#arrow3)" />
+                            <path d="M350 180 L350 210" stroke="#333" stroke-width="2" marker-end="url(#arrow3)" />
+                            <path d="M550 180 L550 210" stroke="#333" stroke-width="2" marker-end="url(#arrow3)" />
+                            
+                            <rect x="50" y="210" width="200" height="60" rx="10" fill="#6c9bcf" />
+                            <text x="150" y="240" text-anchor="middle" fill="white" font-size="14">訓練階段</text>
+                            <text x="150" y="260" text-anchor="middle" fill="white" font-size="12">計算損失並更新權重</text>
+                            
+                            <rect x="270" y="210" width="160" height="60" rx="10" fill="#6c9bcf" />
+                            <text x="350" y="240" text-anchor="middle" fill="white" font-size="14">驗證階段</text>
+                            <text x="350" y="260" text-anchor="middle" fill="white" font-size="12">評估驗證集性能</text>
+                            
+                            <rect x="450" y="210" width="200" height="60" rx="10" fill="#6c9bcf" />
+                            <text x="550" y="240" text-anchor="middle" fill="white" font-size="14">模型保存</text>
+                            <text x="550" y="260" text-anchor="middle" fill="white" font-size="12">如果驗證損失改善則保存</text>
+                            
+                            <path d="M150 270 L150 300 L550 300 L550 270" stroke="#333" stroke-width="2" />
+                            <path d="M350 300 L350 290" stroke="#333" stroke-width="2" marker-end="url(#arrow3)" />
+                            <text x="350" y="320" text-anchor="middle" font-size="14">檢查早停條件，繼續下一個 Epoch</text>
+                            
+                            <!-- 箭頭定義 -->
+                            <defs>
+                                <marker id="arrow3" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+                                    <path d="M0,0 L0,6 L9,3 z" fill="#333" />
+                                </marker>
+                            </defs>
+                        </svg>
+                    </div>
+                    
+                    <div class="code-container">
+                        <div class="code-header">
+                            <span>訓練函數</span>
+                            <button class="toggle-btn" onclick="toggleCode('train-code')">顯示/隱藏代碼</button>
+                        </div>
+                        <div id="train-code" class="code-content">
+def train_ddpm(diffusion, train_loader, val_loader, epochs=20, lr=1e-4, device='cuda', patience=3, weight_decay=1e-6, save

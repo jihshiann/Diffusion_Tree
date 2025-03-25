@@ -560,36 +560,33 @@ def visualize_predictions(cond, generated, target, sample_idx: int = 0,
         plt.savefig(os.path.join(save_dir, f'prediction_sample{sample_idx}_t{t}.png'), dpi=300)
         plt.close()
 
-def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int, error_matrix: np.ndarray, 
+def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int, 
+                         mse_matrix: np.ndarray, mae_matrix: np.ndarray, mape_matrix: np.ndarray, 
                          save_dir: str = r"C:\\thesis\\code\\result_ddpm"):
     """
-    繪製網格圖，顯示每個網格點的誤差（MSE 與 MAE），並將結果存成圖與表格。
-    參數:
-        sorted_flow_columns: 經緯度欄位的排序列表
-        H, W: 網格的高與寬
-        error_matrix: 每個網格點的誤差矩陣，通常為 MSE
-        save_dir: 存檔路徑
+    繪製網格圖，顯示每個網格點的誤差（MSE、MAE 和 MAPE），並將結果存成圖與表格。
+    
+    Args:
+        sorted_flow_columns (list): 經緯度欄位的排序列表。
+        H (int): 網格高度。
+        W (int): 網格寬度。
+        mse_matrix (np.ndarray): 每個網格點的 MSE 矩陣，形狀為 (H, W)。
+        mae_matrix (np.ndarray): 每個網格點的 MAE 矩陣，形狀為 (H, W)。
+        mape_matrix (np.ndarray): 每個網格點的 MAPE 矩陣，形狀為 (H, W)。
+        save_dir (str): 存檔路徑。
     """
     os.makedirs(save_dir, exist_ok=True)
     
-    # 取得每個網格點的經緯度
+    # 解析經緯度
     locations = [parse_lat_lon(col) for col in sorted_flow_columns]
     longitudes, latitudes = zip(*locations)
     
-    # mse_matrix 為每個網格的平均平方誤差
-    mse_matrix = error_matrix  # 這裡假設 error_matrix 已為 (H, W) 的平均值矩陣
-    
-    # 計算 MAE：對平方誤差取開根號再求絕對值，若有多個樣本則求平均
-    mae_matrix = np.abs(np.sqrt(error_matrix))
-    if mae_matrix.ndim > 2:
-        mae_matrix = np.mean(mae_matrix, axis=(0, 1, 2))
-    else:
-        mae_matrix = mae_matrix
+    # 定義顏色映射
+    orig_cmap = plt.get_cmap('OrRd')
+    trunc_cmap = truncate_colormap(orig_cmap, 0.3, 1.0)
     
     # 繪製 MSE 網格圖
     plt.figure(figsize=(12, 12))
-    orig_cmap = plt.get_cmap('OrRd')
-    trunc_cmap = truncate_colormap(orig_cmap, 0.3, 1.0)
     scatter = plt.scatter(longitudes, latitudes, c=mse_matrix.flatten(), cmap=trunc_cmap, marker='o')
     plt.colorbar(scatter, label='MSE')
     plt.xlabel("Longitude")
@@ -610,17 +607,29 @@ def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int, error_matrix
     plt.savefig(os.path.join(save_dir, 'plot_grid_with_error_mae.png'), dpi=600, bbox_inches='tight', pad_inches=0.1)
     plt.close()
 
-    # 將每個網格點的誤差數據存成表格，並分別存為 CSV 與 Excel 檔案
+    # 繪製 MAPE 網格圖
+    plt.figure(figsize=(12, 12))
+    scatter = plt.scatter(longitudes, latitudes, c=mape_matrix.flatten(), cmap=trunc_cmap, marker='o')
+    plt.colorbar(scatter, label='MAPE (%)')
+    plt.xlabel("Longitude")
+    plt.ylabel("Latitude")
+    plt.title("Grid with MAPE")
+    plt.grid(True)
+    plt.savefig(os.path.join(save_dir, 'plot_grid_with_error_mape.png'), dpi=600, bbox_inches='tight', pad_inches=0.1)
+    plt.close()
+
+    # 保存表格
     table_data = {
         'Grid Index': [f'[{i},{j}]' for i in range(H) for j in range(W)],
         'Longitude': longitudes,
         'Latitude': latitudes,
         'MSE': mse_matrix.flatten(),
-        'MAE': mae_matrix.flatten()
+        'MAE': mae_matrix.flatten(),
+        'MAPE (%)': mape_matrix.flatten()
     }
     df = pd.DataFrame(table_data)
-    df.to_csv(os.path.join(save_dir, 'mse_mae_per_coordinate.csv'), index=False)
-    df.to_excel(os.path.join(save_dir, 'mse_mae_per_coordinate.xlsx'), index=False)
+    df.to_csv(os.path.join(save_dir, 'mse_mae_mape_per_coordinate.csv'), index=False)
+    df.to_excel(os.path.join(save_dir, 'mse_mae_mape_per_coordinate.xlsx'), index=False)
 
 # --------------------------------------
 # 訓練與評估函數
@@ -715,118 +724,94 @@ def evaluate_model(diffusion: DDPM3D, dataset: Dataset, device: str = 'cuda',
                    sample_idx: int = 0) -> dict:
     """
     評估模型，並生成視覺化圖表。
-    參數:
+    
+    Args:
         diffusion: 訓練好的 DDPM 模型
         dataset: 驗證或測試數據集
         device: 設備
         max_samples: 最大評估樣本數
         save_dir: 結果存檔目錄
         sample_idx: 指定視覺化的樣本索引
-    回傳:
-        包含 MSE 與 MAE 的評估指標字典
+    Returns:
+        包含 MSE、MAE 和 MAPE 的評估指標字典
     """
+    import torch
+    import torch.nn.functional as F
+    import numpy as np
+    import os
+    import random
+    import json
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    from torch.utils.data import Subset
+
     diffusion.eval()
-    metrics = {'mse': 0.0, 'mae': 0.0}
+    metrics = {'mse': 0.0, 'mae': 0.0, 'mape': 0.0}
     N = min(len(dataset), max_samples)
     sample_indices = random.sample(range(len(dataset)), N)
     
     # 若 dataset 為 Subset，則取出原始數據集以獲取參數
-    if isinstance(dataset, Subset):
-        base_dataset = dataset.dataset
-    else:
-        base_dataset = dataset
-    
+    base_dataset = dataset.dataset if isinstance(dataset, Subset) else dataset
     H, W = base_dataset.H, base_dataset.W
-    cond_channels = dataset[0][0].shape[1]  # 例如條件通道數為 9
-    pred_length = base_dataset.prediction_length  # 例如預測 1 時間步
+    pred_length = base_dataset.prediction_length
     
     mean_val = base_dataset.mean_val.to(device)
     std_val = base_dataset.std_val.to(device)
     
-    # 預先分配張量以存放生成結果、條件與真實目標數據
-    generated_batch = torch.zeros(N, 1, pred_length, H, W, device=device)  # (N, 1, 1, H, W)
-    cond_batch = torch.zeros(N, 1, cond_channels, H, W, device=device)    # (N, 1, 9, H, W)
-    target_batch = torch.zeros(N, 1, pred_length, H, W, device=device)    # (N, 1, 1, H, W)
+    # 預先分配張量
+    generated_batch = torch.zeros(N, 1, pred_length, H, W, device=device)
+    target_batch = torch.zeros(N, 1, pred_length, H, W, device=device)
     
-    # 逐個樣本填充數據
     for i, idx in enumerate(sample_indices):
-        cond, target = dataset[idx]  # cond: (1, 9, H, W), target: (1, 1, H, W)
+        cond, target = dataset[idx]
         cond, target = cond.to(device), target.to(device)
+        target = target.unsqueeze(2)  # (1, 1, 1, H, W)
         
-        # 調整 target 的形狀，增加時間步維度以匹配模型輸出
-        target = target.unsqueeze(2)  # 變為 (1, 1, 1, H, W)
+        x_recon = diffusion.p_sample_loop(target.shape, cond)
         
-        # 使用反向去噪迴圈生成重構數據
-        x_recon = diffusion.p_sample_loop(target.shape, cond)  # 預期輸出 (1, 1, 1, H, W)
-        
-        # 反正規化：將數據轉換回原始尺度
+        # 反正規化
         x_recon_original = x_recon * std_val + mean_val
         target_original = target * std_val + mean_val
-        cond_original = cond * std_val + mean_val
         
-        # 確保數據形狀符合預期
-        assert cond_original.shape == (1, cond_channels, H, W), f"cond_original shape mismatch: {cond_original.shape}"
-        assert x_recon_original.shape == (1, 1, pred_length, H, W), f"x_recon_original shape mismatch: {x_recon_original.shape}"
-        assert target_original.shape == (1, 1, pred_length, H, W), f"target_original shape mismatch: {target_original.shape}"
-        
-        # 將生成結果與對應條件、目標存入預分配的張量
         generated_batch[i] = x_recon_original
-        cond_batch[i] = cond_original
         target_batch[i] = target_original
         
-        metrics['mse'] += F.mse_loss(x_recon_original, target_original).item()
-        metrics['mae'] += F.l1_loss(x_recon_original, target_original).item()
+        # 計算誤差
+        mse = F.mse_loss(x_recon_original, target_original).item()
+        mae = F.l1_loss(x_recon_original, target_original).item()
+        mape = torch.mean(torch.abs((target_original - x_recon_original) / (target_original + 1e-10))) * 100
+        
+        metrics['mse'] += mse
+        metrics['mae'] += mae
+        metrics['mape'] += mape.item()
     
-    # 計算平均誤差
+    # 平均誤差
     metrics['mse'] /= N
     metrics['mae'] /= N
+    metrics['mape'] /= N
     
     os.makedirs(save_dir, exist_ok=True)
     
-    # 針對每個時間步繪製生成結果、真實值與誤差圖
-    for t in range(pred_length):
-        plt.figure(figsize=(12, 4))
-        plt.subplot(1, 3, 1)
-        plt.imshow(generated_batch[sample_idx, 0, t].cpu().numpy(), cmap='viridis')
-        plt.colorbar()
-        plt.title(f'Generated (t={t})')
-        
-        plt.subplot(1, 3, 2)
-        plt.imshow(target_batch[sample_idx, 0, t].cpu().numpy(), cmap='viridis')
-        plt.colorbar()
-        plt.title(f'True (t={t})')
-        
-        plt.subplot(1, 3, 3)
-        error = np.abs(generated_batch[sample_idx, 0, t].cpu().numpy() - 
-                       target_batch[sample_idx, 0, t].cpu().numpy())
-        plt.imshow(error, cmap='hot')
-        plt.colorbar()
-        plt.title(f'Error (t={t})')
-        
-        plt.suptitle(f'Sample {sample_idx} - Time Step {t}')
-        plt.tight_layout(rect=[0, 0, 1, 0.95])
-        plt.savefig(os.path.join(save_dir, f'prediction_sample{sample_idx}_t{t}.png'), dpi=300)
-        plt.close()
+    # 計算每個網格點的誤差矩陣
+    error_matrix_mse = (generated_batch - target_batch) ** 2
+    mse_matrix = torch.mean(error_matrix_mse, dim=(0, 2)).cpu().numpy()[0]  # (H, W)
     
-    # 調用視覺化函數，產生包含 MAE 的圖形
-    visualize_predictions(cond_batch, generated_batch, target_batch, sample_idx=sample_idx, save_dir=save_dir)
-    # 計算誤差矩陣後繪製網格圖，展示各網格點的 MSE
-    error_matrix = (generated_batch - target_batch) ** 2
-    mse_matrix = torch.mean(error_matrix, dim=(0, 2)).cpu().numpy()[0]  # (H, W)
-    plot_grid_with_error(base_dataset.sorted_flow_columns, H, W, mse_matrix, save_dir)
+    error_matrix_mae = torch.abs(generated_batch - target_batch)
+    mae_matrix = torch.mean(error_matrix_mae, dim=(0, 2)).cpu().numpy()[0]  # (H, W)
     
-    # 儲存評估結果至文字檔與 JSON 檔
+    # 計算 MAPE 矩陣
+    mape_matrix = torch.mean(torch.abs((target_batch - generated_batch) / (target_batch + 1e-10)), 
+                            dim=(0, 2)).cpu().numpy()[0] * 100  # (H, W)
+    
+    # 繪製誤差圖並保存表格
+    plot_grid_with_error(base_dataset.sorted_flow_columns, H, W, mse_matrix, mae_matrix, mape_matrix, save_dir)
+    
+    # 儲存評估結果
     with open(os.path.join(save_dir, 'evaluation_metrics.txt'), 'w') as f:
         f.write(f"Evaluation Metrics (computed on {N} samples):\n")
-        f.write(f"Date: {pd.Timestamp.now()}\n")
         f.write(f"Reconstruction MSE: {metrics['mse']:.6f}\n")
         f.write(f"Reconstruction MAE: {metrics['mae']:.6f}\n")
-    
-    with open(os.path.join(save_dir, 'evaluation_metrics.json'), 'w') as f:
-        json.dump({
-            "mse": metrics['mse'], "mae": metrics['mae'],
-            "sample_size": N, "timestamp": pd.Timestamp.now().isoformat()
-        }, f, indent=4)
+        f.write(f"Reconstruction MAPE: {metrics['mape']:.6f}%\n")
     
     return metrics
 

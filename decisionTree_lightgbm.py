@@ -166,10 +166,10 @@ for target in target_columns:
     lgb_model = lgb.train(
         params,
         train_data,
-        num_boost_round=100,
+        num_boost_round=500,
         valid_sets=[test_data],
         valid_names=["valid_0"],
-        callbacks=[lgb.early_stopping(stopping_rounds=10, verbose=True),
+        callbacks=[lgb.early_stopping(stopping_rounds=50, verbose=True),
                    lgb.record_evaluation(evals_result),
                    lgb.log_evaluation(10)]
     )

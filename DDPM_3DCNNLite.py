@@ -321,9 +321,11 @@ class DDPMPerCell(nn.Module):
         return x_t_minus_1 + mask * sigma_t * noise
 
     @torch.no_grad()
-    # 執行完整的反向去噪過程，從純噪聲生成最終的預測數據
     def p_sample_loop(self, condition: torch.Tensor, shape: tuple) -> torch.Tensor:
         x = torch.randn(shape, device=self.device)
+        # 確保 condition 是五維張量
+        if condition.dim() == 4:
+            condition = condition.unsqueeze(1)  # 從 (batch, depth, height, width) 變為 (batch, 1, depth, height, width)
         for i in reversed(range(self.timesteps)):
             t = torch.full((shape[0],), i, device=self.device, dtype=torch.long)
             x = self.p_sample(condition, x, t)
@@ -449,16 +451,6 @@ def visualize_predictions(cond, generated, target, sample_idx: int = 0,
         plt.savefig(os.path.join(save_dir, f'prediction_sample{sample_idx}_t{t}.png'), dpi=300)
         plt.close()
 
-def truncate_colormap(cmap, minval: float = 0.0, maxval: float = 1.0, n: int = 256):
-    """
-    截斷色彩圖，僅使用指定範圍的色階。
-    """
-    new_cmap = mcolors.LinearSegmentedColormap.from_list(
-        f'trunc({cmap.name},{minval:.2f},{maxval:.2f})',
-        cmap(np.linspace(minval, maxval, n))
-    )
-    return new_cmap
-
 # ### 訓練與評估函數
 def train_ddpm(diffusion: DDPMPerCell, train_loader: DataLoader, val_loader: DataLoader, i: int, j: int,
                start_epoch: int = 0, epochs: int = 20, lr: float = 1e-4, device: str = 'cuda', 
@@ -493,6 +485,7 @@ def train_ddpm(diffusion: DDPMPerCell, train_loader: DataLoader, val_loader: Dat
     checkpoint_path = os.path.join(save_dir, f'checkpoint_{i}_{j}.pth')
     
     # 檢查並恢復檢查點
+    # TODO: 先檢查best model
     if os.path.exists(checkpoint_path):
         checkpoint = torch.load(checkpoint_path)
         diffusion.load_state_dict(checkpoint['model_state_dict'])
@@ -571,6 +564,16 @@ def train_ddpm(diffusion: DDPMPerCell, train_loader: DataLoader, val_loader: Dat
     
     return diffusion
 
+def truncate_colormap(cmap, minval: float = 0.0, maxval: float = 1.0, n: int = 256):
+    """
+    截斷色彩圖，僅使用指定範圍的色階。
+    """
+    new_cmap = mcolors.LinearSegmentedColormap.from_list(
+        f'trunc({cmap.name},{minval:.2f},{maxval:.2f})',
+        cmap(np.linspace(minval, maxval, n))
+    )
+    return new_cmap
+
 @torch.no_grad()
 def evaluate_model_per_cell(models: dict, grid_data: GridData, test_dataset: Dataset, device: str = 'cuda', 
                             max_samples: int = 100, save_dir: str = r"C:\thesis\code\result_ddpm_perCell") -> dict:
@@ -578,7 +581,7 @@ def evaluate_model_per_cell(models: dict, grid_data: GridData, test_dataset: Dat
     評估模型在每個網格點的性能，計算 MSE、MAE 和 MAPE。
     
     Args:
-        models (dict): 每個網格點的模型字典，鍵為 (i, j)。
+        models (dict): 每個網格點的模型字典，鍵為 (i, j)，值為 DDPMPerCell 實例。
         grid_data (GridData): 網格數據，包含均值和標準差。
         test_dataset (Dataset): 測試數據集。
         device (str): 設備（預設為 'cuda'）。
@@ -588,6 +591,10 @@ def evaluate_model_per_cell(models: dict, grid_data: GridData, test_dataset: Dat
     Returns:
         dict: 包含 MSE、MAE 和 MAPE 的評估指標。
     """
+    # 設定日誌基本配置
+    logging.basicConfig(level=logging.INFO, 
+                        format='%(asctime)s - %(levelname)s - %(message)s')  # 加入時間戳記
+    
     metrics = {'mse': 0.0, 'mae': 0.0, 'mape': 0.0}
     N = min(len(test_dataset), max_samples)
     sample_indices = random.sample(range(len(test_dataset)), N)
@@ -595,28 +602,38 @@ def evaluate_model_per_cell(models: dict, grid_data: GridData, test_dataset: Dat
     mean_val = grid_data.mean_val.to(device)
     std_val = grid_data.std_val.to(device)
     
+    # 初始化預測和目標張量，確保在正確的設備上
     generated_batch = torch.zeros(N, 1, 1, H, W, device=device)
     target_batch = torch.zeros(N, 1, 1, H, W, device=device)
     
+    # 創建保存目錄
     os.makedirs(save_dir, exist_ok=True)
     
+    # 確保所有模型移動到指定設備
+    for (i, j), model in models.items():
+        model.to(device)  # 將模型移動到指定設備
+        model.eval()     # 設置為評估模式，避免計算梯度
+
+    # 評估每個樣本並記錄進度
     for k, idx in enumerate(sample_indices):
+        logging.info(f"評估進度: {k+1}/{N} 樣本")  # 記錄當前樣本進度
         cond, target = test_dataset[idx]
-        cond = cond.to(device)
-        target = target.to(device)
-        predictions = torch.zeros(1, 1, H, W, device=device)
+        cond = cond.to(device)           # 條件數據移到設備
+        target = target.to(device)       # 目標數據移到設備
+        predictions = torch.zeros(1, 1, H, W, device=device)  # 初始化預測張量
         
-        # 對每個網格點進行預測
+        # 對每個網格點進行預測並記錄單元格
         for i in range(H):
             for j in range(W):
+                logging.info(f"正在處理單元 ({i}, {j})")  # 記錄當前處理的單元格
                 model = models[(i, j)]
-                x_pred = model.p_sample_loop(condition=cond, shape=(1, 1))
-                predictions[0, 0, i, j] = x_pred[0, 0]
+                x_pred = model.p_sample_loop(condition=cond, shape=(1, 1))  # 生成單點預測
+                predictions[0, 0, i, j] = x_pred[0, 0]  # 填入預測值
         
         # 將預測值和目標值還原到原始尺度
         x_recon_original = predictions * std_val + mean_val
         target_original = target * std_val + mean_val
-        target_original = target_original.view(1, 1, H, W)
+        target_original = target_original.view(1, 1, H, W)  # 確保形狀一致
         
         # 計算 MSE、MAE 和 MAPE
         mse = F.mse_loss(x_recon_original, target_original).item()
@@ -630,7 +647,7 @@ def evaluate_model_per_cell(models: dict, grid_data: GridData, test_dataset: Dat
         generated_batch[k] = x_recon_original
         target_batch[k] = target_original
         
-        # 可視化預測結果（假設已有 visualize_predictions 函數）
+        # 可視化預測結果
         visualize_predictions(cond, predictions, target_original, sample_idx=k, save_dir=save_dir)
     
     # 計算平均指標
@@ -643,7 +660,8 @@ def evaluate_model_per_cell(models: dict, grid_data: GridData, test_dataset: Dat
     mse_matrix = torch.mean(error_matrix, dim=(0, 2)).cpu().numpy()[0]  # (H, W)
     abs_error_matrix = torch.abs(generated_batch - target_batch)  # MAE
     mae_matrix = torch.mean(abs_error_matrix, dim=(0, 2)).cpu().numpy()[0]  # (H, W)
-    mape_matrix = torch.mean(torch.abs((target_batch - generated_batch) / (target_batch + 1e-10)), dim=(0, 2)).cpu().numpy()[0] * 100  # (H, W)
+    mape_matrix = torch.mean(torch.abs((target_batch - generated_batch) / (target_batch + 1e-10)), 
+                             dim=(0, 2)).cpu().numpy()[0] * 100  # (H, W)
     
     # 繪製誤差圖並保存表格
     plot_grid_with_error(grid_data.sorted_flow_columns, H, W, mse_matrix, mae_matrix, mape_matrix, save_dir)
@@ -684,7 +702,7 @@ if __name__ == "__main__":
     test_end = int(0.85 * len(test_dataset))
     test_dataset = Subset(test_dataset, range(test_end, len(test_dataset)))
     print(device)
-    
+
     # 訓練 441 個模型（對應 21x21 網格的每個單元）
     for i in range(H):
         for j in range(W):
@@ -701,7 +719,7 @@ if __name__ == "__main__":
             diffusion = DDPMPerCell(model=model, timesteps=timesteps, beta_start=1e-4, beta_end=0.02, device=device)
             trained_diffusion = train_ddpm(diffusion, train_loader, val_loader, i, j, epochs=epochs, 
                                           lr=lr, device=device, patience=patience, save_dir=save_dir, checkpoint_interval=10)
-    
+
     # 評估模型（載入最佳模型）
     models = {}
     for i in range(H):
@@ -723,5 +741,5 @@ if __name__ == "__main__":
         
             models[(i, j)] = diffusion
 
-    metrics = evaluate_model_per_cell(models, grid_data, test_dataset, device=device, max_samples=50, save_dir=save_dir)
+    metrics = evaluate_model_per_cell(models, grid_data, test_dataset, device=device, max_samples=2, save_dir=save_dir)
     logging.info(f"重建 MSE: {metrics['mse']:.6f}, MAE: {metrics['mae']:.6f}")

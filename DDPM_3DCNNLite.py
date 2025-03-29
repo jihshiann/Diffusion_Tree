@@ -172,11 +172,11 @@ class PeopleFlowDatasetPerCell(Dataset):
         return self.max_index
 
     def __getitem__(self, idx: int):
-        # 提取條件序列：整個 21x21 網格的連續時間片段
-        condition = self.grid_data.data[idx:idx + self.condition_length].unsqueeze(0)  # 形狀：(1, 8, 21, 21)
-        # 提取目標值：指定單元的下一個時間點值
-        target = self.grid_data.data[idx + self.condition_length, self.i, self.j].unsqueeze(0)  # 形狀：(1,)
-        return condition, target
+        # 條件序列：(1, condition_length, H, W)
+        condition = self.grid_data.data[idx:idx + self.condition_length].unsqueeze(0)
+        # 目標序列：(prediction_length,)，指定單元的連續時間步
+        target = self.grid_data.data[idx + self.condition_length:idx + self.condition_length + self.prediction_length, self.i, self.j]
+        return condition, target  # target 形狀為 (prediction_length,)
 
 class PeopleFlowDatasetForEval(Dataset):
     """為評估生成數據集，返回整個 21x21 網格的目標值。
@@ -198,11 +198,11 @@ class PeopleFlowDatasetForEval(Dataset):
         return self.max_index
 
     def __getitem__(self, idx: int):
-        # 提取條件序列：整個 21x21 網格的連續時間片段
-        condition = self.grid_data.data[idx:idx + self.condition_length].unsqueeze(0)  # 形狀：(1, 8, 21, 21)
-        # 提取目標值：整個 21x21 網格的下一個時間點值
-        target = self.grid_data.data[idx + self.condition_length].unsqueeze(0)  # 形狀：(1, 21, 21)
-        return condition, target
+        # 條件序列：(1, condition_length, H, W)
+        condition = self.grid_data.data[idx:idx + self.condition_length].unsqueeze(0)
+        # 目標序列：(prediction_length, H, W)
+        target = self.grid_data.data[idx + self.condition_length:idx + self.condition_length + self.prediction_length]
+        return condition, target  # target 形狀為 (prediction_length, H, W)
 
 # ### 模型定義
 class DoubleConv3D(nn.Module):
@@ -242,6 +242,9 @@ class ScalarPredictor(nn.Module):
         e1 = self.enc1(condition)
         e2 = self.enc2(self.pool1(e1))
         pooled = self.adaptive_pool(self.pool2(e2)).view(condition.size(0), -1)
+        # 確保 x_t 是二維張量 (batch_size, 1)
+        if x_t.dim() == 1:
+            x_t = x_t.unsqueeze(1)
         combined = torch.cat([pooled, x_t, t_emb], dim=1)
         out = self.fc(combined)
         return out
@@ -295,8 +298,8 @@ class DDPMPerCell(nn.Module):
     def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise: Optional[torch.Tensor] = None) -> torch.Tensor:
         if noise is None:
             noise = torch.randn_like(x0)
-        sqrt_alpha = self.sqrt_alphas_cumprod[t].view(-1, 1)
-        sqrt_one_minus_alpha = self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1)
+        sqrt_alpha = self.sqrt_alphas_cumprod[t].view(-1, *(1 for _ in x0.shape[1:]))
+        sqrt_one_minus_alpha = self.sqrt_one_minus_alphas_cumprod[t].view(-1, *(1 for _ in x0.shape[1:]))
         return sqrt_alpha * x0 + sqrt_one_minus_alpha * noise
     # 計算訓練損失，訓練模型預測噪聲
     def p_losses(self, condition: torch.Tensor, target: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
@@ -309,33 +312,45 @@ class DDPMPerCell(nn.Module):
     @torch.no_grad()
     # 執行反向去噪過程的單步操作，從含噪數據 x_t 生成前一步數據 x_{t-1}
     def p_sample(self, condition: torch.Tensor, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        beta_t = self.betas[t].view(-1, 1)
-        sqrt_recip_alpha_t = 1.0 / torch.sqrt(self.alphas[t]).view(-1, 1)
-        sqrt_one_minus_alphas_cumprod_t = self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1)
+        beta_t = self.betas[t].view(-1, *(1 for _ in x_t.shape[1:]))
+        sqrt_recip_alpha_t = 1.0 / torch.sqrt(self.alphas[t]).view(-1, *(1 for _ in x_t.shape[1:]))
+        sqrt_one_minus_alphas_cumprod_t = self.sqrt_one_minus_alphas_cumprod[t].view(-1, *(1 for _ in x_t.shape[1:]))
         time_emb = self.get_time_embedding(t).to(self.device)
         eps_theta = self.model(condition, x_t, time_emb)
         x_t_minus_1 = sqrt_recip_alpha_t * (x_t - beta_t / sqrt_one_minus_alphas_cumprod_t * eps_theta)
-        mask = (t > 0).float().view(-1, 1)
+        mask = (t > 0).float().view(-1, *(1 for _ in x_t.shape[1:]))
         sigma_t = torch.sqrt(beta_t)
         noise = torch.randn_like(x_t)
         return x_t_minus_1 + mask * sigma_t * noise
 
     @torch.no_grad()
-    def p_sample_loop(self, condition: torch.Tensor, shape: tuple) -> torch.Tensor:
-        x = torch.randn(shape, device=self.device)
-        # 確保 condition 是五維張量
+    def p_sample_loop(self, condition: torch.Tensor, shape: tuple, prediction_length: int) -> torch.Tensor:
+        batch_size = shape[0]
+        predictions = []
+        x = torch.randn((batch_size, 1), device=self.device)  # 初始隨機噪聲
         if condition.dim() == 4:
-            condition = condition.unsqueeze(1)  # 從 (batch, depth, height, width) 變為 (batch, 1, depth, height, width)
-        for i in reversed(range(self.timesteps)):
-            t = torch.full((shape[0],), i, device=self.device, dtype=torch.long)
-            x = self.p_sample(condition, x, t)
-        return x
+            condition = condition.unsqueeze(1)
+
+        for t_idx in range(prediction_length):
+            # 逐步去噪生成當前時間步
+            for i in reversed(range(self.timesteps)):
+                t = torch.full((batch_size,), i, device=self.device, dtype=torch.long)
+                x = self.p_sample(condition, x, t)
+            predictions.append(x.clone())  # 保存當前預測
+
+            # 更新條件：將當前預測加入條件序列（模擬自迴歸）
+            if t_idx < prediction_length - 1:
+                new_condition_slice = x.view(batch_size, 1, 1, 1)  # 假設單一值擴展為條件
+                condition = torch.cat([condition[:, :, 1:], new_condition_slice], dim=2)  # 移除最早時間步，加入新預測
+                x = torch.randn((batch_size, 1), device=self.device)  # 重置噪聲以預測下一個時間步
+
+        return torch.stack(predictions, dim=1)  # 形狀：(batch_size, prediction_length)
 
 # ### 繪製網格誤差圖的函數
 def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int, mse_matrix: np.ndarray, mae_matrix: np.ndarray, mape_matrix: np.ndarray, 
-                         save_dir: str = r"C:\thesis\code\result_ddpm_perCell"):
+                         save_dir: str = r"C:\thesis\code\result_ddpm_perCell\evaluate", smape_matrix: np.ndarray = None):
     """
-    繪製網格圖，顯示每個網格點的誤差（MSE、MAE 和 MAPE），並將結果存成圖與表格。
+    繪製網格圖，顯示每個網格點的誤差（MSE、MAE、MAPE 和 SMAPE），並將結果存成圖與表格。
     
     Args:
         sorted_flow_columns (list): 經緯度欄位的排序列表。
@@ -345,6 +360,7 @@ def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int, mse_matrix: 
         mae_matrix (np.ndarray): 每個網格點的 MAE 矩陣，形狀為 (H, W)。
         mape_matrix (np.ndarray): 每個網格點的 MAPE 矩陣，形狀為 (H, W)。
         save_dir (str): 存檔路徑。
+        smape_matrix (np.ndarray, optional): 每個網格點的 SMAPE 矩陣，形狀為 (H, W)。
     """
     os.makedirs(save_dir, exist_ok=True)
     
@@ -356,7 +372,7 @@ def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int, mse_matrix: 
     orig_cmap = plt.get_cmap('OrRd')
     trunc_cmap = truncate_colormap(orig_cmap, 0.3, 1.0)
     
-    # 繪製 MSE 網格圖
+    # 繪製 MSE 網格圖（保留 colorbar）
     plt.figure(figsize=(12, 12))
     scatter = plt.scatter(longitudes, latitudes, c=mse_matrix.flatten(), cmap=trunc_cmap, marker='o')
     plt.colorbar(scatter, label='MSE')
@@ -367,10 +383,11 @@ def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int, mse_matrix: 
     plt.savefig(os.path.join(save_dir, 'plot_grid_with_error_mse.png'), dpi=600, bbox_inches='tight', pad_inches=0.1)
     plt.close()
 
-    # 繪製 MAE 網格圖
+    # 繪製 MAE 網格圖（標示整數數值，移除 colorbar）
     plt.figure(figsize=(12, 12))
-    scatter = plt.scatter(longitudes, latitudes, c=mae_matrix.flatten(), cmap=trunc_cmap, marker='o')
-    plt.colorbar(scatter, label='MAE')
+    plt.scatter(longitudes, latitudes, c=mae_matrix.flatten(), cmap=trunc_cmap, marker='o')
+    for i, (lon, lat) in enumerate(zip(longitudes, latitudes)):
+        plt.text(lon, lat, f'{int(round(mae_matrix.flatten()[i]))}', ha='center', va='center', color='white', fontsize=8)
     plt.xlabel("Longitude")
     plt.ylabel("Latitude")
     plt.title("Grid with MAE")
@@ -378,16 +395,30 @@ def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int, mse_matrix: 
     plt.savefig(os.path.join(save_dir, 'plot_grid_with_error_mae.png'), dpi=600, bbox_inches='tight', pad_inches=0.1)
     plt.close()
 
-    # 繪製 MAPE 網格圖
+    # 繪製 MAPE 網格圖（標示整數數值，移除 colorbar）
     plt.figure(figsize=(12, 12))
-    scatter = plt.scatter(longitudes, latitudes, c=mape_matrix.flatten(), cmap=trunc_cmap, marker='o')
-    plt.colorbar(scatter, label='MAPE (%)')
+    plt.scatter(longitudes, latitudes, c=mape_matrix.flatten(), cmap=trunc_cmap, marker='o')
+    for i, (lon, lat) in enumerate(zip(longitudes, latitudes)):
+        plt.text(lon, lat, f'{int(round(mape_matrix.flatten()[i]))}', ha='center', va='center', color='white', fontsize=8)
     plt.xlabel("Longitude")
     plt.ylabel("Latitude")
-    plt.title("Grid with MAPE")
+    plt.title("Grid with MAPE (%)")
     plt.grid(True)
     plt.savefig(os.path.join(save_dir, 'plot_grid_with_error_mape.png'), dpi=600, bbox_inches='tight', pad_inches=0.1)
     plt.close()
+
+    # 繪製 SMAPE 網格圖（標示整數數值，移除 colorbar）
+    if smape_matrix is not None:
+        plt.figure(figsize=(12, 12))
+        plt.scatter(longitudes, latitudes, c=smape_matrix.flatten(), cmap=trunc_cmap, marker='o')
+        for i, (lon, lat) in enumerate(zip(longitudes, latitudes)):
+            plt.text(lon, lat, f'{int(round(smape_matrix.flatten()[i]))}', ha='center', va='center', color='white', fontsize=8)
+        plt.xlabel("Longitude")
+        plt.ylabel("Latitude")
+        plt.title("Grid with SMAPE (%)")
+        plt.grid(True)
+        plt.savefig(os.path.join(save_dir, 'plot_grid_with_error_smape.png'), dpi=600, bbox_inches='tight', pad_inches=0.1)
+        plt.close()
 
     # 保存表格
     table_data = {
@@ -398,64 +429,124 @@ def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int, mse_matrix: 
         'MAE': mae_matrix.flatten(),
         'MAPE (%)': mape_matrix.flatten()
     }
+    if smape_matrix is not None:
+        table_data['SMAPE (%)'] = smape_matrix.flatten()
+    
     df = pd.DataFrame(table_data)
-    df.to_csv(os.path.join(save_dir, 'mse_mae_mape_per_coordinate.csv'), index=False)
-    df.to_excel(os.path.join(save_dir, 'mse_mae_mape_per_coordinate.xlsx'), index=False)
-
-def visualize_predictions(cond, generated, target, sample_idx: int = 0, 
-                         save_dir: str = r"C:\thesis\code\result_ddpm_perCell"):
+    df.to_csv(os.path.join(save_dir, 'mse_mae_mape_smape_per_coordinate.csv'), index=False)
+    df.to_excel(os.path.join(save_dir, 'mse_mae_mape_smape_per_coordinate.xlsx'), index=False)
+    
+def visualize_predictions(cond, generated, target, sample_idx: int = None, 
+                         save_dir: str = r"C:\thesis\code\result_ddpm_perCell\evaluate", 
+                         mse_matrix: Optional[np.ndarray] = None, 
+                         mae_matrix: Optional[np.ndarray] = None, 
+                         mape_matrix: Optional[np.ndarray] = None, 
+                         smape_matrix: Optional[np.ndarray] = None):
     """
-    視覺化預測結果與真實值的比較，包含生成結果、真實數據、以及誤差（MSE 和 MAE）的圖形。
+    視覺化所有樣本和時間步平均後的生成預測值與真實值的比較，將每個指標儲存為獨立圖形。
+    MAE、MAPE 和 SMAPE 圖在網格上標示整數數值，移除右側尺度，利用已有誤差矩陣。
     
     Args:
-        cond: 條件數據（未使用於視覺化）。
-        generated: 生成的預測結果。
-        target: 真實目標數據。
-        sample_idx: 指定要視覺化的樣本索引。
-        save_dir: 圖形存檔的目錄。
+        cond: 條件張量，此處未使用。
+        generated: 生成的預測值，形狀 (N, 1, prediction_length, H, W)。
+        target: 目標值，形狀 (N, 1, prediction_length, H, W)。
+        sample_idx: 樣本索引，此處設為 None 表示平均圖。
+        save_dir: 保存視覺化結果的目錄。
+        mse_matrix: 預計算的 MSE 矩陣，形狀 (H, W)。
+        mae_matrix: 預計算的 MAE 矩陣，形狀 (H, W)。
+        mape_matrix: 預計算的 MAPE 矩陣，形狀 (H, W)。
+        smape_matrix: 預計算的 SMAPE 矩陣，形狀 (H, W)。
     """
     os.makedirs(save_dir, exist_ok=True)
-    pred_length = generated.shape[2]  # 預測時間步長，通常為 1
     
-    for t in range(pred_length):
-        plt.figure(figsize=(16, 4))
-        
-        # 子圖1：生成結果
-        plt.subplot(1, 4, 1)
-        plt.imshow(generated[sample_idx, 0, t].cpu().numpy(), cmap='viridis')
-        plt.colorbar()
-        plt.title(f'Generated (t={t})')
-        
-        # 子圖2：真實值
-        plt.subplot(1, 4, 2)
-        plt.imshow(target[sample_idx, 0, t].cpu().numpy(), cmap='viridis')
-        plt.colorbar()
-        plt.title(f'True (t={t})')
-        
-        # 子圖3：MSE 誤差圖（平方誤差）
-        error_sq = (generated[sample_idx, 0, t].cpu().numpy() - target[sample_idx, 0, t].cpu().numpy()) ** 2
-        plt.subplot(1, 4, 3)
-        plt.imshow(error_sq, cmap='hot')
-        plt.colorbar()
-        plt.title(f'MSE (t={t})')
-        
-        # 子圖4：MAE 誤差圖（絕對誤差）
-        error_abs = np.abs(generated[sample_idx, 0, t].cpu().numpy() - target[sample_idx, 0, t].cpu().numpy())
-        plt.subplot(1, 4, 4)
-        plt.imshow(error_abs, cmap='hot')
-        plt.colorbar()
-        plt.title(f'MAE (t={t})')
-        
-        plt.suptitle(f'Sample {sample_idx} - Time Step {t}')
-        plt.tight_layout(rect=[0, 0, 1, 0.95])
-        plt.savefig(os.path.join(save_dir, f'prediction_sample{sample_idx}_t{t}.png'), dpi=300)
-        plt.close()
+    # 對所有樣本和時間步取平均
+    generated_avg = torch.mean(generated, dim=(0, 2)).squeeze(0).cpu().numpy()  # 形狀：(H, W)
+    target_avg = torch.mean(target, dim=(0, 2)).squeeze(0).cpu().numpy()        # 形狀：(H, W)
+    
+    # 使用預計算的誤差矩陣，若未提供則重新計算
+    if mse_matrix is None:
+        mse_matrix = np.mean((generated_avg - target_avg) ** 2, axis=None)
+    if mae_matrix is None:
+        mae_matrix = np.abs(generated_avg - target_avg)
+    if mape_matrix is None:
+        mape_matrix = np.abs((target_avg - generated_avg) / (target_avg + 1)) * 100
+    if smape_matrix is None:
+        smape_matrix = np.abs(target_avg - generated_avg) / (np.abs(target_avg) + np.abs(generated_avg) + 1) * 100
+    
+    mse = np.mean(mse_matrix)
+    mae = np.mean(mae_matrix)
+    mape = np.mean(mape_matrix)
+    smape = np.mean(smape_matrix)
+    
+    # 子圖 1：平均生成結果
+    plt.figure(figsize=(6, 6))
+    plt.imshow(generated_avg, cmap='viridis')
+    plt.colorbar()
+    plt.title('平均生成結果')
+    plt.savefig(os.path.join(save_dir, 'prediction_all_samples_avg_generated.png'), dpi=300)
+    plt.close()
+    
+    # 子圖 2：平均真實值
+    plt.figure(figsize=(6, 6))
+    plt.imshow(target_avg, cmap='viridis')
+    plt.colorbar()
+    plt.title('平均真實值')
+    plt.savefig(os.path.join(save_dir, 'prediction_all_samples_avg_target.png'), dpi=300)
+    plt.close()
+    
+    # 子圖 3：MSE 誤差圖
+    plt.figure(figsize=(6, 6))
+    plt.imshow(mse_matrix, cmap='hot')
+    plt.colorbar()
+    plt.title(f'MSE: {mse:.0f}')
+    plt.savefig(os.path.join(save_dir, 'prediction_all_samples_avg_mse.png'), dpi=300)
+    plt.close()
+    
+    # 子圖 4：MAE 誤差圖（標示整數數值，移除 colorbar）
+    plt.figure(figsize=(6, 6))
+    plt.imshow(mae_matrix, cmap='hot')
+    for i in range(mae_matrix.shape[0]):
+        for j in range(mae_matrix.shape[1]):
+            plt.text(j, i, f'{int(round(mae_matrix[i, j]))}', ha='center', va='center', color='white', fontsize=8)
+    plt.title(f'MAE: {mae:.0f}')
+    plt.savefig(os.path.join(save_dir, 'prediction_all_samples_avg_mae.png'), dpi=300)
+    plt.close()
+    
+    # 子圖 5：MAPE 誤差圖（標示整數數值，移除 colorbar）
+    plt.figure(figsize=(6, 6))
+    plt.imshow(mape_matrix, cmap='hot')
+    for i in range(mape_matrix.shape[0]):
+        for j in range(mape_matrix.shape[1]):
+            plt.text(j, i, f'{int(round(mape_matrix[i, j]))}', ha='center', va='center', color='white', fontsize=8)
+    plt.title(f'MAPE: {mape:.0f}%')
+    plt.savefig(os.path.join(save_dir, 'prediction_all_samples_avg_mape.png'), dpi=300)
+    plt.close()
+    
+    # 子圖 6：SMAPE 誤差圖（標示整數數值，移除 colorbar）
+    plt.figure(figsize=(6, 6))
+    plt.imshow(smape_matrix, cmap='hot')
+    for i in range(smape_matrix.shape[0]):
+        for j in range(smape_matrix.shape[1]):
+            plt.text(j, i, f'{int(round(smape_matrix[i, j]))}', ha='center', va='center', color='white', fontsize=8)
+    plt.title(f'SMAPE: {smape:.0f}%')
+    plt.savefig(os.path.join(save_dir, 'prediction_all_samples_avg_smape.png'), dpi=300)
+    plt.close()
+
+def truncate_colormap(cmap, minval: float = 0.0, maxval: float = 1.0, n: int = 256):
+    """
+    截斷色彩圖，僅使用指定範圍的色階。
+    """
+    new_cmap = mcolors.LinearSegmentedColormap.from_list(
+        f'trunc({cmap.name},{minval:.2f},{maxval:.2f})',
+        cmap(np.linspace(minval, maxval, n))
+    )
+    return new_cmap
 
 # ### 訓練與評估函數
 def train_ddpm(diffusion: DDPMPerCell, train_loader: DataLoader, val_loader: DataLoader, i: int, j: int,
                start_epoch: int = 0, epochs: int = 20, lr: float = 1e-4, device: str = 'cuda', 
                patience: int = 3, weight_decay: float = 1e-6, 
-               save_dir: str = r"C:\thesis\code\result_ddpm_perCell", checkpoint_interval: int = 10) -> DDPMPerCell:
+               save_dir: str = r"C:\thesis\code\result_ddpm_perCell\model", checkpoint_interval: int = 10) -> DDPMPerCell:
     """訓練 DDPM 模型，帶有檢查點保存和恢復功能。
     
     Args:
@@ -576,9 +667,9 @@ def truncate_colormap(cmap, minval: float = 0.0, maxval: float = 1.0, n: int = 2
 
 @torch.no_grad()
 def evaluate_model_per_cell(models: dict, grid_data: GridData, test_dataset: Dataset, device: str = 'cuda', 
-                            max_samples: int = 100, save_dir: str = r"C:\thesis\code\result_ddpm_perCell") -> dict:
+                            max_samples: int = 100, save_dir: str = r"C:\thesis\code\result_ddpm_perCell\evaluate") -> dict:
     """
-    評估模型在每個網格點的性能，計算 MSE、MAE 和 MAPE。
+    評估模型在每個網格點的性能，計算 MSE、MAE、MAPE 和 SMAPE。
     
     Args:
         models (dict): 每個網格點的模型字典，鍵為 (i, j)，值為 DDPMPerCell 實例。
@@ -589,98 +680,104 @@ def evaluate_model_per_cell(models: dict, grid_data: GridData, test_dataset: Dat
         save_dir (str): 結果儲存路徑。
     
     Returns:
-        dict: 包含 MSE、MAE 和 MAPE 的評估指標。
+        dict: 包含 MSE、MAE、MAPE 和 SMAPE 的評估指標。
     """
     # 設定日誌基本配置
-    logging.basicConfig(level=logging.INFO, 
-                        format='%(asctime)s - %(levelname)s - %(message)s')  # 加入時間戳記
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     
-    metrics = {'mse': 0.0, 'mae': 0.0, 'mape': 0.0}
+    metrics = {'mse': 0.0, 'mae': 0.0, 'mape': 0.0, 'smape': 0.0}
     N = min(len(test_dataset), max_samples)
     sample_indices = random.sample(range(len(test_dataset)), N)
     H, W = grid_data.H, grid_data.W
+    prediction_length = test_dataset.dataset.prediction_length
     mean_val = grid_data.mean_val.to(device)
     std_val = grid_data.std_val.to(device)
     
-    # 初始化預測和目標張量，確保在正確的設備上
-    generated_batch = torch.zeros(N, 1, 1, H, W, device=device)
-    target_batch = torch.zeros(N, 1, 1, H, W, device=device)
+    # 初始化累加器
+    generated_batch = torch.zeros(N, 1, prediction_length, H, W, device=device)
+    target_batch = torch.zeros(N, 1, prediction_length, H, W, device=device)
+    mse_sum = torch.zeros(H, W, device=device)
+    mae_sum = torch.zeros(H, W, device=device)
+    mape_sum = torch.zeros(H, W, device=device)
+    smape_sum = torch.zeros(H, W, device=device)
     
-    # 創建保存目錄
     os.makedirs(save_dir, exist_ok=True)
     
-    # 確保所有模型移動到指定設備
     for (i, j), model in models.items():
-        model.to(device)  # 將模型移動到指定設備
-        model.eval()     # 設置為評估模式，避免計算梯度
+        model.to(device)
+        model.eval()
 
-    # 評估每個樣本並記錄進度
     for k, idx in enumerate(sample_indices):
-        logging.info(f"評估進度: {k+1}/{N} 樣本")  # 記錄當前樣本進度
+        logging.info(f"評估進度: {k+1}/{N} 樣本")
         cond, target = test_dataset[idx]
-        cond = cond.to(device)           # 條件數據移到設備
-        target = target.to(device)       # 目標數據移到設備
-        predictions = torch.zeros(1, 1, H, W, device=device)  # 初始化預測張量
+        cond = cond.to(device)
+        target = target.to(device)
+        predictions = torch.zeros(1, prediction_length, H, W, device=device)
         
-        # 對每個網格點進行預測並記錄單元格
         for i in range(H):
             for j in range(W):
-                logging.info(f"正在處理單元 ({i}, {j})")  # 記錄當前處理的單元格
+                logging.info(f"正在處理單元 ({i}, {j})")
                 model = models[(i, j)]
-                x_pred = model.p_sample_loop(condition=cond, shape=(1, 1))  # 生成單點預測
-                predictions[0, 0, i, j] = x_pred[0, 0]  # 填入預測值
+                x_pred = model.p_sample_loop(condition=cond, shape=(1, 1), prediction_length=prediction_length)
+                predictions[0, :, i, j] = x_pred[0, :]
         
-        # 將預測值和目標值還原到原始尺度
         x_recon_original = predictions * std_val + mean_val
         target_original = target * std_val + mean_val
-        target_original = target_original.view(1, 1, H, W)  # 確保形狀一致
+        target_original = target_original.view(1, prediction_length, H, W)
         
-        # 計算 MSE、MAE 和 MAPE
-        mse = F.mse_loss(x_recon_original, target_original).item()
-        mae = F.l1_loss(x_recon_original, target_original).item()
-        mape = torch.mean(torch.abs((target_original - x_recon_original) / (target_original + 1e-10))) * 100
+        # 計算誤差並累加
+        error = x_recon_original - target_original
+        mse_grid = torch.mean(error ** 2, dim=(0, 1))  # 每個網格的 MSE
+        mae_grid = torch.mean(torch.abs(error), dim=(0, 1))  # 每個網格的 MAE
+        mape_grid = torch.mean(torch.abs(error / (target_original + 1)), dim=(0, 1)) * 100  # MAPE
+        smape_grid = torch.mean(torch.abs(error) / (torch.abs(target_original) + torch.abs(x_recon_original) + 1), dim=(0, 1)) * 100  # SMAPE
         
-        metrics['mse'] += mse
-        metrics['mae'] += mae
-        metrics['mape'] += mape.item()
+        mse_sum += mse_grid
+        mae_sum += mae_grid
+        mape_sum += mape_grid
+        smape_sum += smape_grid
         
         generated_batch[k] = x_recon_original
         target_batch[k] = target_original
-        
-        # 可視化預測結果
-        visualize_predictions(cond, predictions, target_original, sample_idx=k, save_dir=save_dir)
     
-    # 計算平均指標
-    metrics['mse'] /= N
-    metrics['mae'] /= N
-    metrics['mape'] /= N
+    # 計算整體平均指標
+    metrics['mse'] = torch.mean(mse_sum / N).item()
+    metrics['mae'] = torch.mean(mae_sum / N).item()
+    metrics['mape'] = torch.mean(mape_sum / N).item()
+    metrics['smape'] = torch.mean(smape_sum / N).item()
     
-    # 計算每個網格點的誤差矩陣
-    error_matrix = (generated_batch - target_batch) ** 2  # MSE
-    mse_matrix = torch.mean(error_matrix, dim=(0, 2)).cpu().numpy()[0]  # (H, W)
-    abs_error_matrix = torch.abs(generated_batch - target_batch)  # MAE
-    mae_matrix = torch.mean(abs_error_matrix, dim=(0, 2)).cpu().numpy()[0]  # (H, W)
-    mape_matrix = torch.mean(torch.abs((target_batch - generated_batch) / (target_batch + 1e-10)), 
-                             dim=(0, 2)).cpu().numpy()[0] * 100  # (H, W)
+    # 計算網格級誤差矩陣
+    mse_matrix = (mse_sum / N).cpu().numpy()
+    mae_matrix = (mae_sum / N).cpu().numpy()
+    mape_matrix = (mape_sum / N).cpu().numpy()
+    smape_matrix = (smape_sum / N).cpu().numpy()
     
-    # 繪製誤差圖並保存表格
-    plot_grid_with_error(grid_data.sorted_flow_columns, H, W, mse_matrix, mae_matrix, mape_matrix, save_dir)
+    # 匯出表格
+    table_data = {
+        'Grid Index': [f'[{i},{j}]' for i in range(H) for j in range(W)],
+        'Longitude': [parse_lat_lon(col)[0] for col in grid_data.sorted_flow_columns],
+        'Latitude': [parse_lat_lon(col)[1] for col in grid_data.sorted_flow_columns],
+        'MSE': mse_matrix.flatten(),
+        'MAE': mae_matrix.flatten(),
+        'MAPE (%)': mape_matrix.flatten(),
+        'SMAPE (%)': smape_matrix.flatten()
+    }
+    df = pd.DataFrame(table_data)
+    df.to_csv(os.path.join(save_dir, 'mse_mae_mape_smape_per_coordinate.csv'), index=False)
+    df.to_excel(os.path.join(save_dir, 'mse_mae_mape_smape_per_coordinate.xlsx'), index=False)
     
-    # 保存評估指標到文字檔
-    with open(os.path.join(save_dir, 'evaluation_metrics.txt'), 'w') as f:
-        f.write(f"Evaluation Metrics (computed on {N} samples):\n")
-        f.write(f"Date: {pd.Timestamp.now()}\n")
-        f.write(f"Reconstruction MSE: {metrics['mse']:.6f}\n")
-        f.write(f"Reconstruction MAE: {metrics['mae']:.6f}\n")
-        f.write(f"Reconstruction MAPE: {metrics['mape']:.6f}%\n")
+    # 繪製網格誤差圖（散點圖）
+    plot_grid_with_error(grid_data.sorted_flow_columns, H, W, mse_matrix, mae_matrix, mape_matrix, save_dir, smape_matrix=smape_matrix)
     
-    # 保存評估指標到 JSON 檔
-    with open(os.path.join(save_dir, 'evaluation_metrics.json'), 'w') as f:
-        json.dump({
-            "mse": metrics['mse'], "mae": metrics['mae'], "mape": metrics['mape'],
-            "sample_size": N, "timestamp": pd.Timestamp.now().isoformat()
-        }, f, indent=4)
+    # 繪製所有樣本的平均圖（熱力圖）
+    visualize_predictions(None, generated_batch, target_batch, sample_idx=None, save_dir=save_dir,
+                          mse_matrix=mse_matrix, mae_matrix=mae_matrix, mape_matrix=mape_matrix, smape_matrix=smape_matrix)
     
+    # 保存整體指標
+    with open(os.path.join(save_dir, 'metrics.json'), 'w') as f:
+        json.dump(metrics, f, indent=4)
+    
+    logging.info(f"重建 MSE: {metrics['mse']:.6f}, MAE: {metrics['mae']:.6f}, MAPE: {metrics['mape']:.6f}, SMAPE: {metrics['smape']:.6f}")
     return metrics
 
 ### 主程式
@@ -690,7 +787,7 @@ if __name__ == "__main__":
     condition_length, prediction_length = 8, 1
     batch_size, epochs, lr, timesteps, patience = 100, 100, 0.001, 1000, 10
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    save_dir = r"C:\thesis\code\result_ddpm_perCell"
+    save_dir = r"C:\thesis\code\result_ddpm_perCell\model"
     torch.manual_seed(42)
     np.random.seed(42)
     
@@ -703,7 +800,7 @@ if __name__ == "__main__":
     test_dataset = Subset(test_dataset, range(test_end, len(test_dataset)))
     print(device)
 
-    # 訓練 441 個模型（對應 21x21 網格的每個單元）
+   # 訓練 441 個模型（對應 21x21 網格的每個單元）
     for i in range(H):
         for j in range(W):
             dataset = PeopleFlowDatasetPerCell(grid_data, condition_length, prediction_length, i, j)
@@ -720,7 +817,7 @@ if __name__ == "__main__":
             trained_diffusion = train_ddpm(diffusion, train_loader, val_loader, i, j, epochs=epochs, 
                                           lr=lr, device=device, patience=patience, save_dir=save_dir, checkpoint_interval=10)
 
-    # 評估模型（載入最佳模型）
+    # 評估模型
     models = {}
     for i in range(H):
         for j in range(W):
@@ -728,8 +825,7 @@ if __name__ == "__main__":
             diffusion = DDPMPerCell(model=model, timesteps=timesteps, beta_start=1e-4, beta_end=0.02, device=device)
             best_model_path = os.path.join(save_dir, f'best_model_{i}_{j}.pth')
             final_model_path = os.path.join(save_dir, f'model_{i}_{j}.pth')
-        
-            # 優先載入最佳模型，若不存在則回退到最終模型
+    
             if os.path.exists(best_model_path):
                 diffusion.load_state_dict(torch.load(best_model_path))
                 logging.info(f"載入單元 ({i}, {j}) 的最佳模型: {best_model_path}")
@@ -738,8 +834,9 @@ if __name__ == "__main__":
                 logging.warning(f"單元 ({i}, {j}) 的最佳模型不存在，載入最終模型: {final_model_path}")
             else:
                 raise FileNotFoundError(f"單元 ({i}, {j}) 的模型文件不存在，請先訓練模型")
-        
+    
             models[(i, j)] = diffusion
 
-    metrics = evaluate_model_per_cell(models, grid_data, test_dataset, device=device, max_samples=2, save_dir=save_dir)
-    logging.info(f"重建 MSE: {metrics['mse']:.6f}, MAE: {metrics['mae']:.6f}")
+    metrics = evaluate_model_per_cell(models, grid_data, test_dataset, device=device, max_samples=1)
+    
+    logging.info(f"重建 MSE: {metrics['mse']:.6f}, MAE: {metrics['mae']:.6f}, MAPE: {metrics['mape']:.6f}")

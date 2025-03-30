@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        body {
+            font-family: Arial, "Microsoft JhengHei", sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f9f9f9;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background-color: white;
+            padding: 20px;
+            box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
+            border-radius: 8px;
+        }
+
+        .title {
+            text-align: center;
+            color: #333;
+            margin-bottom: 30px;
+        }
+
+        .model-container {
+            border: 2px dashed #666;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 30px;
+            position: relative;
+        }
+
+        .model-title {
+            position: absolute;
+            top: -15px;
+            left: 20px;
+            background-color: white;
+            padding: 0 10px;
+            font-weight: bold;
+            font-size: 18px;
+        }
+
+        .component-box {
+            border: 1px solid #999;
+            border-radius: 6px;
+            padding: 10px;
+            margin: 10px 0;
+            background-color: #f5f5f5;
+        }
+
+        .grid-layout {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 20px;
+        }
+
+        .diffusion-process {
+            border: 2px solid #ff9800;
+            border-radius: 8px;
+            padding: 15px;
+            margin: 20px 0;
+            background-color: #fff8e1;
+        }
+
+        .process-title {
+            background-color: #ff9800;
+            color: white;
+            padding: 5px 10px;
+            border-radius: 4px;
+            display: inline-block;
+            margin-bottom: 10px;
+        }
+
+        .flow-diagram {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin: 20px 0;
+        }
+
+        .box {
+            border-radius: 6px;
+            padding: 10px;
+            text-align: center;
+            width: 150px;
+            margin: 0 5px;
+        }
+
+        .arrow {
+            flex-grow: 0;
+            color: #666;
+            font-size: 24px;
+            margin: 0 10px;
+        }
+
+        .time-embedding {
+            background-color: #9ccc65;
+            border-radius: 6px;
+            padding: 10px;
+            text-align: center;
+            width: 150px;
+            margin: 0 auto 20px auto;
+        }
+
+        .data-flow {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin: 30px 0;
+        }
+
+        .data-box {
+            border: 1px solid #999;
+            border-radius: 6px;
+            padding: 10px;
+            text-align: center;
+            width: 150px;
+            background-color: #e3f2fd;
+        }
+
+        .code-block {
+            background-color: #f5f5f5;
+            border-left: 4px solid #2196F3;
+            padding: 10px;
+            margin: 10px 0;
+            font-family: monospace;
+            overflow-x: auto;
+        }
+
+        #scalar-predictor, #ddpm-per-cell {
+            border: 2px solid #2196F3;
+            border-radius: 8px;
+            padding: 15px;
+            margin: 20px 0;
+        }
+
+        .module-title {
+            background-color: #2196F3;
+            color: white;
+            padding: 5px 10px;
+            border-radius: 4px;
+            display: inline-block;
+            margin-bottom: 10px;
+        }
+
+        .unet-container {
+            border: 2px solid #673AB7;
+            border-radius: 8px;
+            padding: 15px;
+            margin: 20px 0;
+            background-color: #f3e5f5;
+        }
+
+        .encoder {
+            background-color: #90caf9;
+            border-radius: 6px;
+            padding: 10px;
+            margin: 5px;
+            text-align: center;
+        }
+
+        .bottleneck {
+            background-color: #ffab91;
+            border-radius: 6px;
+            padding: 10px;
+            margin: 5px;
+            text-align: center;
+        }
+
+        .predictor {
+            background-color: #ffcc80;
+            border-radius: 6px;
+            padding: 10px;
+            margin: 5px;
+            text-align: center;
+        }
+
+        .diffusion-step {
+            background-color: #b39ddb;
+            border-radius: 6px;
+            padding: 10px;
+            margin: 5px;
+            text-align: center;
+        }
+
+        .forward-diffusion {
+            background-color: #ef9a9a;
+            border-radius: 6px;
+            padding: 10px;
+            margin: 5px;
+            text-align: center;
+        }
+
+        .prediction {
+            background-color: #81c784;
+            border-radius: 6px;
+            padding: 10px;
+            margin: 5px;
+            text-align: center;
+        }
+
+        .reverse-diffusion {
+            background-color: #ce93d8;
+            border-radius: 6px;
+            padding: 10px;
+            margin: 5px;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1 class="title">DDPM 3D CNN Lite 模型架構</h1>
+
+        <div class="model-container">
+            <div class="model-title">整體架構</div>
+
+            <div class="time-embedding">
+                <strong>時間嵌入</strong><br>
+                <small>TIME_EMB_DIM = 128</small>
+            </div>
+
+            <div class="data-flow">
+                <div class="data-box">
+                    <strong>輸入資料</strong><br>
+                    <small>shape = (B, 1, condition_length, H, W)</small>
+                </div>
+                <div class="arrow">→</div>
+                <div id="scalar-predictor">
+                    <div class="module-title">ScalarPredictor</div>
+                    <div class="unet-container">
+                        <div class="encoder">
+                            <strong>編碼器 1</strong><br>
+                            <small>DoubleConv3D(1, 64)</small>
+                        </div>
+                        <div class="arrow">↓</div>
+                        <div class="encoder">
+                            <strong>池化層 + 編碼器 2</strong><br>
+                            <small>MaxPool3d(2) + DoubleConv3D(64, 128)</small>
+                        </div>
+                        <div class="arrow">↓</div>
+                        <div class="bottleneck">
+                            <strong>自適應池化層</strong><br>
+                            <small>AdaptiveAvgPool3d(1, 1, 1)</small>
+                        </div>
+                        <div class="arrow">↓</div>
+                        <div class="predictor">
+                            <strong>全連接層</strong><br>
+                            <small>Linear(128+1+time_emb_dim, 1)</small>
+                        </div>
+                    </div>
+                </div>
+                <div class="arrow">→</div>
+                <div class="data-box">
+                    <strong>輸出預測</strong><br>
+                    <small>shape = (B, 1)</small>
+                </div>
+            </div>
+
+            <div id="ddpm-per-cell">
+                <div class="module-title">DDPMPerCell</div>
+                <div class="diffusion-process">
+                    <div class="process-title">擴散過程</div>
+                    <div class="flow-diagram">
+                        <div class="forward-diffusion">
+                            <strong>前向擴散</strong><br>
+                            <small>q_sample(x0, t, noise)</small>
+                        </div>
+                        <div class="arrow">→</div>
+                        <div class="diffusion-step">
+                            <strong>雜訊預測</strong><br>
+                            <small>model(condition, x_noisy, t_emb)</small>
+                        </div>
+                        <div class="arrow">→</div>
+                        <div class="reverse-diffusion">
+                            <strong>反向擴散</strong><br>
+                            <small>p_sample(condition, x_t, t)</small>
+                        </div>
+                    </div>
+                    <div class="code-block">
+                        <div>timesteps = 1000</div>
+                        <div>betas = torch.linspace(1e-4, 0.02, timesteps)</div>
+                        <div>alphas = 1.0 - betas</div>
+                        <div>alphas_cumprod = torch.cumprod(alphas, dim=0)</div>
+                    </div>
+                </div>
+
+                <div class="component-box">
+                    <h3>採樣迴圈</h3>
+                    <div class="code-block">
+                        <div>def p_sample_loop(self, condition, shape, prediction_length):</div>
+                        <div>    # 從隨機雜訊開始</div>
+                        <div>    # 針對每個預測時間點，執行完整的反向擴散</div>
+                        <div>    # 將結果加入預測序列</div>
+                        <div>    # 將預測結果納入條件，用於預測下一個時間點</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="grid-layout">
+            <div class="component-box">
+                <h3>DoubleConv3D</h3>
+                <div class="code-block">
+                    <div>nn.Conv3d(in_channels, out_channels, 3, padding=1)</div>
+                    <div>nn.BatchNorm3d(out_channels)</div>
+                    <div>nn.ReLU(inplace=True)</div>
+                    <div>nn.Conv3d(out_channels, out_channels, 3, padding=1)</div>
+                    <div>nn.BatchNorm3d(out_channels)</div>
+                    <div>nn.ReLU(inplace=True)</div>
+                </div>
+            </div>
+
+            <div class="component-box">
+                <h3>時間嵌入</h3>
+                <div class="code-block">
+                    <div>def get_time_embedding(self, t):</div>
+                    <div>    t = t.float()</div>
+                    <div>    emb = t[:, None] * self.freq_factor</div>
+                    <div>    return torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)</div>
+                </div>
+            </div>
+
+            <div class="component-box">
+                <h3>資料處理</h3>
+                <div class="code-block">
+                    <div>GridData - 處理CSV資料並構建網格</div>
+                    <div>PeopleFlowDatasetPerCell - 每個單元格的時間序列資料</div>
+                    <div>PeopleFlowDatasetForEval - 評估用的完整網格資料</div>
+                </div>
+            </div>
+
+            <div class="component-box">
+                <h3>訓練與評估</h3>
+                <div class="code-block">
+                    <div>train_ddpm - 訓練每個單元格的擴散模型</div>
+                    <div>evaluate_model_per_cell - 評估模型在測試集上的表現</div>
+                    <div>評估指標: MSE, MAE, MAPE, SMAPE</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="component-box">
+            <h3>主要參數</h3>
+            <div class="grid-layout">
+                <div>
+                    <ul>
+                        <li>H, W = 21, 21 (網格大小)</li>
+                        <li>condition_length = 8 (條件序列長度)</li>
+                        <li>prediction_length = 1 (預測序列長度)</li>
+                    </ul>
+                </div>
+                <div>
+                    <ul>
+                        <li>batch_size = 150</li>
+                        <li>timesteps = 1000 (擴散步數)</li>
+                        <li>lr = 0.0005 (學習率)</li>
+                        <li>patience = 5 (早停耐心值)</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+
+        <div class="component-box">
+            <h3>訓練流程</h3>
+            <ol>
+                <li>對每個網格單元格 (i, j):</li>
+                <li>創建單元格專用的資料集與資料載入器</li>
+                <li>初始化 ScalarPredictor 模型</li>
+                <li>包裝為 DDPMPerCell 擴散模型</li>
+                <li>訓練模型並保存檢查點</li>
+                <li>載入所有單元格的最佳模型</li>
+                <li>在測試集上評估整體表現</li>
+            </ol>
+        </div>
+    </div>
+</body>
+</html>

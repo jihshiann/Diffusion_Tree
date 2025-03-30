@@ -525,40 +525,117 @@ def visualize_predictions(cond, generated, target, sample_idx: int = 0,
     os.makedirs(save_dir, exist_ok=True)
     pred_length = generated.shape[2]
     
-    # 對預測的每個時間步進行繪圖
-    for t in range(pred_length):
-        plt.figure(figsize=(16, 4))
+    # 若 sample_idx 為 None，則計算所有樣本的平均值
+    if sample_idx is None:
+        generated_avg = torch.mean(generated, dim=(0, 2)).squeeze(0).cpu().numpy()  # (H, W)
+        target_avg = torch.mean(target, dim=(0, 2)).squeeze(0).cpu().numpy()        # (H, W)
         
-        # 子圖1：生成結果
-        plt.subplot(1, 4, 1)
-        plt.imshow(generated[sample_idx, 0, t].cpu().numpy(), cmap='viridis')
+        mse_matrix = (generated_avg - target_avg) ** 2
+        mae_matrix = np.abs(generated_avg - target_avg)
+        mape_matrix = np.abs((target_avg - generated_avg) / (target_avg + 1e-10)) * 100
+        smape_matrix = np.abs(generated_avg - target_avg) / (np.abs(target_avg) + np.abs(generated_avg) + 1e-10) * 100
+        
+        mse = np.mean(mse_matrix)
+        mae = np.mean(mae_matrix)
+        mape = np.mean(mape_matrix)
+        smape = np.mean(smape_matrix)
+        
+        # 子圖 1：平均生成結果
+        plt.figure(figsize=(6, 6))
+        plt.imshow(generated_avg, cmap='viridis')
         plt.colorbar()
-        plt.title(f'Generated (t={t})')
-        
-        # 子圖2：真實值
-        plt.subplot(1, 4, 2)
-        plt.imshow(target[sample_idx, 0, t].cpu().numpy(), cmap='viridis')
-        plt.colorbar()
-        plt.title(f'True (t={t})')
-        
-        # 子圖3：MSE 誤差圖（平方誤差）
-        error_sq = (generated[sample_idx, 0, t].cpu().numpy() - target[sample_idx, 0, t].cpu().numpy()) ** 2
-        plt.subplot(1, 4, 3)
-        plt.imshow(error_sq, cmap='hot')
-        plt.colorbar()
-        plt.title(f'MSE (t={t})')
-        
-        # 子圖4：MAE 誤差圖（絕對誤差）
-        error_abs = np.abs(generated[sample_idx, 0, t].cpu().numpy() - target[sample_idx, 0, t].cpu().numpy())
-        plt.subplot(1, 4, 4)
-        plt.imshow(error_abs, cmap='hot')
-        plt.colorbar()
-        plt.title(f'MAE (t={t})')
-        
-        plt.suptitle(f'Sample {sample_idx} - Time Step {t}')
-        plt.tight_layout(rect=[0, 0, 1, 0.95])
-        plt.savefig(os.path.join(save_dir, f'prediction_sample{sample_idx}_t{t}.png'), dpi=300)
+        plt.title('avg_generated')
+        plt.savefig(os.path.join(save_dir, 'prediction_all_samples_avg_generated.png'), dpi=300)
         plt.close()
+        
+        # 子圖 2：平均真實值
+        plt.figure(figsize=(6, 6))
+        plt.imshow(target_avg, cmap='viridis')
+        plt.colorbar()
+        plt.title('avg_target')
+        plt.savefig(os.path.join(save_dir, 'prediction_all_samples_avg_target.png'), dpi=300)
+        plt.close()
+        
+        # 子圖 3：MSE 誤差圖
+        plt.figure(figsize=(6, 6))
+        plt.imshow(mse_matrix, cmap='hot')
+        plt.colorbar()
+        plt.title(f'MSE: {mse:.0f}')
+        plt.savefig(os.path.join(save_dir, 'prediction_all_samples_avg_mse.png'), dpi=300)
+        plt.close()
+        
+        # 子圖 4：MAE 誤差圖（標示整數）
+        plt.figure(figsize=(6, 6))
+        plt.imshow(mae_matrix, cmap='hot')
+        plt.colorbar()
+        for i in range(mae_matrix.shape[0]):
+            for j in range(mae_matrix.shape[1]):
+                plt.text(j, i, f'{int(round(mae_matrix[i, j]))}', ha='center', va='center', color='white', fontsize=4)
+        plt.title(f'MAE: {mae:.0f}')
+        plt.savefig(os.path.join(save_dir, 'prediction_all_samples_avg_mae.png'), dpi=300)
+        plt.close()
+        
+        # 子圖 5：MAPE 誤差圖（標示整數）
+        plt.figure(figsize=(6, 6))
+        plt.imshow(mape_matrix, cmap='hot')
+        plt.colorbar()
+        for i in range(mape_matrix.shape[0]):
+            for j in range(mape_matrix.shape[1]):
+                plt.text(j, i, f'{int(round(mape_matrix[i, j]))}', ha='center', va='center', color='white', fontsize=4)
+        plt.title(f'MAPE: {mape:.0f}%')
+        plt.savefig(os.path.join(save_dir, 'prediction_all_samples_avg_mape.png'), dpi=300)
+        plt.close()
+        
+        # 子圖 6：SMAPE 誤差圖（標示整數）
+        plt.figure(figsize=(6, 6))
+        plt.imshow(smape_matrix, cmap='hot')
+        plt.colorbar()
+        for i in range(smape_matrix.shape[0]):
+            for j in range(smape_matrix.shape[1]):
+                plt.text(j, i, f'{int(round(smape_matrix[i, j]))}', ha='center', va='center', color='white', fontsize=4)
+        plt.title(f'SMAPE: {smape:.0f}%')
+        plt.savefig(os.path.join(save_dir, 'prediction_all_samples_avg_smape.png'), dpi=300)
+        plt.close()
+    
+    else:
+        # 原有單樣本視覺化邏輯（這裡保留，僅更新為包含 MAPE 和 SMAPE）
+        for t in range(pred_length):
+            plt.figure(figsize=(20, 4))
+            
+            plt.subplot(1, 5, 1)
+            plt.imshow(generated[sample_idx, 0, t].cpu().numpy(), cmap='viridis')
+            plt.colorbar()
+            plt.title(f'Generated (t={t})')
+            
+            plt.subplot(1, 5, 2)
+            plt.imshow(target[sample_idx, 0, t].cpu().numpy(), cmap='viridis')
+            plt.colorbar()
+            plt.title(f'True (t={t})')
+            
+            error_sq = (generated[sample_idx, 0, t].cpu().numpy() - target[sample_idx, 0, t].cpu().numpy()) ** 2
+            plt.subplot(1, 5, 3)
+            plt.imshow(error_sq, cmap='hot')
+            plt.colorbar()
+            plt.title(f'MSE (t={t})')
+            
+            error_abs = np.abs(generated[sample_idx, 0, t].cpu().numpy() - target[sample_idx, 0, t].cpu().numpy())
+            plt.subplot(1, 5, 4)
+            plt.imshow(error_abs, cmap='hot')
+            plt.colorbar()
+            plt.title(f'MAE (t={t})')
+            
+            # 新增 MAPE 子圖
+            mape = np.abs((target[sample_idx, 0, t].cpu().numpy() - generated[sample_idx, 0, t].cpu().numpy()) / 
+                         (target[sample_idx, 0, t].cpu().numpy() + 1e-10)) * 100
+            plt.subplot(1, 5, 5)
+            plt.imshow(mape, cmap='hot')
+            plt.colorbar()
+            plt.title(f'MAPE (t={t})')
+            
+            plt.suptitle(f'Sample {sample_idx} - Time Step {t}')
+            plt.tight_layout(rect=[0, 0, 1, 0.95])
+            plt.savefig(os.path.join(save_dir, f'prediction_sample{sample_idx}_t{t}.png'), dpi=300)
+            plt.close()
 
 def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int, 
                          mse_matrix: np.ndarray, mae_matrix: np.ndarray, mape_matrix: np.ndarray, 
@@ -577,15 +654,13 @@ def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int,
     """
     os.makedirs(save_dir, exist_ok=True)
     
-    # 解析經緯度
     locations = [parse_lat_lon(col) for col in sorted_flow_columns]
     longitudes, latitudes = zip(*locations)
     
-    # 定義顏色映射
     orig_cmap = plt.get_cmap('OrRd')
     trunc_cmap = truncate_colormap(orig_cmap, 0.3, 1.0)
     
-    # 繪製 MSE 網格圖
+    # 繪製 MSE 網格圖（不標示數字）
     plt.figure(figsize=(12, 12))
     scatter = plt.scatter(longitudes, latitudes, c=mse_matrix.flatten(), cmap=trunc_cmap, marker='o')
     plt.colorbar(scatter, label='MSE')
@@ -596,10 +671,12 @@ def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int,
     plt.savefig(os.path.join(save_dir, 'plot_grid_with_error_mse.png'), dpi=600, bbox_inches='tight', pad_inches=0.1)
     plt.close()
 
-    # 繪製 MAE 網格圖
+    # 繪製 MAE 網格圖（標示整數）
     plt.figure(figsize=(12, 12))
     scatter = plt.scatter(longitudes, latitudes, c=mae_matrix.flatten(), cmap=trunc_cmap, marker='o')
     plt.colorbar(scatter, label='MAE')
+    for i, (lon, lat) in enumerate(zip(longitudes, latitudes)):
+        plt.text(lon, lat, f'{int(round(mae_matrix.flatten()[i]))}', ha='center', va='center', color='black', fontsize=6)
     plt.xlabel("Longitude")
     plt.ylabel("Latitude")
     plt.title("Grid with MAE")
@@ -607,10 +684,12 @@ def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int,
     plt.savefig(os.path.join(save_dir, 'plot_grid_with_error_mae.png'), dpi=600, bbox_inches='tight', pad_inches=0.1)
     plt.close()
 
-    # 繪製 MAPE 網格圖
+    # 繪製 MAPE 網格圖（標示整數）
     plt.figure(figsize=(12, 12))
     scatter = plt.scatter(longitudes, latitudes, c=mape_matrix.flatten(), cmap=trunc_cmap, marker='o')
     plt.colorbar(scatter, label='MAPE (%)')
+    for i, (lon, lat) in enumerate(zip(longitudes, latitudes)):
+        plt.text(lon, lat, f'{int(round(mape_matrix.flatten()[i]))}', ha='center', va='center', color='black', fontsize=6)
     plt.xlabel("Longitude")
     plt.ylabel("Latitude")
     plt.title("Grid with MAPE")
@@ -618,7 +697,21 @@ def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int,
     plt.savefig(os.path.join(save_dir, 'plot_grid_with_error_mape.png'), dpi=600, bbox_inches='tight', pad_inches=0.1)
     plt.close()
 
-    # 保存表格
+    # 繪製 SMAPE 網格圖（標示整數）
+    if smape_matrix is not None:
+        plt.figure(figsize=(12, 12))
+        scatter = plt.scatter(longitudes, latitudes, c=smape_matrix.flatten(), cmap=trunc_cmap, marker='o')
+        plt.colorbar(scatter, label='SMAPE (%)')
+        for i, (lon, lat) in enumerate(zip(longitudes, latitudes)):
+            plt.text(lon, lat, f'{int(round(smape_matrix.flatten()[i]))}', ha='center', va='center', color='black', fontsize=6)
+        plt.xlabel("Longitude")
+        plt.ylabel("Latitude")
+        plt.title("Grid with SMAPE")
+        plt.grid(True)
+        plt.savefig(os.path.join(save_dir, 'plot_grid_with_error_smape.png'), dpi=600, bbox_inches='tight', pad_inches=0.1)
+        plt.close()
+
+    # 更新表格，新增 SMAPE
     table_data = {
         'Grid Index': [f'[{i},{j}]' for i in range(H) for j in range(W)],
         'Longitude': longitudes,
@@ -627,9 +720,12 @@ def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int,
         'MAE': mae_matrix.flatten(),
         'MAPE (%)': mape_matrix.flatten()
     }
+    if smape_matrix is not None:
+        table_data['SMAPE (%)'] = smape_matrix.flatten()
+    
     df = pd.DataFrame(table_data)
-    df.to_csv(os.path.join(save_dir, 'mse_mae_mape_per_coordinate.csv'), index=False)
-    df.to_excel(os.path.join(save_dir, 'mse_mae_mape_per_coordinate.xlsx'), index=False)
+    df.to_csv(os.path.join(save_dir, 'mse_mae_mape_smape_per_coordinate.csv'), index=False)
+    df.to_excel(os.path.join(save_dir, 'mse_mae_mape_smape_per_coordinate.xlsx'), index=False)
 
 # --------------------------------------
 # 訓練與評估函數
@@ -746,11 +842,10 @@ def evaluate_model(diffusion: DDPM3D, dataset: Dataset, device: str = 'cuda',
     from torch.utils.data import Subset
 
     diffusion.eval()
-    metrics = {'mse': 0.0, 'mae': 0.0, 'mape': 0.0}
+    metrics = {'mse': 0.0, 'mae': 0.0, 'mape': 0.0, 'smape': 0.0}
     N = min(len(dataset), max_samples)
     sample_indices = random.sample(range(len(dataset)), N)
     
-    # 若 dataset 為 Subset，則取出原始數據集以獲取參數
     base_dataset = dataset.dataset if isinstance(dataset, Subset) else dataset
     H, W = base_dataset.H, base_dataset.W
     pred_length = base_dataset.prediction_length
@@ -758,7 +853,6 @@ def evaluate_model(diffusion: DDPM3D, dataset: Dataset, device: str = 'cuda',
     mean_val = base_dataset.mean_val.to(device)
     std_val = base_dataset.std_val.to(device)
     
-    # 預先分配張量
     generated_batch = torch.zeros(N, 1, pred_length, H, W, device=device)
     target_batch = torch.zeros(N, 1, pred_length, H, W, device=device)
     
@@ -780,15 +874,20 @@ def evaluate_model(diffusion: DDPM3D, dataset: Dataset, device: str = 'cuda',
         mse = F.mse_loss(x_recon_original, target_original).item()
         mae = F.l1_loss(x_recon_original, target_original).item()
         mape = torch.mean(torch.abs((target_original - x_recon_original) / (target_original + 1e-10))) * 100
+        # 新增 SMAPE 計算
+        smape = torch.mean(torch.abs(x_recon_original - target_original) / 
+                          (torch.abs(target_original) + torch.abs(x_recon_original) + 1e-10)) * 100
         
         metrics['mse'] += mse
         metrics['mae'] += mae
         metrics['mape'] += mape.item()
+        metrics['smape'] += smape.item()
     
     # 平均誤差
     metrics['mse'] /= N
     metrics['mae'] /= N
     metrics['mape'] /= N
+    metrics['smape'] /= N
     
     os.makedirs(save_dir, exist_ok=True)
     
@@ -799,19 +898,25 @@ def evaluate_model(diffusion: DDPM3D, dataset: Dataset, device: str = 'cuda',
     error_matrix_mae = torch.abs(generated_batch - target_batch)
     mae_matrix = torch.mean(error_matrix_mae, dim=(0, 2)).cpu().numpy()[0]  # (H, W)
     
-    # 計算 MAPE 矩陣
     mape_matrix = torch.mean(torch.abs((target_batch - generated_batch) / (target_batch + 1e-10)), 
                             dim=(0, 2)).cpu().numpy()[0] * 100  # (H, W)
     
-    # 繪製誤差圖並保存表格
-    plot_grid_with_error(base_dataset.sorted_flow_columns, H, W, mse_matrix, mae_matrix, mape_matrix, save_dir)
+    # 新增 SMAPE 矩陣計算
+    smape_matrix = torch.mean(torch.abs(generated_batch - target_batch) / 
+                             (torch.abs(target_batch) + torch.abs(generated_batch) + 1e-10), 
+                             dim=(0, 2)).cpu().numpy()[0] * 100  # (H, W)
     
-    # 儲存評估結果
+    # 更新視覺化函數調用，傳入 smape_matrix
+    plot_grid_with_error(base_dataset.sorted_flow_columns, H, W, mse_matrix, mae_matrix, mape_matrix, save_dir, smape_matrix)
+    visualize_predictions(generated_batch, generated_batch, target_batch, sample_idx, save_dir)  # 注意這裡應傳入 cond
+    
+    # 更新評估結果儲存，包含 SMAPE
     with open(os.path.join(save_dir, 'evaluation_metrics.txt'), 'w') as f:
         f.write(f"Evaluation Metrics (computed on {N} samples):\n")
         f.write(f"Reconstruction MSE: {metrics['mse']:.6f}\n")
         f.write(f"Reconstruction MAE: {metrics['mae']:.6f}\n")
         f.write(f"Reconstruction MAPE: {metrics['mape']:.6f}%\n")
+        f.write(f"Reconstruction SMAPE: {metrics['smape']:.6f}%\n")
     
     return metrics
 
@@ -866,20 +971,21 @@ if __name__ == "__main__":
     # -------------------------------
     # 評估模型
     # -------------------------------
-    metrics = evaluate_model(trained_diffusion, val_dataset, device=device, max_samples=100, save_dir=save_dir)
-    logging.info(f"Reconstruction MSE: {metrics['mse']:.6f}, MAE: {metrics['mae']:.6f}")
+    metrics = evaluate_model(trained_diffusion, val_dataset, device=device, max_samples=20, save_dir=save_dir)
+    logging.info(f"Reconstruction MSE: {metrics['mse']:.6f}, MAE: {metrics['mae']:.6f}, "
+                 f"MAPE: {metrics['mape']:.6f}, SMAPE: {metrics['smape']:.6f}")
 
-    # -------------------------------
     # 儲存最終評估結果
-    # -------------------------------
     os.makedirs(save_dir, exist_ok=True)
     with open(os.path.join(save_dir, 'evaluation_metrics.txt'), 'w') as f:
-        f.write(f"Evaluation Metrics (computed on 2 samples):\n")
+        f.write(f"Evaluation Metrics (computed on 100 samples):\n")
         f.write(f"Date: {pd.Timestamp.now()}\n")
         f.write(f"Reconstruction MSE: {metrics['mse']:.6f}\n")
         f.write(f"Reconstruction MAE: {metrics['mae']:.6f}\n")
+        f.write(f"Reconstruction MAPE: {metrics['mape']:.6f}%\n")
+        f.write(f"Reconstruction SMAPE: {metrics['smape']:.6f}%\n")
     with open(os.path.join(save_dir, 'evaluation_metrics.json'), 'w') as f:
         json.dump({
-            "mse": metrics['mse'], "mae": metrics['mae'],
-            "sample_size": 2, "timestamp": pd.Timestamp.now().isoformat()
+            "mse": metrics['mse'], "mae": metrics['mae'], "mape": metrics['mape'], "smape": metrics['smape'],
+            "sample_size": 20, "timestamp": pd.Timestamp.now().isoformat()
         }, f, indent=4)

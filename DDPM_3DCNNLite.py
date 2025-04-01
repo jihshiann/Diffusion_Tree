@@ -388,7 +388,7 @@ def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int, mse_matrix: 
     scatter = plt.scatter(longitudes, latitudes, c=mae_matrix.flatten(), cmap=trunc_cmap, marker='o')
     plt.colorbar(scatter, label='MAE')
     for i, (lon, lat) in enumerate(zip(longitudes, latitudes)):
-        plt.text(lon, lat, f'{int(round(mae_matrix.flatten()[i]))}', ha='center', va='center', color='black', fontsize=6)
+        plt.text(lon, lat, f'{int(round(mae_matrix.flatten()[i]))}', ha='center', va='center', color='black', fontsize=5)
     plt.xlabel("Longitude")
     plt.ylabel("Latitude")
     plt.title("Grid with MAE")
@@ -396,12 +396,22 @@ def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int, mse_matrix: 
     plt.savefig(os.path.join(save_dir, 'plot_grid_with_error_mae.png'), dpi=600, bbox_inches='tight', pad_inches=0.1)
     plt.close()
 
+    plt.figure(figsize=(12, 12))
+    scatter = plt.scatter(longitudes, latitudes, c=mae_matrix.flatten(), cmap=trunc_cmap, marker='o')
+    plt.colorbar(scatter, label='MAE')
+    plt.xlabel("Longitude")
+    plt.ylabel("Latitude")
+    plt.title("Grid with MAE")
+    plt.grid(True)
+    plt.savefig(os.path.join(save_dir, 'plot_grid_with_error_mae_clean.png'), dpi=600, bbox_inches='tight', pad_inches=0.1)
+    plt.close()
+
     # 繪製 MAPE 網格圖
     plt.figure(figsize=(12, 12))
     scatter = plt.scatter(longitudes, latitudes, c=mape_matrix.flatten(), cmap=trunc_cmap, marker='o')
     plt.colorbar(scatter, label='MAPE')
     for i, (lon, lat) in enumerate(zip(longitudes, latitudes)):
-        plt.text(lon, lat, f'{int(round(mape_matrix.flatten()[i]))}', ha='center', va='center', color='black', fontsize=6)
+        plt.text(lon, lat, f'{int(round(mape_matrix.flatten()[i]))}', ha='center', va='center', color='black', fontsize=7)
     plt.xlabel("Longitude")
     plt.ylabel("Latitude")
     plt.title("Grid with MAPE (%)")
@@ -409,18 +419,38 @@ def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int, mse_matrix: 
     plt.savefig(os.path.join(save_dir, 'plot_grid_with_error_mape.png'), dpi=600, bbox_inches='tight', pad_inches=0.1)
     plt.close()
 
+    plt.figure(figsize=(12, 12))
+    scatter = plt.scatter(longitudes, latitudes, c=mape_matrix.flatten(), cmap=trunc_cmap, marker='o')
+    plt.colorbar(scatter, label='MAPE')
+    plt.xlabel("Longitude")
+    plt.ylabel("Latitude")
+    plt.title("Grid with MAPE (%)")
+    plt.grid(True)
+    plt.savefig(os.path.join(save_dir, 'plot_grid_with_error_mape_clean.png'), dpi=600, bbox_inches='tight', pad_inches=0.1)
+    plt.close()
+    
+
     # 繪製 SMAPE 網格圖
     if smape_matrix is not None:
         plt.figure(figsize=(12, 12))
         scatter = plt.scatter(longitudes, latitudes, c=smape_matrix.flatten(), cmap=trunc_cmap, marker='o')
         plt.colorbar(scatter, label='SMAPE')
         for i, (lon, lat) in enumerate(zip(longitudes, latitudes)):
-            plt.text(lon, lat, f'{int(round(smape_matrix.flatten()[i]))}', ha='center', va='center', color='black', fontsize=6)
+            plt.text(lon, lat, f'{int(round(smape_matrix.flatten()[i]))}', ha='center', va='center', color='black', fontsize=7)
         plt.xlabel("Longitude")
         plt.ylabel("Latitude")
         plt.title("Grid with SMAPE (%)")
         plt.grid(True)
         plt.savefig(os.path.join(save_dir, 'plot_grid_with_error_smape.png'), dpi=600, bbox_inches='tight', pad_inches=0.1)
+        plt.close()
+
+        plt.figure(figsize=(12, 12))
+        scatter = plt.scatter(longitudes, latitudes, c=smape_matrix.flatten(), cmap=trunc_cmap, marker='o')
+        plt.colorbar(scatter, label='SMAPE')
+        plt.ylabel("Latitude")
+        plt.title("Grid with SMAPE (%)")
+        plt.grid(True)
+        plt.savefig(os.path.join(save_dir, 'plot_grid_with_error_smape_simple.png'), dpi=600, bbox_inches='tight', pad_inches=0.1)
         plt.close()
 
     # 保存表格
@@ -690,6 +720,8 @@ def evaluate_model_per_cell(models: dict, grid_data: GridData, test_dataset: Dat
     
     metrics = {'mse': 0.0, 'mae': 0.0, 'mape': 0.0, 'smape': 0.0}
     N = min(len(test_dataset), max_samples)
+    print(len(test_dataset))
+    print(N)
     sample_indices = random.sample(range(len(test_dataset)), N)
     H, W = grid_data.H, grid_data.W
     prediction_length = test_dataset.dataset.prediction_length
@@ -842,4 +874,5 @@ if __name__ == "__main__":
             models[(i, j)] = diffusion
 
     metrics = evaluate_model_per_cell(models, grid_data, test_dataset, device=device, max_samples=20)
+
     logging.info(f"重建 MSE: {metrics['mse']:.6f}, MAE: {metrics['mae']:.6f}, MAPE: {metrics['mape']:.6f}, SMAPE: {metrics['smape']:.6f}")

@@ -14,6 +14,10 @@ from torch.utils.data import Dataset, DataLoader, Subset
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from typing import Optional
+from torch.optim import lr_scheduler
+import torch_fidelity
+from PIL import Image
+import scipy.linalg
 
 # 設定 logging 等級為 INFO，方便查看訓練過程
 logging.basicConfig(level=logging.INFO)
@@ -236,7 +240,19 @@ class ScalarPredictor(nn.Module):
         self.pool2 = nn.MaxPool3d(kernel_size=2, stride=2)  # -> (batch, 128, 2, 5, 5)
         self.adaptive_pool = nn.AdaptiveAvgPool3d((1, 1, 1))  # -> (batch, 128, 1, 1, 1)
         feature_size = base_channels * 2  # 128
-        self.fc = nn.Linear(feature_size + 1 + time_emb_dim, 1)  # 直接映射到單一標量
+        
+        # 定義多層全連接層（MLP）
+        self.mlp = nn.Sequential(
+            nn.Linear(feature_size + 1 + time_emb_dim, 128),
+            nn.BatchNorm1d(128),  # Add BatchNorm1d after the first Linear layer
+            nn.ReLU(),
+            nn.Dropout(p=0.2),
+            nn.Linear(128, 64),
+            nn.BatchNorm1d(64),   # Add BatchNorm1d after the second Linear layer
+            nn.ReLU(),
+            nn.Dropout(p=0.2),
+            nn.Linear(64, 1)      # Output layer, no BatchNorm1d or ReLU
+        )
 
     def forward(self, condition: torch.Tensor, x_t: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
         e1 = self.enc1(condition)
@@ -246,8 +262,23 @@ class ScalarPredictor(nn.Module):
         if x_t.dim() == 1:
             x_t = x_t.unsqueeze(1)
         combined = torch.cat([pooled, x_t, t_emb], dim=1)
-        out = self.fc(combined)
+        out = self.mlp(combined)
         return out
+
+# 假設 DoubleConv3D 已定義，若未定義，可用以下簡單實現：
+class DoubleConv3D(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm3d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm3d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x)
 
 class DDPMPerCell(nn.Module):
     """每個網格單元的 DDPM 模型，實現噪聲添加和去噪過程"""
@@ -578,10 +609,45 @@ def truncate_colormap(cmap, minval: float = 0.0, maxval: float = 1.0, n: int = 2
     )
     return new_cmap
 
+
+def calculate_fid_custom(real_data, generated_data, device='cuda'):
+    """
+    計算 FID，分別針對真實數據和生成數據。
+    
+    Args:
+        real_data (torch.Tensor): 真實數據，形狀為 (N, T, H, W)，例如 (50, 24, 21, 21)
+        generated_data (torch.Tensor): 生成數據，形狀相同
+        device (str): 計算設備
+    
+    Returns:
+        float: FID 值
+    """
+    # 展平數據以提取特徵，假設使用簡單的統計特徵
+    real_data = real_data.to(device).view(real_data.size(0), -1)  # (N, T*H*W)
+    generated_data = generated_data.to(device).view(generated_data.size(0), -1)
+
+    # 轉為 numpy 進行計算
+    real_data_np = real_data.cpu().numpy()
+    generated_data_np = generated_data.cpu().numpy()
+
+    # 計算均值和協方差
+    mu_real = np.mean(real_data_np, axis=0)
+    sigma_real = np.cov(real_data_np, rowvar=False)
+    mu_gen = np.mean(generated_data_np, axis=0)
+    sigma_gen = np.cov(generated_data_np, rowvar=False)
+
+    # 計算 Fréchet 距離
+    diff = mu_real - mu_gen
+    covmean = scipy.linalg.sqrtm(sigma_real.dot(sigma_gen), disp=False)[0]  # 使用 scipy.linalg.sqrtm
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+    fid = np.sum(diff**2) + np.trace(sigma_real + sigma_gen - 2 * covmean)
+    return fid
+
 # ### 訓練與評估函數
 def train_ddpm(diffusion: DDPMPerCell, train_loader: DataLoader, val_loader: DataLoader, i: int, j: int,
                start_epoch: int = 0, epochs: int = 20, lr: float = 1e-4, device: str = 'cuda', 
-               patience: int = 3, weight_decay: float = 1e-6, 
+               patience: int = 15, weight_decay: float = 1e-6, 
                save_dir: str = r"C:\thesis\code\result_ddpm_perCell\model", checkpoint_interval: int = 10) -> DDPMPerCell:
     """訓練 DDPM 模型，帶有檢查點保存和恢復功能。
     
@@ -604,18 +670,34 @@ def train_ddpm(diffusion: DDPMPerCell, train_loader: DataLoader, val_loader: Dat
         DDPMPerCell: 訓練完成的模型。
     """
     optimizer = optim.AdamW(diffusion.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, min_lr=1e-6) 
     diffusion.to(device)
     best_val_loss = float('inf')
     patience_counter = 0
     train_losses, val_losses = [], []
     os.makedirs(save_dir, exist_ok=True)
     checkpoint_path = os.path.join(save_dir, f'checkpoint_{i}_{j}.pth')
+    lr_history = []
     
     # 檢查並恢復檢查點
     if os.path.exists(checkpoint_path):
         checkpoint = torch.load(checkpoint_path)
         diffusion.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+        # 檢查是否有 scheduler_state_dict，若無則重新初始化 scheduler
+        if 'scheduler_state_dict' in checkpoint:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            logging.info(f"恢復單元 ({i}, {j}) 的 scheduler 狀態")
+        else:
+            logging.warning(f"檢查點中未找到 'scheduler_state_dict'，使用默認 scheduler 設置")
+            # 可選：如果檢查點中保存了學習率，可以用來更新 optimizer 的學習率
+            if 'learning_rate' in checkpoint:
+                current_lr = checkpoint['learning_rate']
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = current_lr
+                logging.info(f"從檢查點恢復學習率: {current_lr:.8f}")
+        
         start_epoch = checkpoint['epoch']
         train_losses = checkpoint['train_losses']
         val_losses = checkpoint['val_losses']
@@ -648,12 +730,20 @@ def train_ddpm(diffusion: DDPMPerCell, train_loader: DataLoader, val_loader: Dat
         avg_val_loss = total_val_loss / len(val_loader)
         val_losses.append(avg_val_loss)
         
-        logging.info(f"單元 ({i}, {j}) Epoch [{epoch+1}/{epochs}] - 訓練損失: {avg_train_loss:.4f}, 驗證損失: {avg_val_loss:.4f}")
+        # 更新學習率
+        scheduler.step(avg_val_loss)
+        current_lr = scheduler.get_last_lr()[0]
+        lr_history.append(current_lr)
+        logging.info(f"單元 ({i}, {j}) Epoch [{epoch+1}/{epochs}] - 訓練損失: {avg_train_loss:.4f}, 驗證損失: {avg_val_loss:.4f}, 學習率: {current_lr:.8f}")
         
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             patience_counter = 0
-            torch.save(diffusion.state_dict(), os.path.join(save_dir, f'best_model_{i}_{j}.pth'))
+            torch.save({
+                'model_state_dict': diffusion.state_dict(),
+                'learning_rate': current_lr,  # 記錄最佳模型的學習率
+            }, os.path.join(save_dir, f'best_model_{i}_{j}.pth'))
+            logging.info(f"單元 ({i}, {j}) 保存最佳模型，驗證損失: {best_val_loss:.4f}, 學習率: {current_lr:.8f}")
         else:
             patience_counter += 1
             if patience_counter >= patience:
@@ -665,14 +755,15 @@ def train_ddpm(diffusion: DDPMPerCell, train_loader: DataLoader, val_loader: Dat
             torch.save({
                 'model_state_dict': diffusion.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
                 'epoch': epoch + 1,
                 'train_losses': train_losses,
                 'val_losses': val_losses,
+                'learning_rate': current_lr,
                 'i': i,
                 'j': j
             }, checkpoint_path)
-            logging.info(f"單元 ({i}, {j}) 在 epoch {epoch + 1} 保存檢查點")
-    
+            logging.info(f"單元 ({i}, {j}) 在 epoch {epoch + 1} 保存檢查點，學習率: {current_lr:.8f}")
     
     # 繪製損失曲線
     plt.figure(figsize=(10, 6))
@@ -684,6 +775,17 @@ def train_ddpm(diffusion: DDPMPerCell, train_loader: DataLoader, val_loader: Dat
     plt.legend()
     plt.grid(True)
     plt.savefig(os.path.join(save_dir, f'loss_curve_{i}_{j}.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # 繪製學習率曲線
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, len(lr_history) + 1), lr_history, label='Learning Rate')
+    plt.xlabel('Epoch')
+    plt.ylabel('Learning Rate')
+    plt.title(f' ({i}, {j}) Learning Rate Curve')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(os.path.join(save_dir, f'lr_curve_{i}_{j}.png'), dpi=300, bbox_inches='tight')
     plt.close()
     
     return diffusion
@@ -698,121 +800,89 @@ def truncate_colormap(cmap, minval: float = 0.0, maxval: float = 1.0, n: int = 2
     )
     return new_cmap
 
+
 @torch.no_grad()
-def evaluate_model_per_cell(models: dict, grid_data: GridData, test_dataset: Dataset, device: str = 'cuda', 
-                            max_samples: int = 100, save_dir: str = r"C:\thesis\code\result_ddpm_perCell\evaluate") -> dict:
+def evaluate_model_per_cell(models, grid_data, test_dataset, device='cuda', max_samples=50, 
+                            save_dir=r"C:\thesis\code\result_ddpm_perCell\evaluate"):
     """
-    評估模型在每個網格點的性能，計算 MSE、MAE、MAPE 和 SMAPE。
+    評估每個網格單元的模型性能，計算 MSE、MAE、MAPE、SMAPE 和 FID 指標。
     
     Args:
-        models (dict): 每個網格點的模型字典，鍵為 (i, j)，值為 DDPMPerCell 實例。
-        grid_data (GridData): 網格數據，包含均值和標準差。
+        models (dict): 每個網格單元的模型字典，鍵為 (i, j)。
+        grid_data (GridData): 網格數據對象，包含均值和標準差。
         test_dataset (Dataset): 測試數據集。
-        device (str): 設備（預設為 'cuda'）。
-        max_samples (int): 最大樣本數（預設為 100）。
-        save_dir (str): 結果儲存路徑。
+        device (str): 計算設備，預設為 'cuda'。
+        max_samples (int): 最大評估樣本數，預設為 50。
+        save_dir (str): 結果保存路徑。
     
     Returns:
-        dict: 包含 MSE、MAE、MAPE 和 SMAPE 的評估指標。
+        dict: 包含各項評估指標的字典。
     """
-    # 設定日誌基本配置
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-    
-    metrics = {'mse': 0.0, 'mae': 0.0, 'mape': 0.0, 'smape': 0.0}
-    N = min(len(test_dataset), max_samples)
-    print(len(test_dataset))
-    print(N)
-    sample_indices = random.sample(range(len(test_dataset)), N)
-    H, W = grid_data.H, grid_data.W
+    # 從 test_dataset 中提取 prediction_length
     prediction_length = test_dataset.dataset.prediction_length
-    mean_val = grid_data.mean_val.to(device)
-    std_val = grid_data.std_val.to(device)
-    
-    # 初始化累加器
-    generated_batch = torch.zeros(N, 1, prediction_length, H, W, device=device)
-    target_batch = torch.zeros(N, 1, prediction_length, H, W, device=device)
+
+    # 初始化指標
+    H, W = grid_data.H, grid_data.W
+    N = min(max_samples, len(test_dataset))
     mse_sum = torch.zeros(H, W, device=device)
     mae_sum = torch.zeros(H, W, device=device)
     mape_sum = torch.zeros(H, W, device=device)
     smape_sum = torch.zeros(H, W, device=device)
-    
-    os.makedirs(save_dir, exist_ok=True)
-    
-    for (i, j), model in models.items():
-        model.to(device)
-        model.eval()
+    generated_images = []
+    target_images = []
+    metrics = {}
 
-    for k, idx in enumerate(sample_indices):
-        logging.info(f"評估進度: {k+1}/{N} 樣本")
-        cond, target = test_dataset[idx]
-        cond = cond.to(device)
-        target = target.to(device)
+    # 單一迴圈處理所有樣本
+    for i in range(N):
+        logging.info(f"評估進度: {i+1}/{N} 樣本")
+        condition, target = test_dataset[i]
+        condition = condition.to(device)
+        target = target.to(device)  # 形狀：(T, H, W)
         predictions = torch.zeros(1, prediction_length, H, W, device=device)
-        
-        for i in range(H):
-            for j in range(W):
-                logging.info(f"正在處理單元 ({i}, {j})")
-                model = models[(i, j)]
-                x_pred = model.p_sample_loop(condition=cond, shape=(1, 1), prediction_length=prediction_length)
-                predictions[0, :, i, j] = x_pred[0, :]
-        
-        x_recon_original = predictions * std_val + mean_val
-        target_original = target * std_val + mean_val
+
+        # 生成每個網格單元的預測
+        for h in range(H):
+            for w in range(W):
+                logging.info(f"正在處理單元 ({h}, {w})")
+                model = models[(h, w)]
+                pred = model.p_sample_loop(condition, (condition.size(0),), prediction_length)
+                predictions[0, :, h, w] = pred[0, :]
+
+        # 轉換回原始尺度
+        x_recon_original = predictions * grid_data.std_val + grid_data.mean_val
+        target_original = target * grid_data.std_val + grid_data.mean_val
         target_original = target_original.view(1, prediction_length, H, W)
-        
+
         # 計算誤差並累加
         error = x_recon_original - target_original
         mse_grid = torch.mean(error ** 2, dim=(0, 1))  # 每個網格的 MSE
         mae_grid = torch.mean(torch.abs(error), dim=(0, 1))  # 每個網格的 MAE
         mape_grid = torch.mean(torch.abs(error / (target_original + 1)), dim=(0, 1)) * 100  # MAPE
         smape_grid = torch.mean(torch.abs(error) / (torch.abs(target_original) + torch.abs(x_recon_original) + 1), dim=(0, 1)) * 100  # SMAPE
-        
+
         mse_sum += mse_grid
         mae_sum += mae_grid
         mape_sum += mape_grid
         smape_sum += smape_grid
-        
-        generated_batch[k] = x_recon_original
-        target_batch[k] = target_original
-    
+
+        # 收集生成的圖像和目標圖像
+        generated_images.append(predictions)
+        target_images.append(target)
+
+    # 將列表轉換為張量
+    generated_images = torch.stack(generated_images)  # 形狀：(N, 1, T, H, W)
+    target_images = torch.stack(target_images)        # 形狀：(N, T, H, W)
+
     # 計算整體平均指標
     metrics['mse'] = torch.mean(mse_sum / N).item()
     metrics['mae'] = torch.mean(mae_sum / N).item()
     metrics['mape'] = torch.mean(mape_sum / N).item()
     metrics['smape'] = torch.mean(smape_sum / N).item()
-    
-    # 計算網格級誤差矩陣
-    mse_matrix = (mse_sum / N).cpu().numpy()
-    mae_matrix = (mae_sum / N).cpu().numpy()
-    mape_matrix = (mape_sum / N).cpu().numpy()
-    smape_matrix = (smape_sum / N).cpu().numpy()
-    
-    # 匯出表格
-    table_data = {
-        'Grid Index': [f'[{i},{j}]' for i in range(H) for j in range(W)],
-        'Longitude': [parse_lat_lon(col)[0] for col in grid_data.sorted_flow_columns],
-        'Latitude': [parse_lat_lon(col)[1] for col in grid_data.sorted_flow_columns],
-        'MSE': mse_matrix.flatten(),
-        'MAE': mae_matrix.flatten(),
-        'MAPE (%)': mape_matrix.flatten(),
-        'SMAPE (%)': smape_matrix.flatten()
-    }
-    df = pd.DataFrame(table_data)
-    df.to_csv(os.path.join(save_dir, 'mse_mae_mape_smape_per_coordinate.csv'), index=False)
-    df.to_excel(os.path.join(save_dir, 'mse_mae_mape_smape_per_coordinate.xlsx'), index=False)
-    
-    # 繪製網格誤差圖（散點圖）
-    plot_grid_with_error(grid_data.sorted_flow_columns, H, W, mse_matrix, mae_matrix, mape_matrix, save_dir, smape_matrix=smape_matrix)
-    
-    # 繪製所有樣本的平均圖（熱力圖）
-    visualize_predictions(None, generated_batch, target_batch, sample_idx=None, save_dir=save_dir,
-                          mse_matrix=mse_matrix, mae_matrix=mae_matrix, mape_matrix=mape_matrix, smape_matrix=smape_matrix)
-    
-    # 保存整體指標
-    with open(os.path.join(save_dir, 'metrics.json'), 'w') as f:
-        json.dump(metrics, f, indent=4)
-    
-    logging.info(f"重建 MSE: {metrics['mse']:.6f}, MAE: {metrics['mae']:.6f}, MAPE: {metrics['mape']:.6f}, SMAPE: {metrics['smape']:.6f}")
+
+    # 計算 FID（假設已有 calculate_fid_custom 函數）
+    fid_value = calculate_fid_custom(target_images, generated_images, device=device)
+    metrics['fid'] = fid_value
+
     return metrics
 
 ### 主程式
@@ -820,7 +890,7 @@ if __name__ == "__main__":
     # 定義超參數
     H, W = 21, 21
     condition_length, prediction_length = 8, 1
-    batch_size, epochs, lr, timesteps, patience = 150, 150, 0.0005, 1000, 5
+    batch_size, epochs, lr, timesteps, patience = 150, 150, 0.0015, 1500, 15
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     save_dir = r"C:\thesis\code\result_ddpm_perCell\model"
     torch.manual_seed(42)
@@ -859,20 +929,29 @@ if __name__ == "__main__":
             model = ScalarPredictor(time_emb_dim=TIME_EMB_DIM, base_channels=64)
             diffusion = DDPMPerCell(model=model, timesteps=timesteps, beta_start=1e-4, beta_end=0.02, device=device)
             best_model_path = os.path.join(save_dir, f'best_model_{i}_{j}.pth')
-            checkpoint_model_path = os.path.join(save_dir, f'checkpoint_{i}_{j}.pth')
-    
+        
             if os.path.exists(best_model_path):
-                diffusion.load_state_dict(torch.load(best_model_path))
-                logging.info(f"載入單元 ({i}, {j}) 的最佳模型: {best_model_path}")
-            elif os.path.exists(checkpoint_model_path):
-                checkpoint = torch.load(checkpoint_model_path)
-                diffusion.load_state_dict(checkpoint['model_state_dict'])
-                logging.warning(f"單元 ({i}, {j}) 的最佳模型不存在，載入檢查點模型: {checkpoint_model_path}")
+                checkpoint = torch.load(best_model_path)
+                if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                    diffusion.load_state_dict(checkpoint['model_state_dict'])
+                    logging.info(f"載入單元 ({i}, {j}) 的最佳模型: {best_model_path}")
+                else:
+                    diffusion.load_state_dict(checkpoint)
+                    logging.info(f"載入單元 ({i}, {j}) 的最佳模型（直接 state_dict 格式）: {best_model_path}")
             else:
-                raise FileNotFoundError(f"單元 ({i}, {j}) 的模型文件不存在，請先訓練模型")
-    
+                checkpoint_model_path = os.path.join(save_dir, f'checkpoint_{i}_{j}.pth')
+                if os.path.exists(checkpoint_model_path):
+                    checkpoint = torch.load(checkpoint_model_path)
+                    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                        diffusion.load_state_dict(checkpoint['model_state_dict'])
+                    else:
+                        diffusion.load_state_dict(checkpoint)
+                    logging.warning(f"單元 ({i}, {j}) 的最佳模型不存在，載入檢查點模型: {checkpoint_model_path}")
+                else:
+                    raise FileNotFoundError(f"單元 ({i}, {j}) 的模型文件不存在，請先訓練模型")
+        
             models[(i, j)] = diffusion
 
-    metrics = evaluate_model_per_cell(models, grid_data, test_dataset, device=device, max_samples=20)
+    metrics = evaluate_model_per_cell(models, grid_data, test_dataset, device=device, max_samples=20)# 最少要2
 
-    logging.info(f"重建 MSE: {metrics['mse']:.6f}, MAE: {metrics['mae']:.6f}, MAPE: {metrics['mape']:.6f}, SMAPE: {metrics['smape']:.6f}")
+    logging.info(f"重建 MSE: {metrics['mse']:.6f}, MAE: {metrics['mae']:.6f}, MAPE: {metrics['mape']:.6f}, SMAPE: {metrics['smape']:.6f}, FID: {metrics['fid']:.6f}")

@@ -14,6 +14,8 @@ from torch.utils.data import Dataset, DataLoader, Subset
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from typing import Optional
+import torch_fidelity
+from PIL import Image
 
 # -------------------------------
 # 設定 logging 等級，方便印出訓練與評估時的訊息
@@ -258,7 +260,7 @@ class UNet3D(nn.Module):
     3D U-Net 結構，包含下採樣（Encoder）、中間瓶頸層與上採樣（Decoder）。
     此模型同時接收噪聲版本的目標數據 x_t、完整序列 x_full 與時間嵌入。
     """
-    def __init__(self, in_channels=1, base_channels=64, time_emb_dim=128, dropout_rate=0.0):
+    def __init__(self, in_channels=1, base_channels=64, time_emb_dim=128, dropout_rate=0.2):
         super().__init__()
         # 編碼器部分：逐層進行雙卷積與下採樣
         self.enc1 = DoubleConv3D(in_channels, base_channels)
@@ -268,26 +270,34 @@ class UNet3D(nn.Module):
         self.enc3 = DoubleConv3D(base_channels * 2, base_channels * 4)
         self.pool3 = nn.MaxPool3d((2, 2, 2))
         self.enc4 = DoubleConv3D(base_channels * 4, base_channels * 8)
-        # 這裡使用不同的池化參數以調整深度與空間尺寸
         self.pool4 = nn.MaxPool3d(kernel_size=(2, 2, 2), stride=(1, 2, 2), padding=(1, 0, 0))
         # 瓶頸層
         self.bottleneck = DoubleConv3D(base_channels * 8, base_channels * 16)
         # 解碼器部分：逐層上採樣並與對應編碼層做 concat
         self.up4 = nn.ConvTranspose3d(base_channels * 16, base_channels * 8, kernel_size=(2, 2, 2), stride=(1, 2, 2), output_padding=(0, 1, 1))
         self.dec4 = DoubleConv3D(base_channels * 16, base_channels * 8)
+        self.bn4 = nn.BatchNorm3d(base_channels * 8)
         self.up3 = nn.ConvTranspose3d(base_channels * 8, base_channels * 4, kernel_size=(2, 2, 2), stride=(2, 2, 2), output_padding=(1, 0, 0))
         self.dec3 = DoubleConv3D(base_channels * 8, base_channels * 4)
+        self.bn3 = nn.BatchNorm3d(base_channels * 4)
         self.up2 = nn.ConvTranspose3d(base_channels * 4, base_channels * 2, kernel_size=(2, 2, 2), stride=(2, 2, 2))
         self.dec2 = DoubleConv3D(base_channels * 4, base_channels * 2)
+        self.bn2 = nn.BatchNorm3d(base_channels * 2)
         self.up1 = nn.ConvTranspose3d(base_channels * 2, base_channels, kernel_size=(2, 2, 2), stride=(2, 2, 2))
         self.dec1 = DoubleConv3D(base_channels * 2, base_channels)
+        self.bn1 = nn.BatchNorm3d(base_channels)
         # 輸出卷積，將通道數降為 1
         self.out_conv = nn.Conv3d(base_channels, 1, kernel_size=1)
+        self.out_bn = nn.BatchNorm3d(1)
         # dropout 用於防止過擬合
         self.dropout = nn.Dropout3d(dropout_rate)
         # 時間嵌入的線性轉換與激活
-        self.time_proj = nn.Sequential(nn.Linear(time_emb_dim, base_channels * 8), nn.SiLU())
-        # 將完整序列 x_full 通過 1x1 卷積調整通道數，使其與 x_t 保持一致（這裡假設保持 1 通道）
+        self.time_proj = nn.Sequential(
+            nn.Linear(time_emb_dim, base_channels * 8),
+            nn.SiLU(),
+            nn.BatchNorm3d(base_channels * 8)
+        )
+        # 將完整序列 x_full 通過 1x1 卷積調整通道數
         self.x_full_conv = nn.Conv3d(in_channels, in_channels, kernel_size=1)
 
     def forward(self, x_t, x_full, t_emb):
@@ -317,23 +327,28 @@ class UNet3D(nn.Module):
         # 解碼器：上採樣後與對應編碼層做 concat
         d4 = self.up4(b)
         if d4.shape[-3:] != e4.shape[-3:]:
-            # 使用 trilinear 插值調整尺寸
             d4 = F.interpolate(d4, size=e4.shape[-3:], mode='trilinear', align_corners=True)
         d4 = self.dec4(torch.cat([d4, e4], dim=1))
+        d4 = self.bn4(d4)
         d3 = self.up3(d4)
         if d3.shape[-3:] != e3.shape[-3:]:
             d3 = F.interpolate(d3, size=e3.shape[-3:], mode='trilinear', align_corners=True)
         d3 = self.dec3(torch.cat([d3, e3], dim=1))
+        d3 = self.bn3(d3)
         d2 = self.up2(d3)
         if d2.shape[-3:] != e2.shape[-3:]:
             d2 = F.interpolate(d2, size=e2.shape[-3:], mode='trilinear', align_corners=True)
         d2 = self.dec2(torch.cat([d2, e2], dim=1))
+        d2 = self.bn2(d2)
         d1 = self.up1(d2)
         if d1.shape[-3:] != e1.shape[-3:]:
             d1 = F.interpolate(d1, size=e1.shape[-3:], mode='trilinear', align_corners=True)
         d1 = self.dec1(torch.cat([d1, e1], dim=1))
-        # 經過輸出卷積獲得最終結果
+        d1 = self.bn1(d1)
+        # 經過輸出卷積獲得最終結果，並應用 BatchNorm
         out = self.out_conv(d1)
+        out = self.out_bn(out)
+        out = nn.ReLU(inplace=True)(out)
         # 返回結果，僅保留時間維度上的第一個步驟（1個預測步長）
         return out[:, :, :1, :, :]
 
@@ -639,7 +654,7 @@ def visualize_predictions(cond, generated, target, sample_idx: int = 0,
 
 def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int, 
                          mse_matrix: np.ndarray, mae_matrix: np.ndarray, mape_matrix: np.ndarray, 
-                         save_dir: str = r"C:\\thesis\\code\\result_ddpm"):
+                         save_dir: str = r"C:\\thesis\\code\\result_ddpm", smape_matrix: np.ndarray = None):
     """
     繪製網格圖，顯示每個網格點的誤差（MSE、MAE 和 MAPE），並將結果存成圖與表格。
     
@@ -651,6 +666,7 @@ def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int,
         mae_matrix (np.ndarray): 每個網格點的 MAE 矩陣，形狀為 (H, W)。
         mape_matrix (np.ndarray): 每個網格點的 MAPE 矩陣，形狀為 (H, W)。
         save_dir (str): 存檔路徑。
+        smape_matrix (np.ndarray, optional): 每個網格點的 SMAPE 矩陣，形狀為 (H, W)。預設為 None。
     """
     os.makedirs(save_dir, exist_ok=True)
     
@@ -660,7 +676,7 @@ def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int,
     orig_cmap = plt.get_cmap('OrRd')
     trunc_cmap = truncate_colormap(orig_cmap, 0.3, 1.0)
     
-    # 繪製 MSE 網格圖（不標示數字）
+    # 繪製 MSE 網格圖
     plt.figure(figsize=(12, 12))
     scatter = plt.scatter(longitudes, latitudes, c=mse_matrix.flatten(), cmap=trunc_cmap, marker='o')
     plt.colorbar(scatter, label='MSE')
@@ -671,12 +687,12 @@ def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int,
     plt.savefig(os.path.join(save_dir, 'plot_grid_with_error_mse.png'), dpi=600, bbox_inches='tight', pad_inches=0.1)
     plt.close()
 
-    # 繪製 MAE 網格圖（標示整數）
+    # 繪製 MAE 網格圖
     plt.figure(figsize=(12, 12))
     scatter = plt.scatter(longitudes, latitudes, c=mae_matrix.flatten(), cmap=trunc_cmap, marker='o')
     plt.colorbar(scatter, label='MAE')
     for i, (lon, lat) in enumerate(zip(longitudes, latitudes)):
-        plt.text(lon, lat, f'{int(round(mae_matrix.flatten()[i]))}', ha='center', va='center', color='black', fontsize=6)
+        plt.text(lon, lat, f'{int(round(mae_matrix.flatten()[i]))}', ha='center', va='center', color='black', fontsize=5)
     plt.xlabel("Longitude")
     plt.ylabel("Latitude")
     plt.title("Grid with MAE")
@@ -684,17 +700,37 @@ def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int,
     plt.savefig(os.path.join(save_dir, 'plot_grid_with_error_mae.png'), dpi=600, bbox_inches='tight', pad_inches=0.1)
     plt.close()
 
-    # 繪製 MAPE 網格圖（標示整數）
+    plt.figure(figsize=(12, 12))
+    scatter = plt.scatter(longitudes, latitudes, c=mae_matrix.flatten(), cmap=trunc_cmap, marker='o')
+    plt.colorbar(scatter, label='MAE')
+    plt.xlabel("Longitude")
+    plt.ylabel("Latitude")
+    plt.title("Grid with MAE")
+    plt.grid(True)
+    plt.savefig(os.path.join(save_dir, 'plot_grid_with_error_mae_clean.png'), dpi=600, bbox_inches='tight', pad_inches=0.1)
+    plt.close()
+
+    # 繪製 MAPE 網格圖
     plt.figure(figsize=(12, 12))
     scatter = plt.scatter(longitudes, latitudes, c=mape_matrix.flatten(), cmap=trunc_cmap, marker='o')
     plt.colorbar(scatter, label='MAPE (%)')
     for i, (lon, lat) in enumerate(zip(longitudes, latitudes)):
-        plt.text(lon, lat, f'{int(round(mape_matrix.flatten()[i]))}', ha='center', va='center', color='black', fontsize=6)
+        plt.text(lon, lat, f'{int(round(mape_matrix.flatten()[i]))}', ha='center', va='center', color='black', fontsize=7)
     plt.xlabel("Longitude")
     plt.ylabel("Latitude")
     plt.title("Grid with MAPE")
     plt.grid(True)
     plt.savefig(os.path.join(save_dir, 'plot_grid_with_error_mape.png'), dpi=600, bbox_inches='tight', pad_inches=0.1)
+    plt.close()
+
+    plt.figure(figsize=(12, 12))
+    scatter = plt.scatter(longitudes, latitudes, c=mape_matrix.flatten(), cmap=trunc_cmap, marker='o')
+    plt.colorbar(scatter, label='MAPE (%)')
+    plt.xlabel("Longitude")
+    plt.ylabel("Latitude")
+    plt.title("Grid with MAPE")
+    plt.grid(True)
+    plt.savefig(os.path.join(save_dir, 'plot_grid_with_error_mape_clean.png'), dpi=600, bbox_inches='tight', pad_inches=0.1)
     plt.close()
 
     # 繪製 SMAPE 網格圖（標示整數）
@@ -703,12 +739,22 @@ def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int,
         scatter = plt.scatter(longitudes, latitudes, c=smape_matrix.flatten(), cmap=trunc_cmap, marker='o')
         plt.colorbar(scatter, label='SMAPE (%)')
         for i, (lon, lat) in enumerate(zip(longitudes, latitudes)):
-            plt.text(lon, lat, f'{int(round(smape_matrix.flatten()[i]))}', ha='center', va='center', color='black', fontsize=6)
+            plt.text(lon, lat, f'{int(round(smape_matrix.flatten()[i]))}', ha='center', va='center', color='black', fontsize=7)
         plt.xlabel("Longitude")
         plt.ylabel("Latitude")
         plt.title("Grid with SMAPE")
         plt.grid(True)
         plt.savefig(os.path.join(save_dir, 'plot_grid_with_error_smape.png'), dpi=600, bbox_inches='tight', pad_inches=0.1)
+        plt.close()
+
+        plt.figure(figsize=(12, 12))
+        scatter = plt.scatter(longitudes, latitudes, c=smape_matrix.flatten(), cmap=trunc_cmap, marker='o')
+        plt.colorbar(scatter, label='SMAPE (%)')
+        plt.xlabel("Longitude")
+        plt.ylabel("Latitude")
+        plt.title("Grid with SMAPE")
+        plt.grid(True)
+        plt.savefig(os.path.join(save_dir, 'plot_grid_with_error_smape_clean.png'), dpi=600, bbox_inches='tight', pad_inches=0.1)
         plt.close()
 
     # 更新表格，新增 SMAPE
@@ -733,30 +779,63 @@ def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int,
 def train_ddpm(diffusion: DDPM3D, train_loader: DataLoader, val_loader: DataLoader, 
                epochs: int = 20, lr: float = 1e-4, device: str = 'cuda', 
                patience: int = 3, weight_decay: float = 1e-6, 
-               save_dir: str = r"C:\thesis\code\result_ddpm") -> DDPM3D:
+               save_dir: str = r"C:\thesis\code\result_ddpm",
+               checkpoint_interval: int = 5) -> DDPM3D:
     """
-    訓練 DDPM 模型，並進行驗證與早停檢查。
-    參數:
+    訓練 DDPM 模型，並進行驗證與早停檢查，加入動態學習率調整與學習率記錄。
+    
+    Args:
         diffusion: DDPM 模型實例
         train_loader, val_loader: 訓練與驗證的 DataLoader
         epochs: 最大訓練輪數
-        lr: 學習率
+        lr: 初始學習率
         device: 訓練設備，例如 'cuda' 或 'cpu'
         patience: 早停耐心次數
         weight_decay: 優化器的權重衰減
         save_dir: 模型與結果的存檔目錄
-    回傳:
+        checkpoint_interval: 檢查點保存間隔（每隔多少 epoch 保存一次檢查點）
+    
+    Returns:
         訓練後的 diffusion 模型
     """
     optimizer = optim.AdamW(diffusion.parameters(), lr=lr, weight_decay=weight_decay)
+    # 添加學習率調度器：當驗證損失不再下降時，將學習率乘以 0.5，最小學習率為 1e-6
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, min_lr=1e-6)
     diffusion.to(device)
     best_val_loss = float('inf')
     patience_counter = 0
     train_losses, val_losses = [], []
+    lr_history = []  # 用於記錄每個 epoch 的學習率
 
     os.makedirs(save_dir, exist_ok=True)
-    
-    for epoch in range(epochs):
+    checkpoint_path = os.path.join(save_dir, 'checkpoint.pth')
+
+    # 檢查並恢復檢查點
+    if os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path)
+        diffusion.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        # 檢查是否有 scheduler_state_dict，若無則重新初始化 scheduler
+        if 'scheduler_state_dict' in checkpoint:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            logging.info("恢復 scheduler 狀態")
+        else:
+            logging.warning("檢查點中未找到 'scheduler_state_dict'，使用默認 scheduler 設置")
+            if 'learning_rate' in checkpoint:
+                current_lr = checkpoint['learning_rate']
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = current_lr
+                logging.info(f"從檢查點恢復學習率: {current_lr:.8f}")
+        
+        start_epoch = checkpoint['epoch']
+        train_losses = checkpoint['train_losses']
+        val_losses = checkpoint['val_losses']
+        best_val_loss = min(val_losses) if val_losses else float('inf')
+        logging.info(f"恢復訓練，從 epoch {start_epoch} 開始")
+    else:
+        start_epoch = 0
+
+    for epoch in range(start_epoch, epochs):
         diffusion.train()
         total_train_loss = 0
         # 逐批訓練
@@ -787,18 +866,40 @@ def train_ddpm(diffusion: DDPM3D, train_loader: DataLoader, val_loader: DataLoad
         avg_val_loss = total_val_loss / len(val_loader)
         val_losses.append(avg_val_loss)
 
-        logging.info(f"Epoch [{epoch+1}/{epochs}] - Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+        # 更新學習率
+        scheduler.step(avg_val_loss)
+        current_lr = scheduler.get_last_lr()[0]  # 獲取當前學習率
+        lr_history.append(current_lr)  # 記錄學習率
 
-        # 若驗證損失降低則儲存模型，否則耐心計數增加
+        logging.info(f"Epoch [{epoch+1}/{epochs}] - Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, Learning Rate: {current_lr:.8f}")
+
+        # 若驗證損失降低則儲存最佳模型，否則耐心計數增加
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             patience_counter = 0
-            torch.save(diffusion.state_dict(), os.path.join(save_dir, 'best_model.pth'))
+            torch.save({
+                'model_state_dict': diffusion.state_dict(),
+                'learning_rate': current_lr,  # 記錄最佳模型的學習率
+            }, os.path.join(save_dir, 'best_model.pth'))
+            logging.info(f"保存最佳模型，驗證損失: {best_val_loss:.4f}, 學習率: {current_lr:.8f}")
         else:
             patience_counter += 1
             if patience_counter >= patience:
                 logging.info("Early stopping triggered.")
                 break
+
+        # 定期保存檢查點
+        if (epoch + 1) % checkpoint_interval == 0:
+            torch.save({
+                'model_state_dict': diffusion.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'epoch': epoch + 1,
+                'train_losses': train_losses,
+                'val_losses': val_losses,
+                'learning_rate': current_lr,
+            }, checkpoint_path)
+            logging.info(f"在 epoch {epoch + 1} 保存檢查點，學習率: {current_lr:.8f}")
 
     # 繪製訓練與驗證損失曲線，並存檔
     plt.figure(figsize=(10, 6))
@@ -812,14 +913,26 @@ def train_ddpm(diffusion: DDPM3D, train_loader: DataLoader, val_loader: DataLoad
     plt.savefig(os.path.join(save_dir, 'loss_curve.png'), dpi=300, bbox_inches='tight')
     plt.close()
 
+    # 繪製學習率曲線，並存檔
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, len(lr_history) + 1), lr_history, label='Learning Rate')
+    plt.xlabel('Epoch')
+    plt.ylabel('Learning Rate')
+    plt.title('Learning Rate Curve')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(os.path.join(save_dir, 'lr_curve.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+
     return diffusion
 
+@torch.no_grad()
 @torch.no_grad()
 def evaluate_model(diffusion: DDPM3D, dataset: Dataset, device: str = 'cuda', 
                    max_samples: int = 100, save_dir: str = r"C:\\thesis\\code\\result_ddpm",
                    sample_idx: int = 0) -> dict:
     """
-    評估模型，並生成視覺化圖表。
+    評估模型，並生成視覺化圖表，新增 FID 計算邏輯。
     
     Args:
         diffusion: 訓練好的 DDPM 模型
@@ -829,7 +942,7 @@ def evaluate_model(diffusion: DDPM3D, dataset: Dataset, device: str = 'cuda',
         save_dir: 結果存檔目錄
         sample_idx: 指定視覺化的樣本索引
     Returns:
-        包含 MSE、MAE 和 MAPE 的評估指標字典
+        包含 MSE、MAE、MAPE、SMAPE 和 FID 的評估指標字典
     """
     import torch
     import torch.nn.functional as F
@@ -840,9 +953,11 @@ def evaluate_model(diffusion: DDPM3D, dataset: Dataset, device: str = 'cuda',
     import pandas as pd
     import matplotlib.pyplot as plt
     from torch.utils.data import Subset
+    import torch_fidelity  # 確保導入 torch_fidelity
+    from PIL import Image  # 確保導入 PIL.Image
 
     diffusion.eval()
-    metrics = {'mse': 0.0, 'mae': 0.0, 'mape': 0.0, 'smape': 0.0}
+    metrics = {'mse': 0.0, 'mae': 0.0, 'mape': 0.0, 'smape': 0.0, 'fid': 0.0}  # 新增 FID 指標
     N = min(len(dataset), max_samples)
     sample_indices = random.sample(range(len(dataset)), N)
     
@@ -852,6 +967,10 @@ def evaluate_model(diffusion: DDPM3D, dataset: Dataset, device: str = 'cuda',
     
     mean_val = base_dataset.mean_val.to(device)
     std_val = base_dataset.std_val.to(device)
+    
+    # 初始化用於 FID 計算的圖像列表
+    generated_images = []
+    target_images = []
     
     generated_batch = torch.zeros(N, 1, pred_length, H, W, device=device)
     target_batch = torch.zeros(N, 1, pred_length, H, W, device=device)
@@ -867,6 +986,21 @@ def evaluate_model(diffusion: DDPM3D, dataset: Dataset, device: str = 'cuda',
         x_recon_original = x_recon * std_val + mean_val
         target_original = target * std_val + mean_val
         
+        # 將網格數據轉換為圖像並保存用於 FID 計算
+        for t in range(pred_length):
+            gen_img = x_recon_original[0, 0, t].cpu().numpy()  # (H, W)
+            tgt_img = target_original[0, 0, t].cpu().numpy()   # (H, W)
+            # 歸一化到 [0, 1] 並轉換為 [0, 255]
+            gen_img = (gen_img - gen_img.min()) / (gen_img.max() - gen_img.min() + 1e-5)
+            tgt_img = (tgt_img - tgt_img.min()) / (tgt_img.max() - tgt_img.min() + 1e-5)
+            gen_img = (gen_img * 255).astype(np.uint8)
+            tgt_img = (tgt_img * 255).astype(np.uint8)
+            # 轉換為 PIL 圖像
+            gen_pil = Image.fromarray(gen_img)
+            tgt_pil = Image.fromarray(tgt_img)
+            generated_images.append(gen_pil)
+            target_images.append(tgt_pil)
+        
         generated_batch[i] = x_recon_original
         target_batch[i] = target_original
         
@@ -874,7 +1008,6 @@ def evaluate_model(diffusion: DDPM3D, dataset: Dataset, device: str = 'cuda',
         mse = F.mse_loss(x_recon_original, target_original).item()
         mae = F.l1_loss(x_recon_original, target_original).item()
         mape = torch.mean(torch.abs((target_original - x_recon_original) / (target_original + 1e-10))) * 100
-        # 新增 SMAPE 計算
         smape = torch.mean(torch.abs(x_recon_original - target_original) / 
                           (torch.abs(target_original) + torch.abs(x_recon_original) + 1e-10)) * 100
         
@@ -889,6 +1022,10 @@ def evaluate_model(diffusion: DDPM3D, dataset: Dataset, device: str = 'cuda',
     metrics['mape'] /= N
     metrics['smape'] /= N
     
+    # 計算 FID
+    fid_value = torch_fidelity.calculate_fid(generated_images, target_images, device=device)
+    metrics['fid'] = fid_value
+    
     os.makedirs(save_dir, exist_ok=True)
     
     # 計算每個網格點的誤差矩陣
@@ -901,22 +1038,48 @@ def evaluate_model(diffusion: DDPM3D, dataset: Dataset, device: str = 'cuda',
     mape_matrix = torch.mean(torch.abs((target_batch - generated_batch) / (target_batch + 1e-10)), 
                             dim=(0, 2)).cpu().numpy()[0] * 100  # (H, W)
     
-    # 新增 SMAPE 矩陣計算
     smape_matrix = torch.mean(torch.abs(generated_batch - target_batch) / 
                              (torch.abs(target_batch) + torch.abs(generated_batch) + 1e-10), 
                              dim=(0, 2)).cpu().numpy()[0] * 100  # (H, W)
     
+    # 更新表格，新增 FID 列
+    table_data = {
+        'Grid Index': [f'[{i},{j}]' for i in range(H) for j in range(W)],
+        'Longitude': [parse_lat_lon(col)[0] for col in base_dataset.sorted_flow_columns],
+        'Latitude': [parse_lat_lon(col)[1] for col in base_dataset.sorted_flow_columns],
+        'MSE': mse_matrix.flatten(),
+        'MAE': mae_matrix.flatten(),
+        'MAPE (%)': mape_matrix.flatten(),
+        'SMAPE (%)': smape_matrix.flatten(),
+        'FID': [metrics['fid']] * (H * W)  # 新增 FID 列，所有網格單元共用同一個 FID 值
+    }
+    df = pd.DataFrame(table_data)
+    df.to_csv(os.path.join(save_dir, 'mse_mae_mape_smape_fid_per_coordinate.csv'), index=False)
+    df.to_excel(os.path.join(save_dir, 'mse_mae_mape_smape_fid_per_coordinate.xlsx'), index=False)
+    
     # 更新視覺化函數調用，傳入 smape_matrix
     plot_grid_with_error(base_dataset.sorted_flow_columns, H, W, mse_matrix, mae_matrix, mape_matrix, save_dir, smape_matrix)
-    visualize_predictions(generated_batch, generated_batch, target_batch, sample_idx, save_dir)  # 注意這裡應傳入 cond
+    visualize_predictions(None, generated_batch, target_batch, sample_idx, save_dir)
     
-    # 更新評估結果儲存，包含 SMAPE
+    # 更新評估結果儲存，包含 FID
     with open(os.path.join(save_dir, 'evaluation_metrics.txt'), 'w') as f:
         f.write(f"Evaluation Metrics (computed on {N} samples):\n")
         f.write(f"Reconstruction MSE: {metrics['mse']:.6f}\n")
         f.write(f"Reconstruction MAE: {metrics['mae']:.6f}\n")
         f.write(f"Reconstruction MAPE: {metrics['mape']:.6f}%\n")
         f.write(f"Reconstruction SMAPE: {metrics['smape']:.6f}%\n")
+        f.write(f"Reconstruction FID: {metrics['fid']:.6f}\n")
+    
+    with open(os.path.join(save_dir, 'evaluation_metrics.json'), 'w') as f:
+        json.dump({
+            "mse": metrics['mse'], 
+            "mae": metrics['mae'], 
+            "mape": metrics['mape'], 
+            "smape": metrics['smape'],
+            "fid": metrics['fid'],  # 新增 FID
+            "sample_size": N, 
+            "timestamp": pd.Timestamp.now().isoformat()
+        }, f, indent=4)
     
     return metrics
 
@@ -929,9 +1092,10 @@ if __name__ == "__main__":
     # -------------------------------
     H, W = 21, 21
     condition_length, prediction_length = 8, 1
-    batch_size, epochs, lr, timesteps, patience = 100, 1000, 0.0001, 1000, 10
+    batch_size, epochs, lr, timesteps, patience = 150, 150, 0.0015, 1500, 15
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     save_dir = r"C:\thesis\code\result_ddpm"
+    checkpoint_interval = 5  
 
     # 設定隨機種子，確保實驗結果可重現
     torch.manual_seed(42)
@@ -959,33 +1123,46 @@ if __name__ == "__main__":
     # 初始化模型
     # 使用 UNet3D 作為去噪模型，並建立 DDPM3D 實例
     # -------------------------------
-    unet = UNet3D(in_channels=1, base_channels=64, time_emb_dim=TIME_EMB_DIM, dropout_rate=0.0)
+    unet = UNet3D(in_channels=1, base_channels=64, time_emb_dim=TIME_EMB_DIM, dropout_rate=0.2)
     diffusion = DDPM3D(model=unet, timesteps=timesteps, beta_start=1e-4, beta_end=0.02, device=device)
 
     # -------------------------------
     # 訓練模型
     # -------------------------------
     trained_diffusion = train_ddpm(diffusion, train_loader, val_loader, epochs=epochs, 
-                                    lr=lr, device=device, patience=patience, save_dir=save_dir)
+                                   lr=lr, device=device, patience=patience, save_dir=save_dir,
+                                   checkpoint_interval=checkpoint_interval)
 
     # -------------------------------
     # 評估模型
     # -------------------------------
     metrics = evaluate_model(trained_diffusion, val_dataset, device=device, max_samples=20, save_dir=save_dir)
+    # 更新 logging.info，新增 FID 輸出
     logging.info(f"Reconstruction MSE: {metrics['mse']:.6f}, MAE: {metrics['mae']:.6f}, "
-                 f"MAPE: {metrics['mape']:.6f}, SMAPE: {metrics['smape']:.6f}")
+                 f"MAPE: {metrics['mape']:.6f}, SMAPE: {metrics['smape']:.6f}, "
+                 f"FID: {metrics['fid']:.6f}")
 
     # 儲存最終評估結果
     os.makedirs(save_dir, exist_ok=True)
     with open(os.path.join(save_dir, 'evaluation_metrics.txt'), 'w') as f:
-        f.write(f"Evaluation Metrics (computed on 100 samples):\n")
+        # 修正樣本數，使用實際的 max_samples 值
+        f.write(f"Evaluation Metrics (computed on {20} samples):\n")
         f.write(f"Date: {pd.Timestamp.now()}\n")
         f.write(f"Reconstruction MSE: {metrics['mse']:.6f}\n")
         f.write(f"Reconstruction MAE: {metrics['mae']:.6f}\n")
         f.write(f"Reconstruction MAPE: {metrics['mape']:.6f}%\n")
         f.write(f"Reconstruction SMAPE: {metrics['smape']:.6f}%\n")
+        # 新增 FID 記錄
+        f.write(f"Reconstruction FID: {metrics['fid']:.6f}\n")
+
     with open(os.path.join(save_dir, 'evaluation_metrics.json'), 'w') as f:
+        # 更新 JSON 檔案，新增 FID
         json.dump({
-            "mse": metrics['mse'], "mae": metrics['mae'], "mape": metrics['mape'], "smape": metrics['smape'],
-            "sample_size": 20, "timestamp": pd.Timestamp.now().isoformat()
+            "mse": metrics['mse'], 
+            "mae": metrics['mae'], 
+            "mape": metrics['mape'], 
+            "smape": metrics['smape'],
+            "fid": metrics['fid'],  # 新增 FID
+            "sample_size": 20, 
+            "timestamp": pd.Timestamp.now().isoformat()
         }, f, indent=4)

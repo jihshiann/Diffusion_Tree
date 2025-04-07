@@ -18,6 +18,11 @@ from torch.optim import lr_scheduler
 import torch_fidelity
 from PIL import Image
 import scipy.linalg
+from torchvision import transforms
+from torchvision.models import inception_v3, Inception_V3_Weights
+from PIL import Image
+import scipy.linalg
+import matplotlib.colors as mcolors
 
 # 設定 logging 等級為 INFO，方便查看訓練過程
 logging.basicConfig(level=logging.INFO)
@@ -610,39 +615,28 @@ def truncate_colormap(cmap, minval: float = 0.0, maxval: float = 1.0, n: int = 2
     return new_cmap
 
 
-def calculate_fid_custom(real_data, generated_data, device='cuda'):
+def compute_rgb_mean_std(dataset, sample_count=100):
     """
-    計算 FID，分別針對真實數據和生成數據。
-    
-    Args:
-        real_data (torch.Tensor): 真實數據，形狀為 (N, T, H, W)，例如 (50, 24, 21, 21)
-        generated_data (torch.Tensor): 生成數據，形狀相同
-        device (str): 計算設備
-    
-    Returns:
-        float: FID 值
+    遍歷部分資料集（目標網格轉換後的 RGB 熱力圖），計算所有圖像每個通道的平均值與標準差。
     """
-    # 展平數據以提取特徵，假設使用簡單的統計特徵
-    real_data = real_data.to(device).view(real_data.size(0), -1)  # (N, T*H*W)
-    generated_data = generated_data.to(device).view(generated_data.size(0), -1)
-
-    # 轉為 numpy 進行計算
-    real_data_np = real_data.cpu().numpy()
-    generated_data_np = generated_data.cpu().numpy()
-
-    # 計算均值和協方差
-    mu_real = np.mean(real_data_np, axis=0)
-    sigma_real = np.cov(real_data_np, rowvar=False)
-    mu_gen = np.mean(generated_data_np, axis=0)
-    sigma_gen = np.cov(generated_data_np, rowvar=False)
-
-    # 計算 Fréchet 距離
-    diff = mu_real - mu_gen
-    covmean = scipy.linalg.sqrtm(sigma_real.dot(sigma_gen), disp=False)[0]  # 使用 scipy.linalg.sqrtm
-    if np.iscomplexobj(covmean):
-        covmean = covmean.real
-    fid = np.sum(diff**2) + np.trace(sigma_real + sigma_gen - 2 * covmean)
-    return fid
+    all_pixels = []
+    total_samples = min(len(dataset), sample_count)
+    
+    for idx in range(total_samples):
+        _, target = dataset[idx]  # target: (1, prediction_length, H, W) 或 (1, H, W)
+        grid = target.squeeze().cpu().numpy()  # 移除單一通道維度
+        if len(grid.shape) == 3:  # (prediction_length, H, W)
+            grid = grid[0]  # 若有多時間步，僅取第一個
+        vmin, vmax = grid.min(), grid.max()
+        norm_grid = (grid - vmin) / (vmax - vmin + 1e-8)
+        rgb = (plt.cm.viridis(norm_grid)[..., :3] * 255).astype(np.uint8)
+        rgb_normalized = rgb.astype(np.float32) / 255.0
+        all_pixels.append(rgb_normalized.reshape(-1, 3))
+    
+    all_pixels = np.concatenate(all_pixels, axis=0)
+    mean = np.mean(all_pixels, axis=0)
+    std = np.std(all_pixels, axis=0)
+    return mean.tolist(), std.tolist()
 
 # ### 訓練與評估函數
 def train_ddpm(diffusion: DDPMPerCell, train_loader: DataLoader, val_loader: DataLoader, i: int, j: int,
@@ -802,87 +796,210 @@ def truncate_colormap(cmap, minval: float = 0.0, maxval: float = 1.0, n: int = 2
 
 
 @torch.no_grad()
-def evaluate_model_per_cell(models, grid_data, test_dataset, device='cuda', max_samples=50, 
-                            save_dir=r"C:\thesis\code\result_ddpm_perCell\evaluate"):
+def evaluate_model_per_cell(models, grid_data, dataset, device='cuda', max_samples=100, 
+                            save_dir=r"C:\\thesis\\code\\result_ddpm_perCell\\evaluate"):
     """
-    評估每個網格單元的模型性能，計算 MSE、MAE、MAPE、SMAPE 和 FID 指標。
-    
+    評估每個網格單元的模型，生成完整網格預測，並使用熱力圖計算 FID，與 DDPM_3DUNet 一致。
+
     Args:
-        models (dict): 每個網格單元的模型字典，鍵為 (i, j)。
-        grid_data (GridData): 網格數據對象，包含均值和標準差。
-        test_dataset (Dataset): 測試數據集。
-        device (str): 計算設備，預設為 'cuda'。
-        max_samples (int): 最大評估樣本數，預設為 50。
-        save_dir (str): 結果保存路徑。
-    
+        models (dict): 每個網格單元的 DDPM 模型字典，鍵為 (i, j)。
+        grid_data (GridData): 包含網格數據和正規化參數的對象。
+        dataset (Dataset): 用於評估的數據集，可以是 PeopleFlowDatasetForEval 或其 Subset。
+        device (str): 計算設備，默認為 'cuda'。
+        max_samples (int): 最大評估樣本數。
+        save_dir (str): 結果保存目錄。
+
     Returns:
-        dict: 包含各項評估指標的字典。
+        dict: 包含 MSE、MAE、MAPE、SMAPE 和 FID 的評估指標。
     """
-    # 從 test_dataset 中提取 prediction_length
-    prediction_length = test_dataset.dataset.prediction_length
-
-    # 初始化指標
-    H, W = grid_data.H, grid_data.W
-    N = min(max_samples, len(test_dataset))
-    mse_sum = torch.zeros(H, W, device=device)
-    mae_sum = torch.zeros(H, W, device=device)
-    mape_sum = torch.zeros(H, W, device=device)
-    smape_sum = torch.zeros(H, W, device=device)
-    generated_images = []
-    target_images = []
-    metrics = {}
-
-    # 單一迴圈處理所有樣本
-    for i in range(N):
-        logging.info(f"評估進度: {i+1}/{N} 樣本")
-        condition, target = test_dataset[i]
-        condition = condition.to(device)
-        target = target.to(device)  # 形狀：(T, H, W)
-        predictions = torch.zeros(1, prediction_length, H, W, device=device)
-
-        # 生成每個網格單元的預測
-        for h in range(H):
-            for w in range(W):
-                logging.info(f"正在處理單元 ({h}, {w})")
-                model = models[(h, w)]
-                pred = model.p_sample_loop(condition, (condition.size(0),), prediction_length)
-                predictions[0, :, h, w] = pred[0, :]
-
-        # 轉換回原始尺度
-        x_recon_original = predictions * grid_data.std_val + grid_data.mean_val
-        target_original = target * grid_data.std_val + grid_data.mean_val
-        target_original = target_original.view(1, prediction_length, H, W)
-
-        # 計算誤差並累加
-        error = x_recon_original - target_original
-        mse_grid = torch.mean(error ** 2, dim=(0, 1))  # 每個網格的 MSE
-        mae_grid = torch.mean(torch.abs(error), dim=(0, 1))  # 每個網格的 MAE
-        mape_grid = torch.mean(torch.abs(error / (target_original + 1)), dim=(0, 1)) * 100  # MAPE
-        smape_grid = torch.mean(torch.abs(error) / (torch.abs(target_original) + torch.abs(x_recon_original) + 1), dim=(0, 1)) * 100  # SMAPE
-
-        mse_sum += mse_grid
-        mae_sum += mae_grid
-        mape_sum += mape_grid
-        smape_sum += smape_grid
-
-        # 收集生成的圖像和目標圖像
-        generated_images.append(predictions)
-        target_images.append(target)
-
-    # 將列表轉換為張量
-    generated_images = torch.stack(generated_images)  # 形狀：(N, 1, T, H, W)
-    target_images = torch.stack(target_images)        # 形狀：(N, T, H, W)
-
-    # 計算整體平均指標
-    metrics['mse'] = torch.mean(mse_sum / N).item()
-    metrics['mae'] = torch.mean(mae_sum / N).item()
-    metrics['mape'] = torch.mean(mape_sum / N).item()
-    metrics['smape'] = torch.mean(smape_sum / N).item()
-
-    # 計算 FID（假設已有 calculate_fid_custom 函數）
-    fid_value = calculate_fid_custom(target_images, generated_images, device=device)
-    metrics['fid'] = fid_value
-
+    os.makedirs(save_dir, exist_ok=True)
+    H, W = grid_data.H, grid_data.W  # 21, 21
+    
+    # 獲取 prediction_length
+    if isinstance(dataset, torch.utils.data.Subset):
+        base_dataset = dataset.dataset
+        if not hasattr(base_dataset, 'prediction_length'):
+            raise AttributeError("底層數據集缺少 'prediction_length' 屬性，請檢查數據集定義")
+        prediction_length = base_dataset.prediction_length
+    else:
+        if not hasattr(dataset, 'prediction_length'):
+            raise AttributeError("數據集缺少 'prediction_length' 屬性，請檢查數據集定義")
+        prediction_length = dataset.prediction_length
+    
+    N = min(len(dataset), max_samples)
+    sample_indices = random.sample(range(len(dataset)), N)
+    
+    # 初始化存儲完整網格的張量
+    generated_batch = torch.zeros(N, prediction_length, H, W, device=device)
+    target_batch = torch.zeros(N, prediction_length, H, W, device=device)
+    
+    metrics = {'mse': 0.0, 'mae': 0.0, 'mape': 0.0, 'smape': 0.0, 'fid': 0.0}
+    
+    # 對每個樣本進行預測
+    for sample_idx, idx in enumerate(sample_indices):
+        condition, target = dataset[idx]
+        condition, target = condition.to(device), target.to(device)  # 確保輸入在 device 上
+        
+        # 為每個網格單元生成預測
+        for i in range(H):
+            for j in range(W):
+                model = models[(i, j)]
+                model.eval()
+                pred = model.p_sample_loop(condition, shape=(1,), prediction_length=prediction_length)
+                generated_batch[sample_idx, :, i, j] = pred.squeeze(0).to(device)  # 確保 pred 在 device 上
+        
+        # 儲存目標值
+        target_batch[sample_idx] = target
+        
+        # 還原正規化數據以計算指標
+        mean_val = grid_data.mean_val.to(device)
+        std_val = grid_data.std_val.to(device)
+        gen_original = generated_batch[sample_idx] * std_val + mean_val
+        tgt_original = target_batch[sample_idx] * std_val + mean_val
+        
+        # 計算指標
+        mse = F.mse_loss(gen_original, tgt_original).item()
+        mae = F.l1_loss(gen_original, tgt_original).item()
+        mape = torch.mean(torch.abs((tgt_original - gen_original) / (tgt_original + 1e-10))) * 100
+        smape = torch.mean(torch.abs(gen_original - tgt_original) / 
+                          (torch.abs(tgt_original) + torch.abs(gen_original) + 1e-10)) * 100
+        
+        metrics['mse'] += mse
+        metrics['mae'] += mae
+        metrics['mape'] += mape.item()
+        metrics['smape'] += smape.item()
+        
+        logging.info(f"評估進度: {sample_idx + 1}/{N} 樣本")
+    
+    # 平均指標
+    metrics['mse'] /= N
+    metrics['mae'] /= N
+    metrics['mape'] /= N
+    metrics['smape'] /= N
+    
+    # 計算熱力圖的 RGB 均值和標準差
+    new_mean, new_std = compute_rgb_mean_std(dataset, sample_count=min(N, 100))
+    logging.info(f"熱力圖 RGB 均值: {new_mean}, 標準差: {new_std}")
+    
+    # 使用自訂均值和標準差更新 InceptionV3 轉換
+    inception_transform = transforms.Compose([
+        transforms.Resize((299, 299)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=new_mean, std=new_std)
+    ])
+    
+    # 生成熱力圖並計算 FID
+    pred_images = []
+    real_images = []
+    for sample_idx in range(N):
+        for t in range(prediction_length):
+            pred_arr = generated_batch[sample_idx, t].cpu().numpy()
+            real_arr = target_batch[sample_idx, t].cpu().numpy()
+            
+            # 正規化到 [0, 1] 範圍以生成熱力圖
+            p_min, p_max = pred_arr.min(), pred_arr.max()
+            r_min, r_max = real_arr.min(), real_arr.max()
+            pred_norm = (pred_arr - p_min) / (p_max - p_min + 1e-8) if p_max > p_min else np.zeros_like(pred_arr)
+            real_norm = (real_arr - r_min) / (r_max - r_min + 1e-8) if r_max > r_min else np.zeros_like(real_arr)
+            
+            # 使用 viridis 色圖轉換為 RGB
+            pred_rgb = (plt.cm.viridis(pred_norm)[..., :3] * 255).astype(np.uint8)
+            real_rgb = (plt.cm.viridis(real_norm)[..., :3] * 255).astype(np.uint8)
+            
+            # 保存熱力圖
+            filename_pred = f"sample{sample_idx}_t{t}_pred_heatmap.png" if prediction_length > 1 else f"sample{sample_idx}_pred_heatmap.png"
+            filename_real = f"sample{sample_idx}_t{t}_real_heatmap.png" if prediction_length > 1 else f"sample{sample_idx}_real_heatmap.png"
+            Image.fromarray(pred_rgb).save(os.path.join(save_dir, filename_pred))
+            Image.fromarray(real_rgb).save(os.path.join(save_dir, filename_real))
+            
+            pred_images.append(Image.fromarray(pred_rgb))
+            real_images.append(Image.fromarray(real_rgb))
+    
+    # 檢查樣本數是否足夠計算 FID
+    if len(pred_images) < 2 or len(real_images) < 2:
+        raise ValueError("樣本數不足以計算 FID，至少需要 2 個樣本")
+    
+    # 使用 InceptionV3 提取特徵
+    inception_model = inception_v3(weights=Inception_V3_Weights.IMAGENET1K_V1, aux_logits=True)
+    inception_model.fc = torch.nn.Identity()  # 移除分類層
+    inception_model.AuxLogits = None  # 移除輔助分支
+    inception_model.to(device)
+    inception_model.eval()
+    
+    pred_tensors = [inception_transform(img).to(device) for img in pred_images]
+    real_tensors = [inception_transform(img).to(device) for img in real_images]
+    pred_tensor_batch = torch.stack(pred_tensors)
+    real_tensor_batch = torch.stack(real_tensors)
+    
+    # 提取特徵
+    with torch.no_grad():
+        pred_features = inception_model(pred_tensor_batch)
+        real_features = inception_model(real_tensor_batch)
+    
+    pred_features_np = pred_features.cpu().numpy()
+    real_features_np = real_features.cpu().numpy()
+    
+    # 計算 FID
+    mu_pred = np.mean(pred_features_np, axis=0)
+    mu_real = np.mean(real_features_np, axis=0)
+    sigma_pred = np.cov(pred_features_np, rowvar=False)
+    sigma_real = np.cov(real_features_np, rowvar=False)
+    covmean = scipy.linalg.sqrtm(sigma_pred.dot(sigma_real), disp=False)[0]
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+    fid = np.sum((mu_pred - mu_real)**2) + np.trace(sigma_pred + sigma_real - 2 * covmean)
+    metrics['fid'] = fid
+    
+    # 計算每個網格點的誤差矩陣
+    error_matrix_mse = (generated_batch - target_batch) ** 2
+    mse_matrix = torch.mean(error_matrix_mse, dim=(0, 1)).cpu().numpy()  # (H, W)
+    error_matrix_mae = torch.abs(generated_batch - target_batch)
+    mae_matrix = torch.mean(error_matrix_mae, dim=(0, 1)).cpu().numpy()  # (H, W)
+    mape_matrix = torch.mean(torch.abs((target_batch - generated_batch) / (target_batch + 1e-10)), 
+                            dim=(0, 1)).cpu().numpy() * 100  # (H, W)
+    smape_matrix = torch.mean(torch.abs(generated_batch - target_batch) / 
+                             (torch.abs(target_batch) + torch.abs(generated_batch) + 1e-10), 
+                             dim=(0, 1)).cpu().numpy() * 100  # (H, W)
+    
+    # 保存誤差表格
+    table_data = {
+        '網格索引': [f'[{i},{j}]' for i in range(H) for j in range(W)],
+        '經度': [parse_lat_lon(col)[0] for col in grid_data.sorted_flow_columns],
+        '緯度': [parse_lat_lon(col)[1] for col in grid_data.sorted_flow_columns],
+        'MSE': mse_matrix.flatten(),
+        'MAE': mae_matrix.flatten(),
+        'MAPE (%)': mape_matrix.flatten(),
+        'SMAPE (%)': smape_matrix.flatten(),
+        'FID': [metrics['fid']] * (H * W)  # FID 為全局指標
+    }
+    df = pd.DataFrame(table_data)
+    df.to_csv(os.path.join(save_dir, 'mse_mae_mape_smape_fid_per_coordinate.csv'), index=False)
+    df.to_excel(os.path.join(save_dir, 'mse_mae_mape_smape_fid_per_coordinate.xlsx'), index=False)
+    
+    # 繪製網格誤差圖
+    plot_grid_with_error(grid_data.sorted_flow_columns, H, W, mse_matrix, mae_matrix, mape_matrix, save_dir, smape_matrix)
+    
+    # 保存評估指標
+    with open(os.path.join(save_dir, 'evaluation_metrics.txt'), 'w') as f:
+        f.write(f"評估指標（基於 {N} 個樣本計算）:\n")
+        f.write(f"日期: {pd.Timestamp.now()}\n")
+        f.write(f"重建 MSE: {metrics['mse']:.6f}\n")
+        f.write(f"重建 MAE: {metrics['mae']:.6f}\n")
+        f.write(f"重建 MAPE: {metrics['mape']:.6f}%\n")
+        f.write(f"重建 SMAPE: {metrics['smape']:.6f}%\n")
+        f.write(f"重建 FID: {metrics['fid']:.6f}\n")
+    
+    with open(os.path.join(save_dir, 'evaluation_metrics.json'), 'w') as f:
+        json.dump({
+            "mse": metrics['mse'],
+            "mae": metrics['mae'],
+            "mape": metrics['mape'],
+            "smape": metrics['smape'],
+            "fid": metrics['fid'],
+            "樣本數": N,
+            "時間戳": pd.Timestamp.now().isoformat()
+        }, f, indent=4)
+    
     return metrics
 
 ### 主程式
@@ -952,6 +1069,6 @@ if __name__ == "__main__":
         
             models[(i, j)] = diffusion
 
-    metrics = evaluate_model_per_cell(models, grid_data, test_dataset, device=device, max_samples=20)# 最少要2
+    metrics = evaluate_model_per_cell(models, grid_data, test_dataset, device=device, max_samples=2)
 
     logging.info(f"重建 MSE: {metrics['mse']:.6f}, MAE: {metrics['mae']:.6f}, MAPE: {metrics['mape']:.6f}, SMAPE: {metrics['smape']:.6f}, FID: {metrics['fid']:.6f}")

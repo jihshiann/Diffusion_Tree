@@ -6,23 +6,17 @@ import logging
 import random
 import numpy as np
 import pandas as pd
+import scipy.linalg
+from PIL import Image
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, Subset
-import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
+from torchvision import transforms, models
 from typing import Optional
-from torch.optim import lr_scheduler
-import torch_fidelity
-from PIL import Image
-import scipy.linalg
-from torchvision import transforms
-from torchvision.models import inception_v3, Inception_V3_Weights
-from PIL import Image
-import scipy.linalg
-import matplotlib.colors as mcolors
 
 # 設定 logging 等級為 INFO，方便查看訓練過程
 logging.basicConfig(level=logging.INFO)

@@ -21,17 +21,19 @@ from torchvision.models import inception_v3, Inception_V3_Weights
 
 logging.basicConfig(level=logging.INFO)
 TIME_EMB_DIM = 128
+
 def parse_lat_lon(column_name: str) -> tuple[float, float]:
     match = re.search(r'\(([\d.-]+),\s*([\d.-]+)\)', column_name)
     if match:
         return float(match.group(1)), float(match.group(2))
     raise ValueError(f"欄位名稱格式無效：{column_name}")
+
 class PeopleFlowDatasetCondition(Dataset):
     def __init__(self, csv_path: str, H: int, W: int, condition_length: int, 
                  prediction_length: int, transform: Optional[callable] = None, 
                  normalize: bool = True, debug: bool = False):
-        """初始化網格數據集，優化座標分配並減少邊緣失真。
-
+        """
+        初始化網格數據集，同時讀取非流量（額外條件）數據，並處理風向等特徵。
         Args:
             csv_path (str): CSV 文件路徑
             H (int): 網格高度
@@ -44,7 +46,10 @@ class PeopleFlowDatasetCondition(Dataset):
         """
         if not os.path.exists(csv_path):
             raise FileNotFoundError(f"CSV 檔案未找到：{csv_path}")
+        # 讀取 CSV 並刪除第一個欄位 (時間)
         self.df = pd.read_csv(csv_path)
+        self.df = self.df.iloc[:, 1:]
+        
         self.transform = transform
         self.condition_length = condition_length
         self.prediction_length = prediction_length
@@ -52,7 +57,8 @@ class PeopleFlowDatasetCondition(Dataset):
         self.normalize = normalize
         self.H, self.W = H, W
 
-        # 提取包含經緯度的欄位
+        # ---------------------------
+        # 1. 針對流量資料：選取欄位含有括號(經緯度) 的欄位
         flow_columns = [c for c in self.df.columns if '(' in c and ')' in c]
         column_info = [(col, *parse_lat_lon(col)) for col in flow_columns]
         coords = np.array([(lon, lat) for _, lon, lat in column_info])
@@ -74,7 +80,7 @@ class PeopleFlowDatasetCondition(Dataset):
         lon_step = np.median(lon_diffs[lon_diffs > 0]) if len(lon_diffs) > 0 else 0.005
         lat_step = np.median(lat_diffs[lat_diffs > 0]) if len(lat_diffs) > 0 else 0.005
 
-        # 準備可用索引和網格位置（曼哈頓距離層級）
+        # 建立可用索引與網格位置（以曼哈頓距離層級）
         available_indices = list(range(len(coords)))
         available_indices.remove(central_idx)
         grid_positions = []
@@ -104,32 +110,26 @@ class PeopleFlowDatasetCondition(Dataset):
             elif r > central_row:
                 lat_constraint = lambda x: x < central_coord[1]
 
-            # 篩選符合約束的索引
             filtered_indices = [idx for idx in available_indices if
                                 (lon_constraint is None or lon_constraint(coords[idx][0])) and
                                 (lat_constraint is None or lat_constraint(coords[idx][1]))]
 
             if filtered_indices:
-                # 若有符合條件的座標，選取距離目標最近的
                 distances = np.sqrt((coords[filtered_indices, 0] - target_lon)**2 +
                                     (coords[filtered_indices, 1] - target_lat)**2)
                 closest_idx = filtered_indices[np.argmin(distances)]
             else:
-                # 考慮相鄰已分配座標的連續性
                 neighbors = [(r-1, c), (r+1, c), (r, c-1), (r, c+1)]
                 neighbor_coords = []
                 for nr, nc in neighbors:
                     if 0 <= nr < H and 0 <= nc < W and grid[nr, nc] != -1:
                         neighbor_coords.append(coords[grid[nr, nc]])
-
                 if neighbor_coords:
-                    # 使用相鄰座標的平均位置
                     neighbor_mean = np.mean(neighbor_coords, axis=0)
                     distances = np.sqrt((coords[available_indices, 0] - neighbor_mean[0])**2 +
                                         (coords[available_indices, 1] - neighbor_mean[1])**2)
                     closest_idx = available_indices[np.argmin(distances)]
                 else:
-                    # 無相鄰座標時，回退到距離目標位置最近的座標
                     distances = np.sqrt((coords[available_indices, 0] - target_lon)**2 +
                                         (coords[available_indices, 1] - target_lat)**2)
                     closest_idx = available_indices[np.argmin(distances)]
@@ -137,15 +137,14 @@ class PeopleFlowDatasetCondition(Dataset):
             grid[r, c] = closest_idx
             available_indices.remove(closest_idx)
 
-        # 檢查網格是否填滿
         if len(grid[grid != -1]) != H * W:
             raise ValueError(f"網格未填滿：選取 {len(grid[grid != -1])} 個，需 {H * W} 個")
 
-        # 處理後續數據
         sorted_indices = grid.flatten()
         self.sorted_flow_columns = [column_info[idx][0] for idx in sorted_indices]
         self._plot_grid(save_path=r"C:\thesis\code\result_ddpm_condition\plot_grid.png") 
         self._plot_grid_matrix(save_path=r"C:\thesis\code\result_ddpm_condition\plot_grid_matrix.png") 
+
         flow_values = self.df[self.sorted_flow_columns].values.reshape(-1, H, W).astype(np.float32)
         self.data = torch.from_numpy(flow_values)
 
@@ -154,11 +153,46 @@ class PeopleFlowDatasetCondition(Dataset):
             self.std_val = self.data.std() + 1e-5
             self.data = (self.data - self.mean_val) / self.std_val
 
+        # ---------------------------
+        # 2. 處理額外條件欄位 (非 flow 部分)
+        # 先對特定欄位做轉換：
+        # 對於 '最大陣風風向' 與 '風向'，計算 sin 與 cos 後刪除原始欄位
+        for col in ['最大陣風風向', '風向']:
+            if col in self.df.columns:
+                self.df[f'sin_{col}'] = np.sin(np.deg2rad(self.df[col]))
+                self.df[f'cos_{col}'] = np.cos(np.deg2rad(self.df[col]))
+                self.df.drop(columns=[col], inplace=True)
+        extra_cols_list = [
+            "測站氣壓", "海平面氣壓", "氣溫", "露點溫度", "相對溼度", "風速", "最大陣風",
+            "降水量", "降水時數", "日照時數", "全天空日射量", "能見度", "紫外線指數", "總雲量",
+            "holiday", "weekday", "年", "月", "日", "時",
+            "sin_風向", "cos_風向", "sin_最大陣風風向", "cos_最大陣風風向"
+        ]
+        self.extra_columns = extra_cols_list
+        self.extra_data = self.df[self.extra_columns].values.astype(np.float32)
+
+        self.max_index = self.data.shape[0] - self.total_length + 1
+        # 從 dataframe 中取出這些欄位
+        df_extra = self.df[extra_cols_list].copy()
+        # 定義 categorical 欄位
+        cat_features = ['holiday', '月']
+        # 進行 one-hot 編碼，會生成類似 "holiday_0", "holiday_1", "月_1", ..., "月_12" 的欄位
+        df_cat = pd.get_dummies(df_extra[cat_features], prefix=cat_features)
+        # 連續特徵部分：把 categorical 欄位先剔除
+        df_cont = df_extra.drop(columns=cat_features)
+        # 對連續特徵若啟用 normalize 則做正規化
+        if self.normalize:
+            cont_mean = df_cont.mean()
+            cont_std = df_cont.std() + 1e-5
+            df_cont = (df_cont - cont_mean) / cont_std
+        # 將正規化後的連續特徵和 one-hot 的 categorical 特徵合併
+        df_extra_processed = pd.concat([df_cont, df_cat], axis=1)
+        self.extra_columns = list(df_extra_processed.columns)
+        self.extra_data = df_extra_processed.values.astype(np.float32)
+
         self.max_index = self.data.shape[0] - self.total_length + 1
     def _plot_grid(self, save_path: str):
         directory = os.path.dirname(save_path)
-    
-        # 檢查目錄是否存在，若不存在則創建
         if not os.path.exists(directory):
             os.makedirs(directory)
         locations = [parse_lat_lon(col) for col in self.sorted_flow_columns]
@@ -178,13 +212,10 @@ class PeopleFlowDatasetCondition(Dataset):
         plt.close()
 
     def _plot_grid_matrix(self, save_path: str):
-        """繪製 21x21 矩陣圖，每個格子顯示對應的經緯度，分行顯示以避免重疊。"""
         directory = os.path.dirname(save_path)
         if not os.path.exists(directory):
             os.makedirs(directory)
-
-        # 創建一個空白圖像，顯示 21x21 矩陣
-        fig, ax = plt.subplots(figsize=(21, 21))  # 增大圖像尺寸以容納更多文字
+        fig, ax = plt.subplots(figsize=(21, 21))
         ax.set_xticks(np.arange(self.W))
         ax.set_yticks(np.arange(self.H))
         ax.set_xticklabels(np.arange(self.W))
@@ -192,32 +223,36 @@ class PeopleFlowDatasetCondition(Dataset):
         ax.set_xlabel("Column Index")
         ax.set_ylabel("Row Index")
         ax.set_title("Grid Matrix with Coordinates")
-
-        # 繪製網格並標註經緯度，分行顯示
         for i in range(self.H):
             for j in range(self.W):
                 idx = i * self.W + j
                 coord = parse_lat_lon(self.sorted_flow_columns[idx])
                 lon, lat = coord[0], coord[1]
-                # 分行顯示經緯度，小數點後 4 位
                 text = f'{lon:.3f}\n{lat:.3f}'
                 ax.text(j, i, text, ha='center', va='center', fontsize=10)
-
-        # 設置網格線
         ax.grid(True, which='both', linestyle='-', linewidth=1)
-        plt.gca().invert_yaxis()  # 反轉 Y 軸以符合網格索引
+        plt.gca().invert_yaxis()
         plt.savefig(save_path, dpi=600, bbox_inches='tight', pad_inches=0.1)
         plt.close()
+
     def __len__(self) -> int:
         return self.max_index
+
     def __getitem__(self, idx):
+        # 取出 grid 資料序列
         cond_seq = self.data[idx:idx + self.condition_length]  
         target_seq = self.data[idx + self.condition_length:idx + self.total_length]  
-        model_input = torch.cat([cond_seq, target_seq], dim=0).unsqueeze(0)  
-        return model_input, target_seq.unsqueeze(0)  
+        model_input = torch.cat([cond_seq, target_seq], dim=0).unsqueeze(0)
+        # 取出額外條件資料（形狀：[1, total_length, num_extra_features]）
+        extra_cond_seq = torch.from_numpy(self.extra_data[idx:idx + self.total_length])
+        extra_cond_seq = extra_cond_seq.unsqueeze(0)
+        return model_input, target_seq.unsqueeze(0), extra_cond_seq
+
+
 def collate_fn(batch):
-    conds, targets = zip(*batch)
-    return torch.stack(conds), torch.stack(targets)
+    conds, targets, extra_conds = zip(*batch)
+    return torch.stack(conds), torch.stack(targets), torch.stack(extra_conds)
+
 class DoubleConv3D(nn.Module):
     def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
@@ -231,6 +266,7 @@ class DoubleConv3D(nn.Module):
         )
     def forward(self, x):
         return self.conv(x)
+
 class UNet3D(nn.Module):
     def __init__(self, in_channels=1, base_channels=64, time_emb_dim=128, dropout_rate=0.0):
         super().__init__()
@@ -284,9 +320,11 @@ class UNet3D(nn.Module):
         d1 = self.dec1(torch.cat([d1, e1], dim=1))
         out = self.out_conv(d1)
         return out[:, :, :1, :, :]
+
 class DDPM3D(nn.Module):
     def __init__(self, model: nn.Module, timesteps: int = 1000, 
-                 beta_start: float = 1e-4, beta_end: float = 0.02, device: str = 'cuda'):
+                 beta_start: float = 1e-4, beta_end: float = 0.02, 
+                 device: str = 'cuda', condition_dim: int = 5):
         super().__init__()
         self.model = model
         self.timesteps = timesteps
@@ -299,75 +337,88 @@ class DDPM3D(nn.Module):
         self.half_dim = TIME_EMB_DIM // 2
         self.freq_factor = torch.exp(torch.arange(self.half_dim, dtype=torch.float32) *
                                      -(math.log(10000.0) / (self.half_dim - 1))).to(device)
+        # 新增條件嵌入 MLP；condition_dim 為額外條件特徵數
+        self.condition_mlp = nn.Sequential(
+            nn.Linear(condition_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, TIME_EMB_DIM)
+        )
     def get_time_embedding(self, t):
         t = t.float()
         emb = t[:, None] * self.freq_factor.to(t.device)
         return torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
-    def get_condition_embedding(self, cond):
-        return torch.zeros(cond.shape[0], TIME_EMB_DIM, device=cond.device)
+    def get_condition_embedding(self, extra_cond):
+        # 假設 extra_cond 的 shape 為 [batch_size, total_length, condition_dim]
+        # 這裡選取時間窗口中第一個時間步的條件特徵（可根據需求修改）
+        extra_cond = extra_cond[:, :1, :]  # [batch_size, 1, condition_dim]
+        extra_cond = extra_cond.squeeze(1)  # [batch_size, condition_dim]
+        cond_emb = self.condition_mlp(extra_cond)
+        return cond_emb
     def q_sample(self, x0, t, noise=None):
         if noise is None:
             noise = torch.randn_like(x0)
         sqrt_alpha = self.sqrt_alphas_cumprod[t].view(-1, 1, 1, 1, 1)
         sqrt_one_minus_alpha = self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1, 1, 1)
         return sqrt_alpha * x0 + sqrt_one_minus_alpha * noise
-    def p_losses(self, cond, target, t):
+    def p_losses(self, cond, target, extra_cond, t):
         x_full = torch.cat([target, cond[:, :, 1:]], dim=2)
         noise = torch.randn_like(target)
         x_noisy_target = self.q_sample(target, t, noise=noise)
         x_t = torch.cat([x_noisy_target, cond[:, :, 1:]], dim=2)
         time_emb = self.get_time_embedding(t).to(self.device)
-        cond_emb = self.get_condition_embedding(cond)
+        cond_emb = self.get_condition_embedding(extra_cond)
         combined_emb = time_emb + cond_emb
         pred_noise = self.model(x_t, x_full, combined_emb)
         pred_noise_target = pred_noise[:, :, :1, :, :]
         return F.mse_loss(pred_noise_target, noise)
     @torch.no_grad()
-    def p_sample(self, x_t, t, cond):
+    def p_sample(self, x_t, t, cond, extra_cond):
         if x_t.dim() == 4:
-            x_t = x_t.unsqueeze(1)  
+            x_t = x_t.unsqueeze(1)
         if cond.dim() == 4:
-            cond = cond.unsqueeze(1)  
+            cond = cond.unsqueeze(1)
         beta_t = self.betas[t].view(-1, 1, 1, 1, 1)
         sqrt_recip_alpha_t = 1.0 / torch.sqrt(self.alphas[t]).view(-1, 1, 1, 1, 1)
         sqrt_one_minus_alphas_cumprod_t = self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1, 1, 1)
         time_emb = self.get_time_embedding(t).to(self.device)
-        cond_emb = self.get_condition_embedding(cond)
+        cond_emb = self.get_condition_embedding(extra_cond)
         combined_emb = time_emb + cond_emb
-        x_t_full = torch.cat([x_t, cond[:, :, 1:]], dim=2)  
-        x_full = cond  
+        x_t_full = torch.cat([x_t, cond[:, :, 1:]], dim=2)
+        x_full = cond
         eps_theta = self.model(x_t_full, x_full, combined_emb)
-        eps_theta_target = eps_theta[:, :, :1, :, :]  
+        eps_theta_target = eps_theta[:, :, :1, :, :]
         x_t_minus_1 = sqrt_recip_alpha_t * (x_t - beta_t / sqrt_one_minus_alphas_cumprod_t * eps_theta_target)
         mask = (t > 0).float().view(-1, 1, 1, 1, 1)
         sigma_t = torch.sqrt(beta_t)
         noise = torch.randn_like(x_t)
         return x_t_minus_1 + mask * sigma_t * noise
     @torch.no_grad()
-    def p_sample_loop(self, shape, cond):
+    def p_sample_loop(self, shape, cond, extra_cond):
         if cond.dim() == 4:
-            cond = cond.unsqueeze(1)  
+            cond = cond.unsqueeze(1)
         if len(shape) == 4:
             batch_size = shape[0]
             shape = (batch_size, 1, shape[1], shape[2], shape[3])
         x = torch.randn(shape, device=self.device)
         for i in reversed(range(self.timesteps)):
             t = torch.full((shape[0],), i, device=self.device, dtype=torch.long)
-            x = self.p_sample(x, t, cond)
+            x = self.p_sample(x, t, cond, extra_cond)
         return x
+
 def truncate_colormap(cmap, minval: float = 0.0, maxval: float = 1.0, n: int = 256):
     new_cmap = mcolors.LinearSegmentedColormap.from_list(
         f'trunc({cmap.name},{minval:.2f},{maxval:.2f})',
         cmap(np.linspace(minval, maxval, n))
     )
     return new_cmap
+
 def visualize_predictions(cond, generated, target, sample_idx: int = 0, 
                          save_dir: str = r"C:\thesis\code\result_ddpm"):
     os.makedirs(save_dir, exist_ok=True)
     pred_length = generated.shape[2]
     if sample_idx is None:
-        generated_avg = torch.mean(generated, dim=(0, 2)).squeeze(0).cpu().numpy()  
-        target_avg = torch.mean(target, dim=(0, 2)).squeeze(0).cpu().numpy()        
+        generated_avg = torch.mean(generated, dim=(0, 2)).squeeze(0).cpu().numpy()
+        target_avg = torch.mean(target, dim=(0, 2)).squeeze(0).cpu().numpy()
         mse_matrix = (generated_avg - target_avg) ** 2
         mae_matrix = np.abs(generated_avg - target_avg)
         mape_matrix = np.abs((target_avg - generated_avg) / (target_avg + 1e-10)) * 100
@@ -452,6 +503,7 @@ def visualize_predictions(cond, generated, target, sample_idx: int = 0,
             plt.tight_layout(rect=[0, 0, 1, 0.95])
             plt.savefig(os.path.join(save_dir, f'prediction_sample{sample_idx}_t{t}.png'), dpi=300)
             plt.close()
+
 def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int, 
                          mse_matrix: np.ndarray, mae_matrix: np.ndarray, mape_matrix: np.ndarray, 
                          save_dir: str = r"C:\\thesis\\code\\result_ddpm", smape_matrix: np.ndarray = None):
@@ -532,8 +584,8 @@ def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int,
         plt.close()
     table_data = {
         'Grid Index': [f'[{i},{j}]' for i in range(H) for j in range(W)],
-        'Longitude': longitudes,
-        'Latitude': latitudes,
+        'Longitude': [parse_lat_lon(col)[0] for col in base_dataset.sorted_flow_columns],
+        'Latitude': [parse_lat_lon(col)[1] for col in base_dataset.sorted_flow_columns],
         'MSE': mse_matrix.flatten(),
         'MAE': mae_matrix.flatten(),
         'MAPE (%)': mape_matrix.flatten()
@@ -543,12 +595,13 @@ def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int,
     df = pd.DataFrame(table_data)
     df.to_csv(os.path.join(save_dir, 'mse_mae_mape_smape_per_coordinate.csv'), index=False)
     df.to_excel(os.path.join(save_dir, 'mse_mae_mape_smape_per_coordinate.xlsx'), index=False)
+
 def compute_rgb_mean_std(dataset, sample_count=100):
     all_pixels = []
     total_samples = min(len(dataset), sample_count)
     for idx in range(total_samples):
-        _, target = dataset[idx]
-        grid = target.squeeze().cpu().numpy()  
+        _, target, _ = dataset[idx]
+        grid = target.squeeze().cpu().numpy()
         vmin, vmax = grid.min(), grid.max()
         norm_grid = (grid - vmin) / (vmax - vmin + 1e-8)
         rgb = (plt.cm.viridis(norm_grid)[..., :3] * 255).astype(np.uint8)
@@ -558,6 +611,7 @@ def compute_rgb_mean_std(dataset, sample_count=100):
     mean = np.mean(all_pixels, axis=0)
     std = np.std(all_pixels, axis=0)
     return mean.tolist(), std.tolist()
+
 def train_ddpm(diffusion: DDPM3D, train_loader: DataLoader, val_loader: DataLoader, 
                epochs: int = 20, lr: float = 1e-4, device: str = 'cuda', 
                patience: int = 3, weight_decay: float = 1e-6, 
@@ -569,18 +623,18 @@ def train_ddpm(diffusion: DDPM3D, train_loader: DataLoader, val_loader: DataLoad
     best_val_loss = float('inf')
     patience_counter = 0
     train_losses, val_losses = [], []
-    lr_history = []  
+    lr_history = []
     os.makedirs(save_dir, exist_ok=True)
     checkpoint_path = os.path.join(save_dir, 'checkpoint.pth')
     start_epoch = 0
     for epoch in range(start_epoch, epochs):
         diffusion.train()
         total_train_loss = 0
-        for cond, target in train_loader:
-            cond, target = cond.to(device), target.to(device)
+        for cond, target, extra_cond in train_loader:
+            cond, target, extra_cond = cond.to(device), target.to(device), extra_cond.to(device)
             optimizer.zero_grad()
             t = torch.randint(0, diffusion.timesteps, (target.shape[0],), device=device)
-            loss = diffusion.p_losses(cond, target, t)
+            loss = diffusion.p_losses(cond, target, extra_cond, t)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(diffusion.parameters(), max_norm=1.0)
             optimizer.step()
@@ -590,23 +644,23 @@ def train_ddpm(diffusion: DDPM3D, train_loader: DataLoader, val_loader: DataLoad
         diffusion.eval()
         total_val_loss = 0
         with torch.no_grad():
-            for cond, target in val_loader:
-                cond, target = cond.to(device), target.to(device)
+            for cond, target, extra_cond in val_loader:
+                cond, target, extra_cond = cond.to(device), target.to(device), extra_cond.to(device)
                 t = torch.randint(0, diffusion.timesteps, (target.shape[0],), device=device)
-                loss = diffusion.p_losses(cond, target, t)
+                loss = diffusion.p_losses(cond, target, extra_cond, t)
                 total_val_loss += loss.item()
         avg_val_loss = total_val_loss / len(val_loader)
         val_losses.append(avg_val_loss)
         scheduler.step(avg_val_loss)
-        current_lr = scheduler.get_last_lr()[0]  
-        lr_history.append(current_lr)  
+        current_lr = scheduler.get_last_lr()[0]
+        lr_history.append(current_lr)
         logging.info(f"Epoch [{epoch+1}/{epochs}] - Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, Learning Rate: {current_lr:.8f}")
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             patience_counter = 0
             torch.save({
                 'model_state_dict': diffusion.state_dict(),
-                'learning_rate': current_lr,  
+                'learning_rate': current_lr,
             }, os.path.join(save_dir, 'best_model.pth'))
             logging.info(f"保存最佳模型，驗證損失: {best_val_loss:.4f}, 學習率: {current_lr:.8f}")
         else:
@@ -645,6 +699,7 @@ def train_ddpm(diffusion: DDPM3D, train_loader: DataLoader, val_loader: DataLoad
     plt.savefig(os.path.join(save_dir, 'lr_curve.png'), dpi=300, bbox_inches='tight')
     plt.close()
     return diffusion
+
 @torch.no_grad()
 def evaluate_model(diffusion: DDPM3D, dataset: Dataset, device: str = 'cuda', 
                    max_samples: int = 100, save_dir: str = r"C:\\thesis\\code\\result_ddpm",
@@ -661,10 +716,10 @@ def evaluate_model(diffusion: DDPM3D, dataset: Dataset, device: str = 'cuda',
     generated_batch = torch.zeros(N, 1, pred_length, H, W, device=device)
     target_batch = torch.zeros(N, 1, pred_length, H, W, device=device)
     for i, idx in enumerate(sample_indices):
-        cond, target = dataset[idx]
-        cond, target = cond.to(device), target.to(device)
-        target = target.unsqueeze(2)  
-        x_recon = diffusion.p_sample_loop(target.shape, cond)
+        cond, target, extra_cond = dataset[idx]
+        cond, target, extra_cond = cond.to(device), target.to(device), extra_cond.to(device)
+        target = target.unsqueeze(2)
+        x_recon = diffusion.p_sample_loop(target.shape, cond, extra_cond)
         x_recon_original = x_recon * std_val + mean_val
         target_original = target * std_val + mean_val
         generated_batch[i] = x_recon_original
@@ -685,17 +740,17 @@ def evaluate_model(diffusion: DDPM3D, dataset: Dataset, device: str = 'cuda',
     os.makedirs(save_dir, exist_ok=True)
     pred_images = []
     real_images = []
-    all_pred = generated_batch[:, 0].cpu().numpy().flatten()  
-    all_real = target_batch[:, 0].cpu().numpy().flatten()     
+    all_pred = generated_batch[:, 0].cpu().numpy().flatten()
+    all_real = target_batch[:, 0].cpu().numpy().flatten()
     global_min = min(all_pred.min(), all_real.min())
     global_max = max(all_pred.max(), all_real.max())
     for i in range(N):
         for t in range(pred_length):
-            pred_arr = generated_batch[i, 0, t].cpu().numpy()  
-            real_arr = target_batch[i, 0, t].cpu().numpy()     
+            pred_arr = generated_batch[i, 0, t].cpu().numpy()
+            real_arr = target_batch[i, 0, t].cpu().numpy()
             pred_norm = (pred_arr - global_min) / (global_max - global_min + 1e-8)
             real_norm = (real_arr - global_min) / (global_max - global_min + 1e-8)
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8), sharey=True)  
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8), sharey=True)
             im1 = ax1.imshow(pred_norm, cmap='viridis', interpolation='bilinear')
             ax1.set_title(f"Predicted (Sample {i}, t={t})")
             ax1.set_xlabel("W")
@@ -728,8 +783,8 @@ def evaluate_model(diffusion: DDPM3D, dataset: Dataset, device: str = 'cuda',
         raise ValueError("樣本數不足以計算 FID，至少需要 2 個樣本")
     new_mean, new_std = compute_rgb_mean_std(dataset, sample_count=100)
     inception_model = inception_v3(weights=Inception_V3_Weights.IMAGENET1K_V1, aux_logits=True)
-    inception_model.fc = torch.nn.Identity()  
-    inception_model.AuxLogits = None  
+    inception_model.fc = torch.nn.Identity()
+    inception_model.AuxLogits = None
     inception_model.to(device)
     inception_model.eval()
     inception_transform = transforms.Compose([
@@ -757,14 +812,14 @@ def evaluate_model(diffusion: DDPM3D, dataset: Dataset, device: str = 'cuda',
     metrics['fid'] = fid
     os.makedirs(save_dir, exist_ok=True)
     error_matrix_mse = (generated_batch - target_batch) ** 2
-    mse_matrix = torch.mean(error_matrix_mse, dim=(0, 2)).cpu().numpy()[0]  
+    mse_matrix = torch.mean(error_matrix_mse, dim=(0, 2)).cpu().numpy()[0]
     error_matrix_mae = torch.abs(generated_batch - target_batch)
-    mae_matrix = torch.mean(error_matrix_mae, dim=(0, 2)).cpu().numpy()[0]  
+    mae_matrix = torch.mean(error_matrix_mae, dim=(0, 2)).cpu().numpy()[0]
     mape_matrix = torch.mean(torch.abs((target_batch - generated_batch) / (target_batch + 1e-10)), 
-                            dim=(0, 2)).cpu().numpy()[0] * 100  
+                            dim=(0, 2)).cpu().numpy()[0] * 100
     smape_matrix = torch.mean(torch.abs(generated_batch - target_batch) / 
                              (torch.abs(target_batch) + torch.abs(generated_batch) + 1e-10), 
-                             dim=(0, 2)).cpu().numpy()[0] * 100  
+                             dim=(0, 2)).cpu().numpy()[0] * 100
     table_data = {
         'Grid Index': [f'[{i},{j}]' for i in range(H) for j in range(W)],
         'Longitude': [parse_lat_lon(col)[0] for col in base_dataset.sorted_flow_columns],
@@ -773,7 +828,7 @@ def evaluate_model(diffusion: DDPM3D, dataset: Dataset, device: str = 'cuda',
         'MAE': mae_matrix.flatten(),
         'MAPE (%)': mape_matrix.flatten(),
         'SMAPE (%)': smape_matrix.flatten(),
-        'FID': [metrics['fid']] * (H * W)  
+        'FID': [metrics['fid']] * (H * W)
     }
     df = pd.DataFrame(table_data)
     df.to_csv(os.path.join(save_dir, 'mse_mae_mape_smape_fid_per_coordinate.csv'), index=False)
@@ -798,13 +853,14 @@ def evaluate_model(diffusion: DDPM3D, dataset: Dataset, device: str = 'cuda',
             "timestamp": pd.Timestamp.now().isoformat()
         }, f, indent=4)
     return metrics
+
 if __name__ == "__main__":
     H, W = 21, 21
     condition_length, prediction_length = 8, 1
     batch_size, epochs, lr, timesteps, patience = 150, 150, 0.0015, 1500, 15
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     save_dir = r"C:\thesis\code\result_ddpm"
-    checkpoint_interval = 5  
+    checkpoint_interval = 5
     torch.manual_seed(42)
     np.random.seed(42)
     dataset = PeopleFlowDatasetCondition(
@@ -821,7 +877,9 @@ if __name__ == "__main__":
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
     unet = UNet3D(in_channels=1, base_channels=64, time_emb_dim=TIME_EMB_DIM, dropout_rate=0.2)
-    diffusion = DDPM3D(model=unet, timesteps=timesteps, beta_start=1e-4, beta_end=0.02, device=device)
+    # condition_dim 為額外條件欄位的特徵數，這裡依據 dataset.extra_columns 數量設定
+    condition_dim = len(dataset.extra_columns)
+    diffusion = DDPM3D(model=unet, timesteps=timesteps, beta_start=1e-4, beta_end=0.02, device=device, condition_dim=condition_dim)
     trained_diffusion = train_ddpm(diffusion, train_loader, val_loader, epochs=epochs, 
                                    lr=lr, device=device, patience=patience, save_dir=save_dir,
                                    checkpoint_interval=checkpoint_interval)

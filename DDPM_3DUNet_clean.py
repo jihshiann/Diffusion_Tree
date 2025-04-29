@@ -34,10 +34,6 @@ class PeopleFlowDatasetCondition(Dataset):
                  normalize: bool = True, debug: bool = False):
         """
         初始化網格數據集，同時讀取非流量（額外條件）數據，並處理風向等特徵。
-        對額外條件的處理方式：
-          1. 對於 '最大陣風風向' 與 '風向'，計算 sin 與 cos 後捨棄原始數值。
-          2. 對 categorical 特徵 "holiday" 與 "月" 進行 one-hot 編碼，
-             其他連續特徵如啟用 normalize 則正規化，並保存正規化參數。
         Args:
             csv_path (str): CSV 文件路徑
             H (int): 網格高度
@@ -159,43 +155,31 @@ class PeopleFlowDatasetCondition(Dataset):
 
         # ---------------------------
         # 2. 處理額外條件欄位 (非 flow 部分)
-        # 針對 '最大陣風風向' 與 '風向'，計算 sin 與 cos 後刪除原始欄位
+        # 先對特定欄位做轉換：
+        # 對於 '最大陣風風向' 與 '風向'，計算 sin 與 cos 後刪除原始欄位
         for col in ['最大陣風風向', '風向']:
             if col in self.df.columns:
                 self.df[f'sin_{col}'] = np.sin(np.deg2rad(self.df[col]))
                 self.df[f'cos_{col}'] = np.cos(np.deg2rad(self.df[col]))
                 self.df.drop(columns=[col], inplace=True)
+        # 根據你的描述，額外欄位包含以下項目（注意大小寫請與 CSV 中保持一致）
         extra_cols_list = [
             "測站氣壓", "海平面氣壓", "氣溫", "露點溫度", "相對溼度", "風速", "最大陣風",
             "降水量", "降水時數", "日照時數", "全天空日射量", "能見度", "紫外線指數", "總雲量",
             "holiday", "weekday", "年", "月", "日", "時",
             "sin_風向", "cos_風向", "sin_最大陣風風向", "cos_最大陣風風向"
         ]
-        if "hoilday" in self.df.columns:
-            self.df.rename(columns={"hoilday": "holiday"}, inplace=True)
-        # 取出額外條件資料
-        df_extra = self.df[extra_cols_list].copy()
-        # 定義 categorical 欄位，這裡要求 "holiday" 與 "月" 進行 one-hot 編碼
-        cat_features = ['holiday', '月']
-        df_extra[cat_features] = df_extra[cat_features].astype(str)
-        df_cat = pd.get_dummies(df_extra[cat_features], prefix=cat_features)
-        # 連續特徵部分：將 categorical 欄位剔除
-        df_cont = df_extra.drop(columns=cat_features)
-        if self.normalize:
-            cont_mean = df_cont.mean()
-            cont_std = df_cont.std() + 1e-5
-            df_cont = (df_cont - cont_mean) / cont_std
-            # 保存額外條件連續特徵的正規化參數，便於日後保持一致
-            self.extra_cont_mean = cont_mean
-            self.extra_cont_std = cont_std
-        # 將正規化後的連續特徵和 one-hot 的 categorical 特徵合併
-        df_extra_processed = pd.concat([df_cont, df_cat], axis=1)
-        self.extra_columns = list(df_extra_processed.columns)
-        print("Extra Columns:", df_extra_processed.columns.tolist())
-        self.extra_data = df_extra_processed.values.astype(np.float32)
+        self.extra_columns = extra_cols_list
+        self.extra_data = self.df[self.extra_columns].values.astype(np.float32)
+        
+        if normalize:
+            self.extra_mean = self.extra_data.mean(axis=0, keepdims=True)
+            self.extra_std = self.extra_data.std(axis=0, keepdims=True) + 1e-5
+            self.extra_data = (self.extra_data - self.extra_mean) / self.extra_std
 
         self.max_index = self.data.shape[0] - self.total_length + 1
 
+    # 以下 _plot_grid 與 _plot_grid_matrix 方法保持不變
     def _plot_grid(self, save_path: str):
         directory = os.path.dirname(save_path)
         if not os.path.exists(directory):
@@ -244,14 +228,15 @@ class PeopleFlowDatasetCondition(Dataset):
         return self.max_index
 
     def __getitem__(self, idx):
-        # 取出 flow 資料序列
+        # 取出 grid 資料序列
         cond_seq = self.data[idx:idx + self.condition_length]  
         target_seq = self.data[idx + self.condition_length:idx + self.total_length]  
         model_input = torch.cat([cond_seq, target_seq], dim=0).unsqueeze(0)
-        # 取出額外條件資料，形狀為 [1, total_length, num_extra_features]
+        # 取出額外條件資料（形狀：[1, total_length, num_extra_features]）
         extra_cond_seq = torch.from_numpy(self.extra_data[idx:idx + self.total_length])
         extra_cond_seq = extra_cond_seq.unsqueeze(0)
         return model_input, target_seq.unsqueeze(0), extra_cond_seq
+
 
 def collate_fn(batch):
     conds, targets, extra_conds = zip(*batch)
@@ -352,20 +337,11 @@ class DDPM3D(nn.Module):
         emb = t[:, None] * self.freq_factor.to(t.device)
         return torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
     def get_condition_embedding(self, extra_cond):
-        # 此處僅取第一個時間步的額外條件進行映射，並與時間嵌入直接相加融合
-        # 之後考慮拼接後再經過額外全連接層
-        # 之後考慮所有時間步都接收額外條件
-        # extra_cond 形狀：[batch_size, 1, total_length, condition_dim] = [150, 1, 9, 35]
-        # 選取第一個時間步
-        if extra_cond.dim() == 4:
-            # 訓練時的形狀：[batch_size, 1, total_length, condition_dim]
-            extra_cond = extra_cond[:, 0, 0, :]  # [batch_size, condition_dim]
-        elif extra_cond.dim() == 3:
-            # 評估時的形狀：[batch_size, total_length, condition_dim]
-            extra_cond = extra_cond[:, 0, :]  # [batch_size, condition_dim]
-        else:
-            raise ValueError(f"Unexpected extra_cond shape: {extra_cond.shape}")
-        cond_emb = self.condition_mlp(extra_cond)  # [batch_size, TIME_EMB_DIM]
+        # 假設 extra_cond 的 shape 為 [batch_size, total_length, condition_dim]
+        # 這裡選取時間窗口中第一個時間步的條件特徵（可根據需求修改）
+        extra_cond = extra_cond[:, :1, :]  # [batch_size, 1, condition_dim]
+        extra_cond = extra_cond.squeeze(1)  # [batch_size, condition_dim]
+        cond_emb = self.condition_mlp(extra_cond)
         return cond_emb
     def q_sample(self, x0, t, noise=None):
         if noise is None:
@@ -418,19 +394,7 @@ class DDPM3D(nn.Module):
             x = self.p_sample(x, t, cond, extra_cond)
         return x
 
-# --------------------------------------
-# 視覺化工具：用於繪製預測結果、誤差網格圖等
-# --------------------------------------
 def truncate_colormap(cmap, minval: float = 0.0, maxval: float = 1.0, n: int = 256):
-    """
-    截斷 colormap，僅使用其中一部分的色階範圍。
-    參數:
-        cmap: 原始的 colormap
-        minval, maxval: 取色範圍
-        n: 取樣點數
-    回傳:
-        新的截斷後的 colormap
-    """
     new_cmap = mcolors.LinearSegmentedColormap.from_list(
         f'trunc({cmap.name},{minval:.2f},{maxval:.2f})',
         cmap(np.linspace(minval, maxval, n))
@@ -438,59 +402,38 @@ def truncate_colormap(cmap, minval: float = 0.0, maxval: float = 1.0, n: int = 2
     return new_cmap
 
 def visualize_predictions(cond, generated, target, sample_idx: int = 0, 
-                         save_dir: str = r"C:\thesis\code\result_ddpm_condition"):
-    """
-    視覺化預測結果與真實值的比較，包含生成結果、真實數據、以及誤差（MSE 與 MAE）的圖形。
-    參數:
-        cond: 條件數據
-        generated: 生成結果
-        target: 真實目標數據
-        sample_idx: 指定要視覺化哪個樣本
-        save_dir: 圖形存檔的目錄
-    """
+                         save_dir: str = r"C:\thesis\code\result_ddpm"):
     os.makedirs(save_dir, exist_ok=True)
     pred_length = generated.shape[2]
-    
-    # 若 sample_idx 為 None，則計算所有樣本的平均值
     if sample_idx is None:
-        generated_avg = torch.mean(generated, dim=(0, 2)).squeeze(0).cpu().numpy()  # (H, W)
-        target_avg = torch.mean(target, dim=(0, 2)).squeeze(0).cpu().numpy()        # (H, W)
-        
+        generated_avg = torch.mean(generated, dim=(0, 2)).squeeze(0).cpu().numpy()
+        target_avg = torch.mean(target, dim=(0, 2)).squeeze(0).cpu().numpy()
         mse_matrix = (generated_avg - target_avg) ** 2
         mae_matrix = np.abs(generated_avg - target_avg)
         mape_matrix = np.abs((target_avg - generated_avg) / (target_avg + 1e-10)) * 100
         smape_matrix = np.abs(generated_avg - target_avg) / (np.abs(target_avg) + np.abs(generated_avg) + 1e-10) * 100
-        
         mse = np.mean(mse_matrix)
         mae = np.mean(mae_matrix)
         mape = np.mean(mape_matrix)
         smape = np.mean(smape_matrix)
-        
-        # 子圖 1：平均生成結果
         plt.figure(figsize=(6, 6))
         plt.imshow(generated_avg, cmap='viridis')
         plt.colorbar()
         plt.title('avg_generated')
         plt.savefig(os.path.join(save_dir, 'prediction_all_samples_avg_generated.png'), dpi=300)
         plt.close()
-        
-        # 子圖 2：平均真實值
         plt.figure(figsize=(6, 6))
         plt.imshow(target_avg, cmap='viridis')
         plt.colorbar()
         plt.title('avg_target')
         plt.savefig(os.path.join(save_dir, 'prediction_all_samples_avg_target.png'), dpi=300)
         plt.close()
-        
-        # 子圖 3：MSE 誤差圖
         plt.figure(figsize=(6, 6))
         plt.imshow(mse_matrix, cmap='hot')
         plt.colorbar()
         plt.title(f'MSE: {mse:.0f}')
         plt.savefig(os.path.join(save_dir, 'prediction_all_samples_avg_mse.png'), dpi=300)
         plt.close()
-        
-        # 子圖 4：MAE 誤差圖（標示整數）
         plt.figure(figsize=(6, 6))
         plt.imshow(mae_matrix, cmap='hot')
         plt.colorbar()
@@ -500,8 +443,6 @@ def visualize_predictions(cond, generated, target, sample_idx: int = 0,
         plt.title(f'MAE: {mae:.0f}')
         plt.savefig(os.path.join(save_dir, 'prediction_all_samples_avg_mae.png'), dpi=300)
         plt.close()
-        
-        # 子圖 5：MAPE 誤差圖（標示整數）
         plt.figure(figsize=(6, 6))
         plt.imshow(mape_matrix, cmap='hot')
         plt.colorbar()
@@ -511,8 +452,6 @@ def visualize_predictions(cond, generated, target, sample_idx: int = 0,
         plt.title(f'MAPE: {mape:.0f}%')
         plt.savefig(os.path.join(save_dir, 'prediction_all_samples_avg_mape.png'), dpi=300)
         plt.close()
-        
-        # 子圖 6：SMAPE 誤差圖（標示整數）
         plt.figure(figsize=(6, 6))
         plt.imshow(smape_matrix, cmap='hot')
         plt.colorbar()
@@ -522,42 +461,33 @@ def visualize_predictions(cond, generated, target, sample_idx: int = 0,
         plt.title(f'SMAPE: {smape:.0f}%')
         plt.savefig(os.path.join(save_dir, 'prediction_all_samples_avg_smape.png'), dpi=300)
         plt.close()
-    
     else:
-        # 原有單樣本視覺化邏輯（這裡保留，僅更新為包含 MAPE 和 SMAPE）
         for t in range(pred_length):
             plt.figure(figsize=(20, 4))
-            
             plt.subplot(1, 5, 1)
             plt.imshow(generated[sample_idx, 0, t].cpu().numpy(), cmap='viridis')
             plt.colorbar()
             plt.title(f'Generated (t={t})')
-            
             plt.subplot(1, 5, 2)
             plt.imshow(target[sample_idx, 0, t].cpu().numpy(), cmap='viridis')
             plt.colorbar()
             plt.title(f'True (t={t})')
-            
             error_sq = (generated[sample_idx, 0, t].cpu().numpy() - target[sample_idx, 0, t].cpu().numpy()) ** 2
             plt.subplot(1, 5, 3)
             plt.imshow(error_sq, cmap='hot')
             plt.colorbar()
             plt.title(f'MSE (t={t})')
-            
             error_abs = np.abs(generated[sample_idx, 0, t].cpu().numpy() - target[sample_idx, 0, t].cpu().numpy())
             plt.subplot(1, 5, 4)
             plt.imshow(error_abs, cmap='hot')
             plt.colorbar()
             plt.title(f'MAE (t={t})')
-            
-            # 新增 MAPE 子圖
             mape = np.abs((target[sample_idx, 0, t].cpu().numpy() - generated[sample_idx, 0, t].cpu().numpy()) / 
                          (target[sample_idx, 0, t].cpu().numpy() + 1e-10)) * 100
             plt.subplot(1, 5, 5)
             plt.imshow(mape, cmap='hot')
             plt.colorbar()
             plt.title(f'MAPE (t={t})')
-            
             plt.suptitle(f'Sample {sample_idx} - Time Step {t}')
             plt.tight_layout(rect=[0, 0, 1, 0.95])
             plt.savefig(os.path.join(save_dir, f'prediction_sample{sample_idx}_t{t}.png'), dpi=300)
@@ -565,29 +495,12 @@ def visualize_predictions(cond, generated, target, sample_idx: int = 0,
 
 def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int, 
                          mse_matrix: np.ndarray, mae_matrix: np.ndarray, mape_matrix: np.ndarray, 
-                         save_dir: str = r"C:\\thesis\\code\\result_ddpm_condition", smape_matrix: np.ndarray = None):
-    """
-    繪製網格圖，顯示每個網格點的誤差（MSE、MAE 和 MAPE），並將結果存成圖與表格。
-    
-    Args:
-        sorted_flow_columns (list): 經緯度欄位的排序列表。
-        H (int): 網格高度。
-        W (int): 網格寬度。
-        mse_matrix (np.ndarray): 每個網格點的 MSE 矩陣，形狀為 (H, W)。
-        mae_matrix (np.ndarray): 每個網格點的 MAE 矩陣，形狀為 (H, W)。
-        mape_matrix (np.ndarray): 每個網格點的 MAPE 矩陣，形狀為 (H, W)。
-        save_dir (str): 存檔路徑。
-        smape_matrix (np.ndarray, optional): 每個網格點的 SMAPE 矩陣，形狀為 (H, W)。預設為 None。
-    """
+                         save_dir: str = r"C:\\thesis\\code\\result_ddpm", smape_matrix: np.ndarray = None):
     os.makedirs(save_dir, exist_ok=True)
-    
     locations = [parse_lat_lon(col) for col in sorted_flow_columns]
     longitudes, latitudes = zip(*locations)
-    
     orig_cmap = plt.get_cmap('OrRd')
     trunc_cmap = truncate_colormap(orig_cmap, 0.3, 1.0)
-    
-    # 繪製 MSE 網格圖
     plt.figure(figsize=(12, 12))
     scatter = plt.scatter(longitudes, latitudes, c=mse_matrix.flatten(), cmap=trunc_cmap, marker='o')
     plt.colorbar(scatter, label='MSE')
@@ -597,8 +510,6 @@ def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int,
     plt.grid(True)
     plt.savefig(os.path.join(save_dir, 'plot_grid_with_error_mse.png'), dpi=600, bbox_inches='tight', pad_inches=0.1)
     plt.close()
-
-    # 繪製 MAE 網格圖
     plt.figure(figsize=(12, 12))
     scatter = plt.scatter(longitudes, latitudes, c=mae_matrix.flatten(), cmap=trunc_cmap, marker='o')
     plt.colorbar(scatter, label='MAE')
@@ -610,7 +521,6 @@ def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int,
     plt.grid(True)
     plt.savefig(os.path.join(save_dir, 'plot_grid_with_error_mae.png'), dpi=600, bbox_inches='tight', pad_inches=0.1)
     plt.close()
-
     plt.figure(figsize=(12, 12))
     scatter = plt.scatter(longitudes, latitudes, c=mae_matrix.flatten(), cmap=trunc_cmap, marker='o')
     plt.colorbar(scatter, label='MAE')
@@ -620,8 +530,6 @@ def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int,
     plt.grid(True)
     plt.savefig(os.path.join(save_dir, 'plot_grid_with_error_mae_clean.png'), dpi=600, bbox_inches='tight', pad_inches=0.1)
     plt.close()
-
-    # 繪製 MAPE 網格圖
     plt.figure(figsize=(12, 12))
     scatter = plt.scatter(longitudes, latitudes, c=mape_matrix.flatten(), cmap=trunc_cmap, marker='o')
     plt.colorbar(scatter, label='MAPE (%)')
@@ -633,7 +541,6 @@ def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int,
     plt.grid(True)
     plt.savefig(os.path.join(save_dir, 'plot_grid_with_error_mape.png'), dpi=600, bbox_inches='tight', pad_inches=0.1)
     plt.close()
-
     plt.figure(figsize=(12, 12))
     scatter = plt.scatter(longitudes, latitudes, c=mape_matrix.flatten(), cmap=trunc_cmap, marker='o')
     plt.colorbar(scatter, label='MAPE (%)')
@@ -643,8 +550,6 @@ def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int,
     plt.grid(True)
     plt.savefig(os.path.join(save_dir, 'plot_grid_with_error_mape_clean.png'), dpi=600, bbox_inches='tight', pad_inches=0.1)
     plt.close()
-
-    # 繪製 SMAPE 網格圖（標示整數）
     if smape_matrix is not None:
         plt.figure(figsize=(12, 12))
         scatter = plt.scatter(longitudes, latitudes, c=smape_matrix.flatten(), cmap=trunc_cmap, marker='o')
@@ -657,7 +562,6 @@ def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int,
         plt.grid(True)
         plt.savefig(os.path.join(save_dir, 'plot_grid_with_error_smape.png'), dpi=600, bbox_inches='tight', pad_inches=0.1)
         plt.close()
-
         plt.figure(figsize=(12, 12))
         scatter = plt.scatter(longitudes, latitudes, c=smape_matrix.flatten(), cmap=trunc_cmap, marker='o')
         plt.colorbar(scatter, label='SMAPE (%)')
@@ -667,40 +571,31 @@ def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int,
         plt.grid(True)
         plt.savefig(os.path.join(save_dir, 'plot_grid_with_error_smape_clean.png'), dpi=600, bbox_inches='tight', pad_inches=0.1)
         plt.close()
-
-    # 更新表格，新增 SMAPE
     table_data = {
         'Grid Index': [f'[{i},{j}]' for i in range(H) for j in range(W)],
-        'Longitude': longitudes,
-        'Latitude': latitudes,
+        'Longitude': [parse_lat_lon(col)[0] for col in base_dataset.sorted_flow_columns],
+        'Latitude': [parse_lat_lon(col)[1] for col in base_dataset.sorted_flow_columns],
         'MSE': mse_matrix.flatten(),
         'MAE': mae_matrix.flatten(),
         'MAPE (%)': mape_matrix.flatten()
     }
     if smape_matrix is not None:
         table_data['SMAPE (%)'] = smape_matrix.flatten()
-    
     df = pd.DataFrame(table_data)
     df.to_csv(os.path.join(save_dir, 'mse_mae_mape_smape_per_coordinate.csv'), index=False)
     df.to_excel(os.path.join(save_dir, 'mse_mae_mape_smape_per_coordinate.xlsx'), index=False)
 
 def compute_rgb_mean_std(dataset, sample_count=100):
-    """
-    遍歷部分資料集（例如目標網格轉換後的 RGB 熱力圖），
-    計算所有圖像每個通道的平均值與標準差。
-    """
     all_pixels = []
     total_samples = min(len(dataset), sample_count)
-    
     for idx in range(total_samples):
-        _, target, _ = dataset[idx]  # 解包三個值，僅使用 target
-        grid = target.squeeze().cpu().numpy()  # (H, W)
+        _, target, _ = dataset[idx]
+        grid = target.squeeze().cpu().numpy()
         vmin, vmax = grid.min(), grid.max()
         norm_grid = (grid - vmin) / (vmax - vmin + 1e-8)
         rgb = (plt.cm.viridis(norm_grid)[..., :3] * 255).astype(np.uint8)
         rgb_normalized = rgb.astype(np.float32) / 255.0
         all_pixels.append(rgb_normalized.reshape(-1, 3))
-    
     all_pixels = np.concatenate(all_pixels, axis=0)
     mean = np.mean(all_pixels, axis=0)
     std = np.std(all_pixels, axis=0)
@@ -709,7 +604,7 @@ def compute_rgb_mean_std(dataset, sample_count=100):
 def train_ddpm(diffusion: DDPM3D, train_loader: DataLoader, val_loader: DataLoader, 
                epochs: int = 20, lr: float = 1e-4, device: str = 'cuda', 
                patience: int = 3, weight_decay: float = 1e-6, 
-               save_dir: str = r"C:\thesis\code\result_ddpm_condition",
+               save_dir: str = r"C:\thesis\code\result_ddpm",
                checkpoint_interval: int = 5) -> DDPM3D:
     optimizer = optim.AdamW(diffusion.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, min_lr=1e-6)
@@ -796,119 +691,71 @@ def train_ddpm(diffusion: DDPM3D, train_loader: DataLoader, val_loader: DataLoad
 
 @torch.no_grad()
 def evaluate_model(diffusion: DDPM3D, dataset: Dataset, device: str = 'cuda', 
-                   max_samples: int = 100, save_dir: str = r"C:\\thesis\\code\\result_ddpm_condition",
+                   max_samples: int = 100, save_dir: str = r"C:\\thesis\\code\\result_ddpm",
                    sample_idx: int = 0) -> dict:
-    """
-    評估模型，並生成視覺化圖表，新增 FID 計算邏輯。
-    
-    Args:
-        diffusion: 訓練好的 DDPM 模型
-        dataset: 驗證或測試數據集
-        device: 設備
-        max_samples: 最大評估樣本數
-        save_dir: 結果存檔目錄
-        sample_idx: 指定視覺化的樣本索引
-    Returns:
-        包含 MSE、MAE、MAPE、SMAPE 和 FID 的評估指標字典
-    """
     diffusion.eval()
     metrics = {'mse': 0.0, 'mae': 0.0, 'mape': 0.0, 'smape': 0.0, 'fid': 0.0}
     N = min(len(dataset), max_samples)
     sample_indices = random.sample(range(len(dataset)), N)
-    
     base_dataset = dataset.dataset if isinstance(dataset, Subset) else dataset
     H, W = base_dataset.H, base_dataset.W
     pred_length = base_dataset.prediction_length
-    
     mean_val = base_dataset.mean_val.to(device)
     std_val = base_dataset.std_val.to(device)
-    
     generated_batch = torch.zeros(N, 1, pred_length, H, W, device=device)
     target_batch = torch.zeros(N, 1, pred_length, H, W, device=device)
-    
     for i, idx in enumerate(sample_indices):
-        cond, target, extra_cond = dataset[idx]  # 解包三個值
-        cond = cond.to(device)
-        target = target.to(device)
-        extra_cond = extra_cond.to(device)
-        
-        # 準備條件和目標的形狀
-        target = target.unsqueeze(2)  # (1, 1, 1, H, W)
-        
-        # 生成重建結果
+        cond, target, extra_cond = dataset[idx]
+        cond, target, extra_cond = cond.to(device), target.to(device), extra_cond.to(device)
+        target = target.unsqueeze(2)
         x_recon = diffusion.p_sample_loop(target.shape, cond, extra_cond)
         x_recon_original = x_recon * std_val + mean_val
         target_original = target * std_val + mean_val
-        
         generated_batch[i] = x_recon_original
         target_batch[i] = target_original
-        
         mse = F.mse_loss(x_recon_original, target_original).item()
         mae = F.l1_loss(x_recon_original, target_original).item()
         mape = torch.mean(torch.abs((target_original - x_recon_original) / (target_original + 1e-10))) * 100
         smape = torch.mean(torch.abs(x_recon_original - target_original) / 
                           (torch.abs(target_original) + torch.abs(x_recon_original) + 1e-10)) * 100
-        
         metrics['mse'] += mse
         metrics['mae'] += mae
         metrics['mape'] += mape.item()
         metrics['smape'] += smape.item()
-    
     metrics['mse'] /= N
     metrics['mae'] /= N
     metrics['mape'] /= N
     metrics['smape'] /= N
-
-    # 轉換為 RGB 熱力圖，並儲存圖檔
     os.makedirs(save_dir, exist_ok=True)
     pred_images = []
     real_images = []
-
-    # 計算全局範圍以統一色階
     all_pred = generated_batch[:, 0].cpu().numpy().flatten()
     all_real = target_batch[:, 0].cpu().numpy().flatten()
     global_min = min(all_pred.min(), all_real.min())
     global_max = max(all_pred.max(), all_real.max())
-
     for i in range(N):
         for t in range(pred_length):
-            pred_arr = generated_batch[i, 0, t].cpu().numpy()  # (H, W)
-            real_arr = target_batch[i, 0, t].cpu().numpy()     # (H, W)
-            
-            # 使用全局範圍正規化到 [0, 1]
+            pred_arr = generated_batch[i, 0, t].cpu().numpy()
+            real_arr = target_batch[i, 0, t].cpu().numpy()
             pred_norm = (pred_arr - global_min) / (global_max - global_min + 1e-8)
             real_norm = (real_arr - global_min) / (global_max - global_min + 1e-8)
-            
-            # 創建並排的熱力圖
             fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8), sharey=True)
-            
-            # 預測熱力圖
             im1 = ax1.imshow(pred_norm, cmap='viridis', interpolation='bilinear')
             ax1.set_title(f"Predicted (Sample {i}, t={t})")
             ax1.set_xlabel("W")
             ax1.set_ylabel("H")
-            
-            # 真實熱力圖
             im2 = ax2.imshow(real_norm, cmap='viridis', interpolation='bilinear')
             ax2.set_title(f"Real (Sample {i}, t={t})")
             ax2.set_xlabel("W")
-            
-            # 添加共享色條
             fig.colorbar(im1, ax=[ax1, ax2], orientation='vertical', label='Normalized Value')
-            
-            # 保存合併的熱力圖
             if pred_length == 1:
                 filename_combined = f"sample{i}_heatmap_combined.png"
             else:
                 filename_combined = f"sample{i}_t{t}_heatmap_combined.png"
             plt.savefig(os.path.join(save_dir, filename_combined), dpi=300, bbox_inches='tight')
             plt.close()
-            
-            # 生成獨立的 RGB 圖像以供 FID 計算
             pred_rgb = (plt.cm.viridis(pred_norm)[..., :3] * 255).astype(np.uint8)
             real_rgb = (plt.cm.viridis(real_norm)[..., :3] * 255).astype(np.uint8)
-            
-            # 保存獨立的熱力圖
             if pred_length == 1:
                 filename_pred = f"sample{i}_pred_heatmap.png"
                 filename_real = f"sample{i}_real_heatmap.png"
@@ -917,69 +764,51 @@ def evaluate_model(diffusion: DDPM3D, dataset: Dataset, device: str = 'cuda',
                 filename_real = f"sample{i}_t{t}_real_heatmap.png"
             Image.fromarray(pred_rgb).save(os.path.join(save_dir, filename_pred))
             Image.fromarray(real_rgb).save(os.path.join(save_dir, filename_real))
-            
             pred_images.append(Image.fromarray(pred_rgb))
             real_images.append(Image.fromarray(real_rgb))
-    
-    # 在特徵提取前檢查樣本數
     print(f"Number of pred_images: {len(pred_images)}")
     print(f"Number of real_images: {len(real_images)}")
     if len(pred_images) < 2 or len(real_images) < 2:
         raise ValueError("樣本數不足以計算 FID，至少需要 2 個樣本")
-    
     new_mean, new_std = compute_rgb_mean_std(dataset, sample_count=100)
-    
-    # 使用 InceptionV3 提取特徵
     inception_model = inception_v3(weights=Inception_V3_Weights.IMAGENET1K_V1, aux_logits=True)
-    inception_model.fc = torch.nn.Identity()  # 移除分類層
-    inception_model.AuxLogits = None  # 手動移除輔助分支
+    inception_model.fc = torch.nn.Identity()
+    inception_model.AuxLogits = None
     inception_model.to(device)
     inception_model.eval()
-    
     inception_transform = transforms.Compose([
         transforms.Resize((299, 299)),
         transforms.ToTensor(),
         transforms.Normalize(new_mean, new_std)
     ])
-    
     pred_tensors = [inception_transform(img).to(device) for img in pred_images]
     real_tensors = [inception_transform(img).to(device) for img in real_images]
     pred_tensor_batch = torch.stack(pred_tensors)
     real_tensor_batch = torch.stack(real_tensors)
-    
     with torch.no_grad():
         pred_features = inception_model(pred_tensor_batch)
         real_features = inception_model(real_tensor_batch)
-    
     pred_features_np = pred_features.cpu().numpy()
     real_features_np = real_features.cpu().numpy()
-
     mu_pred = np.mean(pred_features_np, axis=0)
     mu_real = np.mean(real_features_np, axis=0)
     sigma_pred = np.cov(pred_features_np, rowvar=False)
     sigma_real = np.cov(real_features_np, rowvar=False)
-    
     covmean, _ = scipy.linalg.sqrtm(sigma_pred.dot(sigma_real), disp=False)
     if np.iscomplexobj(covmean):
         covmean = covmean.real
     fid = np.sum((mu_pred - mu_real)**2) + np.trace(sigma_pred + sigma_real - 2 * covmean)
     metrics['fid'] = fid
-    
-    # 計算每個網格點的誤差矩陣
+    os.makedirs(save_dir, exist_ok=True)
     error_matrix_mse = (generated_batch - target_batch) ** 2
-    mse_matrix = torch.mean(error_matrix_mse, dim=(0, 2)).cpu().numpy()[0]  # (H, W)
-    
+    mse_matrix = torch.mean(error_matrix_mse, dim=(0, 2)).cpu().numpy()[0]
     error_matrix_mae = torch.abs(generated_batch - target_batch)
-    mae_matrix = torch.mean(error_matrix_mae, dim=(0, 2)).cpu().numpy()[0]  # (H, W)
-    
+    mae_matrix = torch.mean(error_matrix_mae, dim=(0, 2)).cpu().numpy()[0]
     mape_matrix = torch.mean(torch.abs((target_batch - generated_batch) / (target_batch + 1e-10)), 
-                            dim=(0, 2)).cpu().numpy()[0] * 100  # (H, W)
-    
+                            dim=(0, 2)).cpu().numpy()[0] * 100
     smape_matrix = torch.mean(torch.abs(generated_batch - target_batch) / 
                              (torch.abs(target_batch) + torch.abs(generated_batch) + 1e-10), 
-                             dim=(0, 2)).cpu().numpy()[0] * 100  # (H, W)
-    
-    # 儲存誤差數據到表格，包含 FID
+                             dim=(0, 2)).cpu().numpy()[0] * 100
     table_data = {
         'Grid Index': [f'[{i},{j}]' for i in range(H) for j in range(W)],
         'Longitude': [parse_lat_lon(col)[0] for col in base_dataset.sorted_flow_columns],
@@ -988,17 +817,13 @@ def evaluate_model(diffusion: DDPM3D, dataset: Dataset, device: str = 'cuda',
         'MAE': mae_matrix.flatten(),
         'MAPE (%)': mape_matrix.flatten(),
         'SMAPE (%)': smape_matrix.flatten(),
-        'FID': [metrics['fid']] * (H * W)  # FID 作為全域指標，應用於所有網格
+        'FID': [metrics['fid']] * (H * W)
     }
     df = pd.DataFrame(table_data)
     df.to_csv(os.path.join(save_dir, 'mse_mae_mape_smape_fid_per_coordinate.csv'), index=False)
     df.to_excel(os.path.join(save_dir, 'mse_mae_mape_smape_fid_per_coordinate.xlsx'), index=False)
-    
-    # 視覺化
     plot_grid_with_error(base_dataset.sorted_flow_columns, H, W, mse_matrix, mae_matrix, mape_matrix, save_dir, smape_matrix)
     visualize_predictions(None, generated_batch, target_batch, sample_idx, save_dir)
-    
-    # 儲存評估指標
     with open(os.path.join(save_dir, 'evaluation_metrics.txt'), 'w') as f:
         f.write(f"Evaluation Metrics (computed on {N} samples):\n")
         f.write(f"Reconstruction MSE: {metrics['mse']:.6f}\n")
@@ -1006,7 +831,6 @@ def evaluate_model(diffusion: DDPM3D, dataset: Dataset, device: str = 'cuda',
         f.write(f"Reconstruction MAPE: {metrics['mape']:.6f}%\n")
         f.write(f"Reconstruction SMAPE: {metrics['smape']:.6f}%\n")
         f.write(f"Reconstruction FID: {metrics['fid']:.6f}\n")
-    
     with open(os.path.join(save_dir, 'evaluation_metrics.json'), 'w') as f:
         json.dump({
             "mse": metrics['mse'], 
@@ -1017,15 +841,14 @@ def evaluate_model(diffusion: DDPM3D, dataset: Dataset, device: str = 'cuda',
             "sample_size": N, 
             "timestamp": pd.Timestamp.now().isoformat()
         }, f, indent=4)
-    
     return metrics
 
 if __name__ == "__main__":
     H, W = 21, 21
-    condition_length, prediction_length = 1, 1
+    condition_length, prediction_length = 8, 1
     batch_size, epochs, lr, timesteps, patience = 150, 150, 0.0015, 1500, 15
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    save_dir = r"C:\thesis\code\result_ddpm_condition"
+    save_dir = r"C:\thesis\code\result_ddpm"
     checkpoint_interval = 5
     torch.manual_seed(42)
     np.random.seed(42)
@@ -1046,41 +869,29 @@ if __name__ == "__main__":
     # condition_dim 為額外條件欄位的特徵數，這裡依據 dataset.extra_columns 數量設定
     condition_dim = len(dataset.extra_columns)
     diffusion = DDPM3D(model=unet, timesteps=timesteps, beta_start=1e-4, beta_end=0.02, device=device, condition_dim=condition_dim)
-
     trained_diffusion = train_ddpm(diffusion, train_loader, val_loader, epochs=epochs, 
-                               lr=lr, device=device, patience=patience, save_dir=save_dir,
-                               checkpoint_interval=checkpoint_interval)
-
-    # -------------------------------
-    # 評估模型
-    # -------------------------------
+                                   lr=lr, device=device, patience=patience, save_dir=save_dir,
+                                   checkpoint_interval=checkpoint_interval)
     metrics = evaluate_model(trained_diffusion, val_dataset, device=device, max_samples=80, save_dir=save_dir)
-    # 更新 logging.info，新增 FID 輸出
     logging.info(f"Reconstruction MSE: {metrics['mse']:.6f}, MAE: {metrics['mae']:.6f}, "
                  f"MAPE: {metrics['mape']:.6f}, SMAPE: {metrics['smape']:.6f}, "
                  f"FID: {metrics['fid']:.6f}")
-
-    # 儲存最終評估結果
     os.makedirs(save_dir, exist_ok=True)
     with open(os.path.join(save_dir, 'evaluation_metrics.txt'), 'w') as f:
-        # 修正樣本數，使用實際的 max_samples 值
         f.write(f"Evaluation Metrics (computed on {20} samples):\n")
         f.write(f"Date: {pd.Timestamp.now()}\n")
         f.write(f"Reconstruction MSE: {metrics['mse']:.6f}\n")
         f.write(f"Reconstruction MAE: {metrics['mae']:.6f}\n")
         f.write(f"Reconstruction MAPE: {metrics['mape']:.6f}%\n")
         f.write(f"Reconstruction SMAPE: {metrics['smape']:.6f}%\n")
-        # 新增 FID 記錄
         f.write(f"Reconstruction FID: {metrics['fid']:.6f}\n")
-
     with open(os.path.join(save_dir, 'evaluation_metrics.json'), 'w') as f:
-        # 更新 JSON 檔案，新增 FID
         json.dump({
             "mse": metrics['mse'], 
             "mae": metrics['mae'], 
             "mape": metrics['mape'], 
             "smape": metrics['smape'],
-            "fid": metrics['fid'],  # 新增 FID
+            "fid": metrics['fid'],  
             "sample_size": 20, 
             "timestamp": pd.Timestamp.now().isoformat()
         }, f, indent=4)

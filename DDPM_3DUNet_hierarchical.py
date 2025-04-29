@@ -146,8 +146,8 @@ class PeopleFlowDatasetCondition(Dataset):
 
         sorted_indices = grid.flatten()
         self.sorted_flow_columns = [column_info[idx][0] for idx in sorted_indices]
-        self._plot_grid(save_path=r"C:\thesis\code\result_ddpm_condition\plot_grid.png") 
-        self._plot_grid_matrix(save_path=r"C:\thesis\code\result_ddpm_condition\plot_grid_matrix.png") 
+        self._plot_grid(save_path=r"C:\thesis\code\result_ddpm_hierarchical\plot_grid.png") 
+        self._plot_grid_matrix(save_path=r"C:\thesis\code\result_ddpm_hierarchical\plot_grid_matrix.png") 
 
         flow_values = self.df[self.sorted_flow_columns].values.reshape(-1, H, W).astype(np.float32)
         self.data = torch.from_numpy(flow_values)
@@ -438,7 +438,7 @@ def truncate_colormap(cmap, minval: float = 0.0, maxval: float = 1.0, n: int = 2
     return new_cmap
 
 def visualize_predictions(cond, generated, target, sample_idx: int = 0, 
-                         save_dir: str = r"C:\thesis\code\result_ddpm_condition"):
+                         save_dir: str = r"C:\thesis\code\result_ddpm_hierarchical"):
     """
     視覺化預測結果與真實值的比較，包含生成結果、真實數據、以及誤差（MSE 與 MAE）的圖形。
     參數:
@@ -565,7 +565,7 @@ def visualize_predictions(cond, generated, target, sample_idx: int = 0,
 
 def plot_grid_with_error(sorted_flow_columns: list, H: int, W: int, 
                          mse_matrix: np.ndarray, mae_matrix: np.ndarray, mape_matrix: np.ndarray, 
-                         save_dir: str = r"C:\\thesis\\code\\result_ddpm_condition", smape_matrix: np.ndarray = None):
+                         save_dir: str = r"C:\\thesis\\code\\result_ddpm_hierarchical", smape_matrix: np.ndarray = None):
     """
     繪製網格圖，顯示每個網格點的誤差（MSE、MAE 和 MAPE），並將結果存成圖與表格。
     
@@ -709,7 +709,7 @@ def compute_rgb_mean_std(dataset, sample_count=100):
 def train_ddpm(diffusion: DDPM3D, train_loader: DataLoader, val_loader: DataLoader, 
                epochs: int = 20, lr: float = 1e-4, device: str = 'cuda', 
                patience: int = 3, weight_decay: float = 1e-6, 
-               save_dir: str = r"C:\thesis\code\result_ddpm_condition",
+               save_dir: str = r"C:\thesis\code\result_ddpm_hierarchical",
                checkpoint_interval: int = 5) -> DDPM3D:
     optimizer = optim.AdamW(diffusion.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, min_lr=1e-6)
@@ -793,10 +793,135 @@ def train_ddpm(diffusion: DDPM3D, train_loader: DataLoader, val_loader: DataLoad
     plt.savefig(os.path.join(save_dir, 'lr_curve.png'), dpi=300, bbox_inches='tight')
     plt.close()
     return diffusion
+# --------------------------------------
+# 複合模型
+# --------------------------------------
+def generate_rainy_simulations(model, dataset, device, num_samples=100):
+    """
+    生成雨天模擬數據。
+    
+    Args:
+        model: 已載入的基礎模型 (DDPM3D)。
+        dataset: PeopleFlowDatasetCondition 實例。
+        device: 計算設備 ('cuda' 或 'cpu')。
+        num_samples: 生成的樣本數量。
+    
+    Returns:
+        simulated_flow: 模擬的人流數據 (tensor)。
+        actual_flow: 實際的人流數據 (tensor)。
+        rainy_indices: 雨天數據的索引。
+    """
+    model.eval()
+    simulated_flow = []
+    actual_flow = []
+    rainy_indices = []
+
+    with torch.no_grad():
+        for idx in range(len(dataset)):
+            condition, target, extra = dataset[idx]
+            if extra[dataset.extra_columns.index('rain')] > 0:  # 假設 'rain' 是雨量欄位
+                rainy_indices.append(idx)
+                condition = condition.unsqueeze(0).to(device)  # [1, C, T, H, W]
+                extra = torch.tensor(extra, dtype=torch.float32).unsqueeze(0).to(device)
+                pred = model.sample(condition, extra)  # 假設 DDPM3D 有 sample 方法
+                simulated_flow.append(pred.cpu())
+                actual_flow.append(target.unsqueeze(0))
+
+            if len(rainy_indices) >= num_samples:
+                break
+
+    simulated_flow = torch.cat(simulated_flow, dim=0)
+    actual_flow = torch.cat(actual_flow, dim=0)
+    return simulated_flow, actual_flow, rainy_indices
+
+def compute_and_save_offset(simulated_flow, actual_flow, save_path="C:\thesis\code\result_ddpm_hierarchical\rainy_offsets.npy"):
+    """
+    計算並儲存雨天模擬數據與實際數據的偏移量。
+    
+    Args:
+        simulated_flow: 模擬的人流數據 (tensor)。
+        actual_flow: 實際的人流數據 (tensor)。
+        save_path: 偏移量儲存路徑。
+    
+    Returns:
+        offsets: 計算出的偏移量 (numpy array)。
+    """
+    offsets = (actual_flow - simulated_flow).numpy()  # 轉換為 numpy
+    np.save(save_path, offsets)
+    return offsets
+
+class RainyOffsetDataset(PeopleFlowDatasetCondition):
+    """
+    雨天偏移數據集，基於偏移量數據進行訓練。
+    """
+    def __init__(self, csv_path, offset_path, H, W, condition_length, prediction_length, normalize=True):
+        super().__init__(csv_path, H, W, condition_length, prediction_length, normalize)
+        self.offsets = np.load(offset_path)
+        
+    def __getitem__(self, idx):
+        condition, _, extra = super().__getitem__(idx)
+        offset = torch.tensor(self.offsets[idx], dtype=torch.float32)
+        return condition, offset, extra
+
+def evaluate_two_stage(base_model, offset_model, dataset, device, save_dir="C:\thesis\code\result_ddpm_hierarchical\two_stage_results"):
+    """
+    執行兩階段預測並評估。
+    
+    Args:
+        base_model: 基礎模型 (DDPM3D)。
+        offset_model: 偏移模型 (DDPM3D)。
+        dataset: PeopleFlowDatasetCondition 實例。
+        device: 計算設備。
+        save_dir: 結果儲存目錄。
+    
+    Returns:
+        one_stage_metrics: 一段式評估指標。
+        two_stage_metrics: 兩段式評估指標。
+    """
+    base_model.eval()
+    offset_model.eval()
+    os.makedirs(save_dir, exist_ok=True)
+    
+    one_stage_preds = []
+    two_stage_preds = []
+    targets = []
+    
+    with torch.no_grad():
+        for idx in range(len(dataset)):
+            condition, target, extra = dataset[idx]
+            condition = condition.unsqueeze(0).to(device)
+            extra = torch.tensor(extra, dtype=torch.float32).unsqueeze(0).to(device)
+            target = target.unsqueeze(0)
+            
+            # 一段式預測
+            base_pred = base_model.sample(condition, extra)
+            one_stage_preds.append(base_pred.cpu())
+            
+            # 兩段式預測：基礎預測 + 偏移量
+            offset_pred = offset_model.sample(condition, extra)
+            two_stage_pred = base_pred + offset_pred
+            two_stage_preds.append(two_stage_pred.cpu())
+            
+            targets.append(target)
+    
+    one_stage_preds = torch.cat(one_stage_preds, dim=0)
+    two_stage_preds = torch.cat(two_stage_preds, dim=0)
+    targets = torch.cat(targets, dim=0)
+    
+    # 計算指標（這裡簡單實現 MSE 和 MAE，您可根據需要擴展）
+    one_stage_mse = torch.mean((one_stage_preds - targets) ** 2).item()
+    two_stage_mse = torch.mean((two_stage_preds - targets) ** 2).item()
+    one_stage_mae = torch.mean(torch.abs(one_stage_preds - targets)).item()
+    two_stage_mae = torch.mean(torch.abs(two_stage_preds - targets)).item()
+    
+    one_stage_metrics = {'mse': one_stage_mse, 'mae': one_stage_mae}
+    two_stage_metrics = {'mse': two_stage_mse, 'mae': two_stage_mae}
+    
+    return one_stage_metrics, two_stage_metrics
 
 @torch.no_grad()
 def evaluate_model(diffusion: DDPM3D, dataset: Dataset, device: str = 'cuda', 
-                   max_samples: int = 100, save_dir: str = r"C:\\thesis\\code\\result_ddpm_condition",
+                   max_samples: int = 100, save_dir: str = r"C:\\thesis\\code\\result_ddpm_hierarchical",
                    sample_idx: int = 0) -> dict:
     """
     評估模型，並生成視覺化圖表，新增 FID 計算邏輯。
@@ -1021,66 +1146,46 @@ def evaluate_model(diffusion: DDPM3D, dataset: Dataset, device: str = 'cuda',
     return metrics
 
 if __name__ == "__main__":
+    # 設定參數
     H, W = 21, 21
-    condition_length, prediction_length = 1, 1
-    batch_size, epochs, lr, timesteps, patience = 150, 150, 0.0015, 1500, 15
+    condition_length, prediction_length = 8, 1
+    batch_size, epochs, lr, timesteps = 32, 20, 1e-4, 1000
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    save_dir = r"C:\thesis\code\result_ddpm_condition"
-    checkpoint_interval = 5
-    torch.manual_seed(42)
-    np.random.seed(42)
+    
+    # 載入數據集
     dataset = PeopleFlowDatasetCondition(
         csv_path=r"C:\thesis\code\Taipei_CF\all_merged.csv",
         H=H, W=W, condition_length=condition_length, prediction_length=prediction_length,
-        normalize=True, debug=True
+        normalize=True
     )
-    train_end = int(0.7 * len(dataset))
-    val_end = int(0.85 * len(dataset))
-    train_dataset = Subset(dataset, range(0, train_end))
-    val_dataset = Subset(dataset, range(train_end, val_end))
-    test_dataset = Subset(dataset, range(val_end, len(dataset)))
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
-    unet = UNet3D(in_channels=1, base_channels=64, time_emb_dim=TIME_EMB_DIM, dropout_rate=0.2)
-    # condition_dim 為額外條件欄位的特徵數，這裡依據 dataset.extra_columns 數量設定
-    condition_dim = len(dataset.extra_columns)
-    diffusion = DDPM3D(model=unet, timesteps=timesteps, beta_start=1e-4, beta_end=0.02, device=device, condition_dim=condition_dim)
-
-    trained_diffusion = train_ddpm(diffusion, train_loader, val_loader, epochs=epochs, 
-                               lr=lr, device=device, patience=patience, save_dir=save_dir,
-                               checkpoint_interval=checkpoint_interval)
-
-    # -------------------------------
-    # 評估模型
-    # -------------------------------
-    metrics = evaluate_model(trained_diffusion, val_dataset, device=device, max_samples=80, save_dir=save_dir)
-    # 更新 logging.info，新增 FID 輸出
-    logging.info(f"Reconstruction MSE: {metrics['mse']:.6f}, MAE: {metrics['mae']:.6f}, "
-                 f"MAPE: {metrics['mape']:.6f}, SMAPE: {metrics['smape']:.6f}, "
-                 f"FID: {metrics['fid']:.6f}")
-
-    # 儲存最終評估結果
-    os.makedirs(save_dir, exist_ok=True)
-    with open(os.path.join(save_dir, 'evaluation_metrics.txt'), 'w') as f:
-        # 修正樣本數，使用實際的 max_samples 值
-        f.write(f"Evaluation Metrics (computed on {20} samples):\n")
-        f.write(f"Date: {pd.Timestamp.now()}\n")
-        f.write(f"Reconstruction MSE: {metrics['mse']:.6f}\n")
-        f.write(f"Reconstruction MAE: {metrics['mae']:.6f}\n")
-        f.write(f"Reconstruction MAPE: {metrics['mape']:.6f}%\n")
-        f.write(f"Reconstruction SMAPE: {metrics['smape']:.6f}%\n")
-        # 新增 FID 記錄
-        f.write(f"Reconstruction FID: {metrics['fid']:.6f}\n")
-
-    with open(os.path.join(save_dir, 'evaluation_metrics.json'), 'w') as f:
-        # 更新 JSON 檔案，新增 FID
-        json.dump({
-            "mse": metrics['mse'], 
-            "mae": metrics['mae'], 
-            "mape": metrics['mape'], 
-            "smape": metrics['smape'],
-            "fid": metrics['fid'],  # 新增 FID
-            "sample_size": 20, 
-            "timestamp": pd.Timestamp.now().isoformat()
-        }, f, indent=4)
+    
+    # 載入基礎模型
+    base_model_path = r"C:\thesis\code\result_ddpm_condition\best_model.pth"
+    unet_base = UNet3D(in_channels=1, base_channels=64, time_emb_dim=128)
+    base_model = DDPM3D(model=unet_base, timesteps=timesteps, device=device, condition_dim=len(dataset.extra_columns))
+    base_model.load_state_dict(torch.load(base_model_path)['model_state_dict'])
+    base_model.to(device)
+    
+    # 生成雨天模擬數據
+    simulated_flow, actual_flow, rainy_indices = generate_rainy_simulations(base_model, dataset, device)
+    
+    # 計算並儲存偏移量
+    offsets = compute_and_save_offset(simulated_flow, actual_flow)
+    
+    # 訓練雨天偏移模型
+    rainy_dataset = RainyOffsetDataset(
+        csv_path=r"C:\thesis\code\Taipei_CF\all_merged.csv",
+        offset_path="rainy_offsets.npy",
+        H=H, W=W, condition_length=condition_length, prediction_length=prediction_length
+    )
+    train_end = int(0.7 * len(rainy_dataset))
+    train_loader = DataLoader(Subset(rainy_dataset, range(train_end)), batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(Subset(rainy_dataset, range(train_end, len(rainy_dataset))), batch_size=batch_size, shuffle=False)
+    unet_offset = UNet3D(in_channels=1, base_channels=64, time_emb_dim=128)
+    offset_model = DDPM3D(model=unet_offset, timesteps=timesteps, device=device, condition_dim=len(dataset.extra_columns))
+    trained_offset_model = train_ddpm(offset_model, train_loader, val_loader, epochs=epochs, lr=lr, device=device)
+    
+    # 評估兩階段方法
+    one_stage_metrics, two_stage_metrics = evaluate_two_stage(base_model, trained_offset_model, dataset, device)
+    print(f"一段式 MSE: {one_stage_metrics['mse']:.6f}, 兩段式 MSE: {two_stage_metrics['mse']:.6f}")
+    print(f"一段式 MAE: {one_stage_metrics['mae']:.6f}, 兩段式 MAE: {two_stage_metrics['mae']:.6f}")

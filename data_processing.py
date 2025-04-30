@@ -96,7 +96,7 @@ def main():
         # 處理降水量欄位
         if '降水量' in ext_df.columns:
             # 將 "降水量" 欄位中的 'T' 轉換為 0.1 (微量)
-            ext_df['降水量'] = ext_df['降水量'].replace('T', 0.1)
+            ext_df['降水量'] = ext_df['降水量'].replace('T', 1)
             # 確保降水量為數值
             ext_df['降水量'] = pd.to_numeric(ext_df['降水量'], errors='coerce').fillna(0)
         

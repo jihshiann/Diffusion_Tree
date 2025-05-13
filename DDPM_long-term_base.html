@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DDPM_Long-term 流程圖</title>
+    <style>
+        body {
+            font-family: 'Arial', sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 1100px;
+            margin: 0 auto;
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+            margin-bottom: 20px;
+        }
+        .legend {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-bottom: 20px;
+            justify-content: center;
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            margin-right: 15px;
+        }
+        .legend-color {
+            width: 20px;
+            height: 20px;
+            margin-right: 5px;
+            border: 1px solid #333;
+        }
+        svg {
+            width: 100%;
+            height: auto;
+            max-width: 1000px;
+            margin: 0 auto;
+            display: block;
+        }
+        .flow-section {
+            margin-bottom: 40px;
+            padding: 20px;
+            border-radius: 8px;
+        }
+        .data-process {
+            background-color: #D4F1F9;
+            border: 1px solid #0099CC;
+        }
+        .condition-process {
+            background-color: #FFE5CC;
+            border: 1px solid #FF9933;
+        }
+        .model-arch {
+            background-color: #E5CCFF;
+            border: 1px solid #9966CC;
+        }
+        .train-process {
+            background-color: #CCFFCC;
+            border: 1px solid #66CC66;
+        }
+        .learn-outcome {
+            background-color: #FFFFCC;
+            border: 1px solid #CCCC00;
+        }
+        h2 {
+            margin-top: 0;
+            color: #333;
+            font-size: 1.3em;
+        }
+        .flow-item {
+            margin-bottom: 15px;
+            position: relative;
+            padding-left: 25px;
+        }
+        .flow-item:before {
+            content: "→";
+            position: absolute;
+            left: 0;
+            font-weight: bold;
+        }
+        .flow-item:first-child:before {
+            content: "•";
+        }
+        .flow-diagram {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            margin: 30px 0;
+        }
+        .flow-row {
+            display: flex;
+            width: 100%;
+            justify-content: center;
+            margin-bottom: 20px;
+            position: relative;
+        }
+        .flow-box {
+            padding: 12px;
+            border-radius: 8px;
+            margin: 0 10px;
+            text-align: center;
+            width: 180px;
+            min-height: 50px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            font-size: 14px;
+        }
+        .arrow-down {
+            width: 0;
+            height: 0;
+            border-left: 10px solid transparent;
+            border-right: 10px solid transparent;
+            border-top: 10px solid #666;
+            margin: 5px auto 15px auto;
+        }
+        .arrow-right {
+            position: absolute;
+            top: 50%;
+            right: -15px;
+            transform: translateY(-50%);
+            width: 20px;
+            height: 20px;
+        }
+        .arrow-right:after {
+            content: "";
+            position: absolute;
+            width: 0;
+            height: 0;
+            border-top: 10px solid transparent;
+            border-bottom: 10px solid transparent;
+            border-left: 10px solid #666;
+        }
+        .box-data {
+            background-color: #D4F1F9;
+            border: 1px solid #0099CC;
+        }
+        .box-condition {
+            background-color: #FFE5CC;
+            border: 1px solid #FF9933;
+        }
+        .box-model {
+            background-color: #E5CCFF;
+            border: 1px solid #9966CC;
+        }
+        .box-train {
+            background-color: #CCFFCC;
+            border: 1px solid #66CC66;
+        }
+        .box-outcome {
+            background-color: #FFFFCC;
+            border: 1px solid #CCCC00;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>DDPM_Long-term.ipynb 流程圖</h1>
+        
+        <div class="legend">
+            <div class="legend-item">
+                <div class="legend-color" style="background-color: #D4F1F9;"></div>
+                <span>資料處理</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background-color: #FFE5CC;"></div>
+                <span>條件處理</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background-color: #E5CCFF;"></div>
+                <span>模型架構</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background-color: #CCFFCC;"></div>
+                <span>訓練過程</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-color" style="background-color: #FFFFCC;"></div>
+                <span>學習成果</span>
+            </div>
+        </div>
+        
+        <!-- 視覺化流程圖 -->
+        <div class="flow-diagram">
+            <!-- 資料處理部分 -->
+            <div class="flow-row">
+                <div class="flow-box box-data">
+                    資料來源: all_merged.csv
+                </div>
+            </div>
+            <div class="arrow-down"></div>
+            
+            <div class="flow-row">
+                <div class="flow-box box-data">
+                    選定20x20網格大小
+                </div>
+                <div class="flow-box box-data">
+                    選取最靠近地理中心的400個點
+                </div>
+                <div class="flow-box box-data">
+                    使用匈牙利演算法映射感測器位置到網格點
+                </div>
+            </div>
+            <div class="arrow-down"></div>
+            
+            <div class="flow-row">
+                <div class="flow-box box-data">
+                    計算條件平均流量圖:
+                    針對每個(小時,是否假日)組合計算平均人流分佈
+                </div>
+            </div>
+            <div class="arrow-down"></div>
+            
+            <div class="flow-row">
+                <div class="flow-box box-data">
+                    正規化:
+                    計算這些條件平均流量圖的整體平均值和標準差
+                </div>
+            </div>
+            <div class="arrow-down"></div>
+            
+            <div class="flow-row">
+                <div class="flow-box box-data">
+                    正規化後的平均人流圖
+                    作為模型訓練的目標資料(x_start)
+                </div>
+            </div>
+            
+            <!-- 條件處理部分 -->
+            <div class="flow-row" style="margin-top: 40px;">
+                <div class="flow-box box-condition">
+                    條件輸入:
+                    小時(0-23)和是否假日(0/1)
+                </div>
+            </div>
+            <div class="arrow-down"></div>
+            
+            <div class="flow-row">
+                <div class="flow-box box-condition">
+                    擴展成20x20網格
+                    小時值正規化到0-1
+                </div>
+            </div>
+            <div class="arrow-down"></div>
+            
+            <div class="flow-row">
+                <div class="flow-box box-condition">
+                    將兩個網格疊加成
+                    2通道3D張量
+                </div>
+            </div>
+            <div class="arrow-down"></div>
+            
+            <div class="flow-row">
+                <div class="flow-box box-condition">
+                    輸入到條件處理器
+                    (小型卷積網路)
+                </div>
+            </div>
+            <div class="arrow-down"></div>
+            
+            <div class="flow-row">
+                <div class="flow-box box-condition">
+                    生成條件嵌入向量
+                    (維度=16)
+                </div>
+            </div>
+            
+            <!-- 模型架構部分 -->
+            <div class="flow-row" style="margin-top: 40px;">
+                <div class="flow-box box-model">
+                    核心模型: DDPM3D
+                </div>
+            </div>
+            <div class="arrow-down"></div>
+            
+            <div class="flow-row">
+                <div class="flow-box box-model">
+                    雜訊預測器: UNet3D
+                </div>
+            </div>
+            <div class="arrow-down"></div>
+            
+            <div class="flow-row">
+                <div class="flow-box box-model">
+                    輸入: 加噪後人流圖(x_t)
+                    + 條件嵌入向量
+                </div>
+                <div class="flow-box box-model">
+                    時間嵌入: 使用正弦時間嵌入
+                    將擴散步驟t轉換為向量
+                </div>
+                <div class="flow-box box-model">
+                    輸出: 預測在時間步t
+                    加入原始目標圖像的雜訊
+                </div>
+            </div>
+            
+            <!-- 訓練過程部分 -->
+            <div class="flow-row" style="margin-top: 40px;">
+                <div class="flow-box box-train">
+                    訓練輸入準備
+                </div>
+            </div>
+            <div class="arrow-down"></div>
+            
+            <div class="flow-row">
+                <div class="flow-box box-train">
+                    步驟1: 取出
+                    (小時,是否假日)
+                </div>
+                <div class="flow-box box-train">
+                    步驟2: 找對應的
+                    正規化平均人流圖
+                    作為x_start
+                </div>
+                <div class="flow-box box-train">
+                    步驟3: 隨機選擇
+                    擴散時間步t
+                </div>
+            </div>
+            <div class="arrow-down"></div>
+            
+            <div class="flow-row">
+                <div class="flow-box box-train">
+                    步驟4: 計算加噪後
+                    的圖像x_t
+                </div>
+                <div class="flow-box box-train">
+                    步驟5: 將x_t、時間步t嵌入
+                    和條件嵌入輸入U-Net
+                </div>
+            </div>
+            <div class="arrow-down"></div>
+            
+            <div class="flow-row">
+                <div class="flow-box box-train">
+                    訓練目標:
+                    預測擴散過程中的雜訊
+                </div>
+            </div>
+            <div class="arrow-down"></div>
+            
+            <div class="flow-row">
+                <div class="flow-box box-train">
+                    損失函數: MSE
+                    預測雜訊與實際雜訊差異
+                </div>
+            </div>
+            <div class="arrow-down"></div>
+            
+            <div class="flow-row">
+                <div class="flow-box box-train">
+                    優化: AdamW
+                    學習率根據訓練損失動態調整
+                </div>
+            </div>
+            <div class="arrow-down"></div>
+            
+            <div class="flow-row">
+                <div class="flow-box box-train">
+                    模型選擇: 保存驗證損失最低的模型
+                </div>
+            </div>
+            <div class="arrow-down"></div>
+            
+            <div class="flow-row">
+                <div class="flow-box box-train">
+                    早停: 訓練損失連續多個週期無改善則停止
+                </div>
+            </div>
+            
+            <!-- 學習成果部分 -->
+            <div class="flow-row" style="margin-top: 40px;">
+                <div class="flow-box box-outcome">
+                    學習成果
+                </div>
+            </div>
+            <div class="arrow-down"></div>
+            
+            <div class="flow-row">
+                <div class="flow-box box-outcome">
+                    學會根據小時和假日狀態
+                    生成預期平均人流分佈圖
+                </div>
+                <div class="flow-box box-outcome">
+                    學習人流分佈在給定條件下的
+                    條件機率分佈 p(x|hour,is_holiday)
+                </div>
+                <div class="flow-box box-outcome">
+                    推論階段: 給定條件,
+                    從隨機雜訊開始逐步去噪,
+                    生成符合條件的人流預測圖
+                </div>
+            </div>
+        </div>
+        
+        <!-- 文字說明部分 -->
+        <div class="flow-section data-process">
+            <h2>1. 資料處理</h2>
+            <div class="flow-item">資料來源: 使用 all_merged.csv，包含時間戳、是否為假日、多個地點的人流數據及天氣等特徵</div>
+            <div class="flow-item">選定 20x20 的網格大小，從眾多座標點中選取最靠近地理中心的 400 個點</div>
+            <div class="flow-item">使用匈牙利演算法將實際感測器位置映射到 20x20 的目標網格點上</div>
+            <div class="flow-item">針對訓練資料中每個 (小時, 是否為假日) 組合，計算出對應的平均人流分佈網格圖</div>
+            <div class="flow-item">計算所有條件平均流量圖的整體平均值和標準差，並用此對這些流量圖進行正規化</div>
+            <div class="flow-item">正規化後的平均人流圖作為模型訓練時的目標資料 (x_start)</div>
+        </div>
+        
+        <div class="flow-section condition-process">
+            <h2>2. 條件處理</h2>
+            <div class="flow-item">主要條件: 一天中的小時 (0-23) 和是否為假日 (0 或 1)</div>
+            <div class="flow-item">將這兩個純量值分別擴展成 20x20 的網格（小時網格先正規化到 0-1 之間）</div>
+            <div class="flow-item">兩個網格疊加成一個 2 通道的 3D 張量 (N, 2, D, H, W)</div>
+            <div class="flow-item">這個 2 通道張量輸入到一個小型卷積網路 (condition_processor) 進行處理</div>
+            <div class="flow-item">產生一個條件嵌入向量 (dimension=16)，用於 U-Net 模型</div>
+        </div>
+        
+        <div class="flow-section model-arch">
+            <h2>3. 模型架構</h2>
+            <div class="flow-item">核心模型: Denoising Diffusion Probabilistic Model (DDPM3D)</div>
+            <div class="flow-item">雜訊預測器: 使用 UNet3D 模型</div>
+            <div class="flow-item">U-Net 輸入: 沿著通道維度合併的張量，包含加噪後的人流圖 (x_t) 和條件嵌入向量</div>
+            <div class="flow-item">時間嵌入: 使用正弦時間嵌入將擴散步驟 t 轉換為嵌入向量</div>
+            <div class="flow-item">U-Net 輸出: 預測在時間步 t 加入到原始目標圖像上的雜訊</div>
+        </div>
+        
+        <div class="flow-section train-process">
+            <h2>4. 訓練過程</h2>
+            <div class="flow-item">取出數據點對應的 (小時, 是否假日)</div>
+            <div class="flow-item">找到對應的正規化後平均人流圖作為 x_start</div>
+            <div class="flow-item">隨機選擇擴散時間步 t，根據 t 和 x_start 計算加噪後的圖像 x_t</div>
+            <div class="flow-item">將 x_t、時間步 t 的嵌入、以及條件嵌入一起輸入 U-Net</div>
+            <div class="flow-item">模型學習在給定 x_t、t 和條件下，反推回原始加入的雜訊</div>
+            <div class="flow-item">損失函數: 使用均方誤差 (MSE)，計算預測雜訊與實際雜訊的差異</div>
+            <div class="flow-item">優化器: 使用 AdamW，學習率根據訓練損失動態調整</div>
+            <div class="flow-item">模型選擇: 保存驗證損失最低的模型狀態</div>
+            <div class="flow-item">早停機制: 如果訓練損失連續多個週期沒改善，則提前停止訓練</div>
+        </div>
+        
+        <div class="flow-section learn-outcome">
+            <h2>5. 學習成果</h2>
+            <div class="flow-item">模型學會了根據小時和是否為假日這兩個條件，生成對應的預期平均人流分佈圖</div>
+            <div class="flow-item">實質上學習了人流分佈 x 在給定條件下的條件機率分佈 p(x|hour,is_holiday)</div>
+            <div class="flow-item">在推論階段，給定條件，模型可以從隨機雜訊開始，逐步去噪，生成符合該條件的平均人流預測圖</div>
+        </div>
+    </div>
+</body>
+</html>

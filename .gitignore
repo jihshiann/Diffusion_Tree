@@ -373,3 +373,4 @@ FodyWeavers.xsd
 /env/Scripts/pip3.exe
 /DIFFUSION_TREE.pyproj
 /results_ddpm_conditioned_flow_taipei_extra_v2
+*.pth

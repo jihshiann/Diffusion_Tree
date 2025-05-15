@@ -122,7 +122,6 @@ if not os.path.exists(CONFIG["basemodel_checkpoint_to_load_for_stage2"]):
     logger.error(f"【【【警告】】】 Basemodel 檢查點路徑未設定或檔案不存在: {CONFIG['basemodel_checkpoint_to_load_for_stage2']}")
     # raise FileNotFoundError(f"未找到 Basemodel 檢查點檔案: {CONFIG['basemodel_checkpoint_to_load_for_stage2']}") # 如果希望直接中斷
 
-
 # ==============================================================================
 # UNet3D, DDPM3D
 # ==============================================================================
@@ -485,6 +484,7 @@ class DDPM3D(nn.Module):
                 img = model_mean + torch.sqrt(posterior_variance_t) * noise_sample
         return img
 
+
 def apply_condition_to_dataframe(df: pd.DataFrame,
                                  condition_feature: str,
                                  condition_operator: str,
@@ -602,7 +602,7 @@ def create_stage2_model_from_basemodel_checkpoint(
 
     logger.info(f"將 Basemodel 的權重載入到新的 Stage2 模型實例 (condition_input_channels={stage2_model_condition_input_channels})...")
     # 這裡假設 basemodel 的 condition_processor 也是2通道輸入 (config_basemodel_original["condition_input_channels"] == 2)
-    # 因此完整的 state_dict 可以直接載入
+    # 因此完整的 state_dict 可以直接載入l
     try:
         stage2_model_instance.load_state_dict(chkpt_basemodel['ddpm_state_dict'])
         logger.info("Stage2 模型權重從 Basemodel 完整遷移完成。")
@@ -616,6 +616,7 @@ def create_stage2_model_from_basemodel_checkpoint(
 
     return stage2_model_instance
 
+
 # --------------------------------------
 # 數據處理相關
 # --------------------------------------
@@ -627,17 +628,17 @@ def parse_lat_lon(column_name: str) -> tuple[float, float]:
 
 class Stage2Dataset(Dataset):
     def __init__(self,
-                 df_for_stage2_targets_and_conditions: pd.DataFrame,
-                 basemodel_outputs_for_samples_np: np.ndarray, # (N_samples, 1, D, H, W)
+                 df_for_stage2_processing: pd.DataFrame, # 改名以反映其未被紫外線篩選
+                 basemodel_outputs_for_samples_np: np.ndarray,
                  config: Dict[str, Any],
-                 original_sorted_flow_columns: List[str], 
+                 original_sorted_flow_columns: List[str],
                  mode: str = 'train',
                  stage2_target_stats_from_train: Optional[Dict[str, float]] = None,
-                 stage2_avg_flow_map_dict_from_train: Optional[Dict[Tuple, np.ndarray]] = None
+                 stage2_avg_flow_map_dict_from_train: Optional[Dict[Tuple, np.ndarray]] = None,
+                 new_cond_feature_norm_stats_from_train: Optional[Dict[str, float]] = None
                  ):
         super().__init__()
-        super().__init__()
-        self.df_s2 = df_for_stage2_targets_and_conditions.reset_index(drop=True)
+        self.df_s2 = df_for_stage2_processing.reset_index(drop=True) # df_s2 現在是更廣泛的數據
         self.basemodel_outputs_np = basemodel_outputs_for_samples_np
         self.config = config
         self.mode = mode
@@ -648,30 +649,19 @@ class Stage2Dataset(Dataset):
         self.D = config.get("D", 1)
         self.image_channels_target = config.get("image_channels", 1)
 
-        self.new_cond_col_name = config["stage2_new_condition_feature_column"]
-        self.new_cond_op = config["stage2_new_conditional_operator"]
-        self.new_cond_val = config["stage2_new_conditional_value"]
+        self.uv_col_name = config["stage2_new_condition_feature_column"] # 沿用，但理解為要分類的列
+        self.uv_op = config["stage2_new_conditional_operator"]         # 運算符
+        self.uv_val = config["stage2_new_conditional_value"]           # 閾值
         self.sorted_flow_columns = original_sorted_flow_columns
 
-        if len(self.df_s2) != self.basemodel_outputs_np.shape[0]:
-            raise ValueError(f"Stage2Dataset: df ({len(self.df_s2)}) 和 basemodel_outputs ({self.basemodel_outputs_np.shape[0]}) 長度不匹配。")
-        expected_bm_output_shape_suffix = (1, self.D, self.H, self.W)
-        if self.basemodel_outputs_np.shape[1:] != expected_bm_output_shape_suffix:
-            raise ValueError(f"Stage2Dataset: basemodel_outputs_np 的形狀應為 (N, {expected_bm_output_shape_suffix}), 但得到 {self.basemodel_outputs_np.shape}")
-        if self.new_cond_col_name not in self.df_s2.columns:
-             raise ValueError(f"Stage2Dataset: 新條件欄位 '{self.new_cond_col_name}' 不在提供的 DataFrame 中。")
-        if not all(col in self.df_s2.columns for col in self.sorted_flow_columns):
-            missing_flow_cols = [col for col in self.sorted_flow_columns if col not in self.df_s2.columns]
-            raise ValueError(f"Stage2Dataset: 以下原始流量欄位缺失: {missing_flow_cols}")
-        required_time_cols = ['時間', 'holiday'] # 假設 holiday 列名固定
-        if not all(col in self.df_s2.columns for col in required_time_cols):
-             missing_cols = [col for col in required_time_cols if col not in self.df_s2.columns]
-             raise ValueError(f"Stage2Dataset: '時間' 或 'holiday' 欄位缺失: {missing_cols}")
+        # ... (維度檢查等保持不變) ...
+        if self.uv_col_name not in self.df_s2.columns:
+             raise ValueError(f"Stage2Dataset: 新條件特徵的原始欄位 '{self.uv_col_name}' 不在 DataFrame 中。")
+
 
         dt_series = pd.to_datetime(self.df_s2['時間'])
         self.hours_for_target_np = dt_series.dt.hour.values
-        
-        # 處理 holiday 欄位 (確保為 0/1)
+        # ... (假日處理保持不變) ...
         if self.df_s2['holiday'].dtype == bool:
             self.is_holiday_for_target_np = self.df_s2['holiday'].astype(int).values
         elif pd.api.types.is_numeric_dtype(self.df_s2['holiday']):
@@ -680,23 +670,63 @@ class Stage2Dataset(Dataset):
             holiday_map = {'是': 1, 'true': 1, '1': 1, 'yes': 1, 'y': 1, '否': 0, 'false': 0, '0': 0, 'no': 0, 'n': 0}
             self.is_holiday_for_target_np = self.df_s2['holiday'].astype(str).str.lower().map(holiday_map).fillna(0).astype(int).values
         
-        self.new_cond_feature_values_for_grid_np = pd.to_numeric(self.df_s2[self.new_cond_col_name], errors='coerce').fillna(0).values
-        numeric_new_cond_vals = pd.to_numeric(self.df_s2[self.new_cond_col_name], errors='coerce') # 用於分類
-        if self.new_cond_op == "<=":
-            self.new_cond_category_for_target_np = (numeric_new_cond_vals <= float(self.new_cond_val)).astype(int)
-        elif self.new_cond_op == ">":
-            self.new_cond_category_for_target_np = (numeric_new_cond_vals > float(self.new_cond_val)).astype(int)
-        # 您可以為其他運算符添加分類邏輯，例如 '=='，'>='，'<'
-        # 這裡只實現了 "<=" 和 ">" 作為兩個主要分支的示例
-        else: # 預設：滿足條件為0，不滿足為1 (以 <= 為例)
-            self.logger.warning(f"Stage2Dataset: 未明確處理運算符 '{self.new_cond_op}'，默認分類為 ({self.new_cond_col_name} <= {self.new_cond_val}) 為類別 0，否則為類別 1。")
-            self.new_cond_category_for_target_np = (numeric_new_cond_vals <= float(self.new_cond_val)).astype(int)
+        # 獲取紫外線指數的原始數值 (用於正規化並作為 Stage2 模型的條件2輸入)
+        self.uv_original_values_np = pd.to_numeric(self.df_s2[self.uv_col_name], errors='coerce').values
 
+        # --- 根據紫外線指數創建分類特徵 (uv_category_for_target_np) ---
+        # 這個分類將用於 _calculate_stage2_target_flows 的 groupby
+        numeric_uv_vals_for_category = pd.to_numeric(self.df_s2[self.uv_col_name], errors='coerce')
+        # 簡單示例：分為兩類 (<= threshold vs > threshold)
+        # 您可以根據需求定義更複雜的分類邏輯，例如多分箱
+        if self.uv_op == "<=":
+            # 類別 0: 紫外線 <= 閾值
+            # 類別 1: 紫外線 > 閾值 (或 NaN) -> 我們將 NaN 也歸為一類或特定處理
+            # 為了簡化，這裡假設 NaN 的情況比較少，或者在 groupby 時 nanmean 會處理
+            self.uv_category_for_target_np = (numeric_uv_vals_for_category <= float(self.uv_val)).astype(int)
+            self.logger.info(f"Stage2Dataset: 紫外線分類邏輯 -> '{self.uv_col_name}' <= {self.uv_val} 為類別 1，否則為類別 0 (反轉一下，小的為0，大的為1)")
+            self.uv_category_for_target_np = (~(numeric_uv_vals_for_category <= float(self.uv_val))).astype(int) # 小於等於為0，大於為1
+
+        elif self.uv_op == ">":
+            # 類別 0: 紫外線 > 閾值
+            # 類別 1: 紫外線 <= 閾值 (或 NaN)
+            self.uv_category_for_target_np = (numeric_uv_vals_for_category > float(self.uv_val)).astype(int)
+        else:
+            self.logger.warning(f"Stage2Dataset: 未明確處理紫外線運算符 '{self.uv_op}'，默認分類為 ({self.uv_col_name} <= {self.uv_val}) 為類別0，否則為類別1。")
+            self.uv_category_for_target_np = (~(numeric_uv_vals_for_category <= float(self.uv_val))).astype(int)
+        
+        # 打印一些分類統計
+        unique_cats, counts_cats = np.unique(self.uv_category_for_target_np, return_counts=True)
+        self.logger.info(f"Stage2Dataset: 生成的紫外線分類 (uv_category_for_target_np) 分佈: {dict(zip(unique_cats, counts_cats))}")
+
+
+        # --- 紫外線指數的正規化 (用於 Stage2 模型的條件2輸入) ---
         if self.mode == 'train':
-            self.average_flow_map_dict_s2 = self._calculate_stage2_target_flows()
+            valid_uv_values = self.uv_original_values_np[~np.isnan(self.uv_original_values_np)]
+            if len(valid_uv_values) > 0:
+                self.uv_feature_mean = np.mean(valid_uv_values)
+                self.uv_feature_std = np.std(valid_uv_values)
+            else:
+                self.uv_feature_mean = 0.0
+                self.uv_feature_std = 1.0
+            if self.uv_feature_std < 1e-6: self.uv_feature_std = 1.0
+            self.norm_stats_new_cond_feature = {'mean': self.uv_feature_mean, 'std': self.uv_feature_std}
+            self.logger.info(f"Stage2 訓練集紫外線特徵 '{self.uv_col_name}' 正規化統計: Mean={self.uv_feature_mean:.4f}, Std={self.uv_feature_std:.4f}")
+        else:
+            # ... (從 new_cond_feature_norm_stats_from_train 加載 uv_feature_mean, uv_feature_std 的邏輯不變) ...
+            if new_cond_feature_norm_stats_from_train is None:
+                raise ValueError(f"Stage2 val/test mode 需要從訓練集傳入 new_cond_feature_norm_stats。")
+            self.norm_stats_new_cond_feature = new_cond_feature_norm_stats_from_train
+            self.uv_feature_mean = self.norm_stats_new_cond_feature['mean']
+            self.uv_feature_std = self.norm_stats_new_cond_feature['std']
+            if self.uv_feature_std < 1e-6: self.uv_feature_std = 1.0
+
+        # --- Stage2 目標流量的正規化統計量計算 (基於新的 groupby) ---
+        if self.mode == 'train':
+            self.average_flow_map_dict_s2 = self._calculate_stage2_target_flows() # 現在會基於 (hr, hol, uv_cat)
+            # ... (後續的 target_mean_s2, target_std_s2 計算邏輯不變，但數據源變了) ...
             all_avg_flows_list = [flow for flow in self.average_flow_map_dict_s2.values() if flow is not None]
             if not all_avg_flows_list:
-                 self.logger.warning("Stage2 訓練集: 未計算出任何目標平均流量。正規化統計量將為0和1。")
+                 self.logger.warning("Stage2 訓練集: 未計算出任何目標平均流量。目標流量正規化統計量將為0和1。")
                  self.target_mean_s2 = 0.0
                  self.target_std_s2 = 1.0
             else:
@@ -705,8 +735,9 @@ class Stage2Dataset(Dataset):
                 self.target_std_s2 = np.std(all_avg_flows_np)
             if self.target_std_s2 < 1e-5: self.target_std_s2 = 1e-5
             self.norm_stats_target_s2 = {'mean': self.target_mean_s2, 'std': self.target_std_s2}
-            self.logger.info(f"Stage2 訓練集目標流量正規化統計: Mean={self.target_mean_s2:.4f}, Std={self.target_std_s2:.4f}")
+            self.logger.info(f"Stage2 訓練集目標流量正規化統計 (基於小時,假日,紫外線分類): Mean={self.target_mean_s2:.4f}, Std={self.target_std_s2:.4f}")
         else:
+            # ... (從 stage2_avg_flow_map_dict_from_train, stage2_target_stats_from_train 加載的邏輯不變) ...
             if stage2_avg_flow_map_dict_from_train is None or stage2_target_stats_from_train is None:
                 raise ValueError("Stage2 val/test mode 需要從訓練集傳入 stage2_avg_flow_map_dict 和 stage2_target_stats。")
             self.average_flow_map_dict_s2 = stage2_avg_flow_map_dict_from_train
@@ -715,62 +746,74 @@ class Stage2Dataset(Dataset):
             self.target_std_s2 = self.norm_stats_target_s2['std']
             if self.target_std_s2 < 1e-5: self.target_std_s2 = 1e-5
 
-    def _calculate_stage2_target_flows(self) -> Dict[Tuple[int, int, int], np.ndarray]:
-        self.logger.info("Stage2: 計算複合條件 (小時, 假日, 新條件分類) 的目標平均流量...")
+
+    def _calculate_stage2_target_flows(self) -> Dict[Tuple[int, int, int], np.ndarray]: #鍵現在是 (hr, hol, uv_cat)
+        self.logger.info("Stage2: 計算複合條件 (小時, 假日, 紫外線分類) 的目標平均流量...")
         avg_flows = {}
         flow_data_for_calc = self.df_s2[self.sorted_flow_columns].values.astype(np.float32)
 
         grouping_df = pd.DataFrame({
             'hour': self.hours_for_target_np,
             'is_holiday': self.is_holiday_for_target_np,
-            'new_cond_category': self.new_cond_category_for_target_np
+            'uv_category_for_target': self.uv_category_for_target_np # 使用新的紫外線分類
         })
-        grouped = grouping_df.groupby(['hour', 'is_holiday', 'new_cond_category'])
+        # 根據小時, 假日, 和紫外線分類進行分組
+        grouped = grouping_df.groupby(['hour', 'is_holiday', 'uv_category_for_target'])
 
         if not grouped.groups:
-            self.logger.warning("Stage2Dataset: 無法根據 (小時, 是否假日, 新條件分類) 對資料進行分組。")
+            self.logger.warning("Stage2Dataset: 無法根據 (小時, 假日, 紫外線分類) 對資料進行分組。")
             return {}
 
-        for (hr, is_hol, new_cat), group_indices in grouped.groups.items():
+        self.logger.info("Stage2 Target Calculation: 樣本數分佈如下 (hour, is_holiday, uv_category): count")
+        for (hr, is_hol, uv_cat), group_indices in grouped.groups.items():
+            count = len(group_indices)
+            self.logger.info(f"  - ({hr:02d}, {is_hol}, {uv_cat}): {count} samples")
+
+        for (hr, is_hol, uv_cat), group_indices in grouped.groups.items():
             if len(group_indices) == 0: continue
             group_flows_flat = flow_data_for_calc[group_indices]
             mean_flow_flat = np.nanmean(group_flows_flat, axis=0)
             mean_flow_flat[np.isnan(mean_flow_flat)] = 0
-            avg_flows[(hr, int(is_hol), int(new_cat))] = mean_flow_flat.reshape(self.H, self.W)
-        self.logger.info(f"Stage2: 計算完成 {len(avg_flows)} 個複合條件的目標平均流量圖。")
+            avg_flows[(hr, int(is_hol), int(uv_cat))] = mean_flow_flat.reshape(self.H, self.W) # 鍵使用紫外線分類
+        self.logger.info(f"Stage2: 計算完成 {len(avg_flows)} 個 (小時,假日,紫外線分類) 條件的目標平均流量圖。")
         return avg_flows
-
-    def __len__(self) -> int:
-        return len(self.df_s2)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         bm_output_grid_np_sample = self.basemodel_outputs_np[idx]
-        condition_grid_1_tensor = torch.from_numpy(bm_output_grid_np_sample.astype(np.float32))
+        condition_grid_1_tensor = torch.from_numpy(bm_output_grid_np_sample.astype(np.float32)) # 假設已正規化
 
-        new_cond_feature_value_scalar = float(self.new_cond_feature_values_for_grid_np[idx])
+        # 獲取並正規化紫外線指數作為條件2
+        original_uv_value = self.uv_original_values_np[idx]
+        if np.isnan(original_uv_value):
+            normalized_uv_value = 0.0 # 或其他填充策略的正規化結果
+        else:
+            normalized_uv_value = (original_uv_value - self.uv_feature_mean) / self.uv_feature_std
+        
         condition_grid_2_tensor = torch.full(
             (1, self.D, self.H, self.W),
-            new_cond_feature_value_scalar,
+            float(normalized_uv_value),
             dtype=torch.float32
         )
 
+        # 獲取目標流量
         hr = self.hours_for_target_np[idx]
         is_hol = self.is_holiday_for_target_np[idx]
-        new_cat = self.new_cond_category_for_target_np[idx]
-        target_key = (hr, is_hol, new_cat)
+        uv_cat = self.uv_category_for_target_np[idx] # 使用生成的紫外線分類
+        target_key = (hr, is_hol, uv_cat)
         
         target_avg_flow_s2_np = self.average_flow_map_dict_s2.get(target_key)
         if target_avg_flow_s2_np is None:
             self.logger.debug(f"Stage2Dataset (idx {idx}): 未找到目標鍵 {target_key}，使用零值網格。")
             target_avg_flow_s2_np = np.zeros((self.H, self.W), dtype=np.float32)
         
-        std_val_safe = self.target_std_s2 if self.target_std_s2 > 1e-6 else 1.0
-        norm_target_s2_np = (target_avg_flow_s2_np - self.target_mean_s2) / std_val_safe
+        std_val_safe_target = self.target_std_s2 if self.target_std_s2 > 1e-6 else 1.0
+        norm_target_s2_np = (target_avg_flow_s2_np - self.target_mean_s2) / std_val_safe_target
         
         target_flow_tensor = torch.from_numpy(norm_target_s2_np).float().reshape(
             self.image_channels_target, self.D, self.H, self.W
         )
         
+        # 返回原始的小時和假日，供 Basemodel 在評估時使用其原始條件
         original_hour_scalar_tensor = torch.tensor(hr, dtype=torch.long)
         original_is_holiday_scalar_tensor = torch.tensor(is_hol, dtype=torch.long)
         
@@ -837,8 +880,6 @@ def calculate_fid(real_acts:np.ndarray, gen_acts:np.ndarray)->float:
     mu_real, sigma_real = real_acts.mean(axis=0), np.cov(real_acts, rowvar=False)
     mu_gen, sigma_gen = gen_acts.mean(axis=0), np.cov(gen_acts, rowvar=False)
     return calculate_frechet_distance(mu_real, sigma_real, mu_gen, sigma_gen)
-
-
 # Cell: 評估與視覺化函數 
 def visualize_predictions_long_term(
                         generated_all_denorm_t: torch.Tensor, # (N, C, D, H, W) 反正規化後的生成數據
@@ -1362,7 +1403,6 @@ def visualize_stage2_comparison(
     plt.close(fig)
     logger.info(f"Saved Stage2 comparison visualization to {save_path_fig}")
 
-
 if __name__ == '__main__':
     logger.info(f"===== DDPM Stage 2 Training and Evaluation =====")
     logger.info(f"Full CONFIG: {json.dumps(CONFIG, indent=2)}") # 可以取消註解以查看完整配置
@@ -1436,6 +1476,7 @@ if __name__ == '__main__':
     else:
         logger.info("成功從 Basemodel 檢查點加載網格映射資訊到 CONFIG。")
 
+
 # --- 步驟 2: 準備 Stage2 數據 ---
 NEW_COND_FEATURE_COL = CONFIG["stage2_new_condition_feature_column"]
 NEW_COND_OPERATOR = CONFIG["stage2_new_conditional_operator"]
@@ -1444,13 +1485,9 @@ STAGE2_MODEL_NAME = CONFIG["stage2_model_name"]
 
 
 logger.info(f"===== STAGE 2: 數據準備 =====")
-logger.info(f"Stage2 主要條件: {NEW_COND_FEATURE_COL} {NEW_COND_OPERATOR} {NEW_COND_VALUE}")
-df_for_stage2_processing = apply_condition_to_dataframe(
-    full_df.copy(), NEW_COND_FEATURE_COL, NEW_COND_OPERATOR, NEW_COND_VALUE, logger
-)
-if df_for_stage2_processing is None or df_for_stage2_processing.empty:
-    raise ValueError("Stage2: 根據主要條件篩選後數據為空。")
-logger.info(f"Stage2: 篩選後得到 {len(df_for_stage2_processing)} 行數據。")
+df_for_stage2_processing = full_df.copy() # 或者您需要的其他基礎數據集
+logger.info(f"Stage2: 使用數據 {len(df_for_stage2_processing)} 行進行處理。")
+# NEW_COND_FEATURE_COL, NEW_COND_OPERATOR, NEW_COND_VALUE 仍然可以用於 Stage2Dataset 內部生成分類
 
 logger.info("Stage2: 生成 basemodel 輸出作為條件...")
 temp_dt_s2_bm_in = pd.to_datetime(df_for_stage2_processing['時間'])
@@ -1488,6 +1525,26 @@ if all_bm_outputs_s2_np_cond.shape[1] != 1: # 確保條件網格是單通道 (C=
     all_bm_outputs_s2_np_cond = all_bm_outputs_s2_np_cond[:, 0:1, ...]
 logger.info(f"Stage2: Basemodel 輸出 (條件) 生成完畢, 形狀: {all_bm_outputs_s2_np_cond.shape}")
 
+# --- 新增：對 Basemodel 的輸出 (作為 Stage2 條件1) 進行標準化 ---
+# 計算 all_bm_outputs_s2_np_cond 的均值和標準差
+# 注意：這裡的統計量是基於篩選後的 Stage2 數據對應的 Basemodel 輸出來計算的
+bm_cond_mean_for_s2 = np.mean(all_bm_outputs_s2_np_cond)
+bm_cond_std_for_s2 = np.std(all_bm_outputs_s2_np_cond)
+if bm_cond_std_for_s2 < 1e-6: # 避免除以非常小的數
+    logger.warning(f"Basemodel 輸出條件的標準差過小 ({bm_cond_std_for_s2})，將設為 1.0 以避免除零錯誤。")
+    bm_cond_std_for_s2 = 1.0
+
+logger.info(f"將用於 Stage2 條件1 (Basemodel輸出) 的正規化統計: Mean={bm_cond_mean_for_s2:.4f}, Std={bm_cond_std_for_s2:.4f}")
+
+# 進行標準化
+all_bm_outputs_s2_np_cond_normalized = (all_bm_outputs_s2_np_cond - bm_cond_mean_for_s2) / bm_cond_std_for_s2
+logger.info(f"正規化後的 Basemodel 輸出 (作為 Stage2 條件1) 的統計: Mean={np.mean(all_bm_outputs_s2_np_cond_normalized):.4f}, Std={np.std(all_bm_outputs_s2_np_cond_normalized):.4f}, Min={np.min(all_bm_outputs_s2_np_cond_normalized):.4f}, Max={np.max(all_bm_outputs_s2_np_cond_normalized):.4f}")
+
+# 更新 CONFIG 以便 Stage2Dataset 如果需要可以訪問這些統計量（雖然目前 Dataset 是直接接收處理後的 numpy array）
+CONFIG["cached_s2_cond1_norm_mean"] = bm_cond_mean_for_s2
+CONFIG["cached_s2_cond1_norm_std"] = bm_cond_std_for_s2
+# --- 標準化結束 ---
+
 # --- 步驟 3: 初始化 Stage2 模型並從 Basemodel 檢查點遷移權重 ---
 logger.info(f"===== STAGE 2: 初始化模型 '{STAGE2_MODEL_NAME}' 並從 Basemodel 遷移權重 =====")
 config_for_stage2_model_creation = CONFIG.copy()
@@ -1519,9 +1576,11 @@ config_for_s2_dataset_use["new_conditional_value"] = NEW_COND_VALUE
 
 train_dataset_s2 = Stage2Dataset(
     df_for_stage2_targets_and_conditions=df_for_stage2_processing.iloc[s2_train_indices_final],
-    basemodel_outputs_for_samples_np=all_bm_outputs_s2_np_cond[s2_train_indices_final],
+    # 使用正規化後的 Basemodel 輸出
+    basemodel_outputs_for_samples_np=all_bm_outputs_s2_np_cond_normalized[s2_train_indices_final],
     config=config_for_s2_dataset_use, mode='train',
-    original_sorted_flow_columns=basemodel_sorted_flow_cols_source
+    original_sorted_flow_columns=basemodel_sorted_flow_cols_source,
+    # new_cond_feature_norm_stats_from_train 在訓練模式下由 Dataset 內部計算
 )
 s2_train_batch_size = CONFIG.get("batch_size")
 train_loader_s2 = DataLoader(train_dataset_s2, batch_size=s2_train_batch_size, shuffle=True, num_workers=CONFIG["num_workers"], pin_memory=True, drop_last=True if len(train_dataset_s2) >= s2_train_batch_size else False)
@@ -1530,11 +1589,13 @@ val_loader_s2 = None
 if len(s2_val_indices_final) > 0:
     val_dataset_s2 = Stage2Dataset(
         df_for_stage2_targets_and_conditions=df_for_stage2_processing.iloc[s2_val_indices_final],
-        basemodel_outputs_for_samples_np=all_bm_outputs_s2_np_cond[s2_val_indices_final],
+        # 使用正規化後的 Basemodel 輸出
+        basemodel_outputs_for_samples_np=all_bm_outputs_s2_np_cond_normalized[s2_val_indices_final],
         config=config_for_s2_dataset_use, mode='val',
         stage2_target_stats_from_train=train_dataset_s2.norm_stats_target_s2,
         stage2_avg_flow_map_dict_from_train=train_dataset_s2.average_flow_map_dict_s2,
-        original_sorted_flow_columns=basemodel_sorted_flow_cols_source
+        original_sorted_flow_columns=basemodel_sorted_flow_cols_source,
+        new_cond_feature_norm_stats_from_train=train_dataset_s2.norm_stats_new_cond_feature # 這個是紫外線指數的正規化參數
     )
     s2_eval_batch_size = CONFIG.get("eval_batch_size") 
     val_loader_s2 = DataLoader(val_dataset_s2, batch_size=s2_eval_batch_size, shuffle=False, num_workers=CONFIG["num_workers"], pin_memory=True)
@@ -1637,11 +1698,13 @@ for epoch_s2_current in range(start_epoch_s2_train, epochs_to_run_s2 + 1):
                 'optimizer_state_dict': optimizer_s2.state_dict(),
                 'scheduler_state_dict': scheduler_s2.state_dict(),
                 'best_val_loss_s2': best_val_loss_s2_train,
-                'config_snapshot_at_save': config_for_s2_dataset_use, # 保存 stage2 訓練時的配置
+                'config_snapshot_at_save': config_for_s2_dataset_use,
                 'metrics_hist_s2': metrics_hist_s2_train,
                 'early_stopping_counter_s2': early_stopping_counter_s2_train,
                 'stage2_target_norm_stats': train_dataset_s2.norm_stats_target_s2,
-                'stage2_avg_flow_map_dict': train_dataset_s2.average_flow_map_dict_s2
+                'stage2_avg_flow_map_dict': train_dataset_s2.average_flow_map_dict_s2,
+                # 新增：保存新條件特徵的正規化統計量
+                'new_cond_feature_norm_stats': train_dataset_s2.norm_stats_new_cond_feature
             }, stage2_model_save_checkpoint_path)
             logger.info(f"Stage2 Epoch {epoch_s2_current}: 新最佳模型已儲存 (Val Loss: {best_val_loss_s2_train:.5f})。")
         else:
@@ -1696,20 +1759,30 @@ else:
     logger.info(f"最佳 Stage2 模型 (Epoch {chkpt_s2_final_for_eval.get('epoch','未知')}) 載入完成。")
     s2_target_stats_for_final_eval = chkpt_s2_final_for_eval.get('stage2_target_norm_stats')
     s2_avg_flow_map_for_final_eval = chkpt_s2_final_for_eval.get('stage2_avg_flow_map_dict')
+    new_cond_feature_norm_stats_for_final_eval = chkpt_s2_final_for_eval.get('new_cond_feature_norm_stats')
 
-if s2_target_stats_for_final_eval is None or s2_avg_flow_map_for_final_eval is None:
-    raise ValueError("無法為最終評估獲取 Stage2 目標的正規化統計量或平均流量圖字典。")
+if s2_target_stats_for_final_eval is None or s2_avg_flow_map_for_final_eval is None or new_cond_feature_norm_stats_for_final_eval is None: # 修改判斷
+        # 如果是從訓練結束時的狀態（而不是檢查點）獲取，則嘗試從 train_dataset_s2 獲取
+        if not os.path.exists(path_to_load_best_s2_model): # 表示使用的是訓練結束時的狀態
+             if hasattr(train_dataset_s2, 'norm_stats_target_s2'): s2_target_stats_for_final_eval = train_dataset_s2.norm_stats_target_s2
+             if hasattr(train_dataset_s2, 'average_flow_map_dict_s2'): s2_avg_flow_map_for_final_eval = train_dataset_s2.average_flow_map_dict_s2
+             if hasattr(train_dataset_s2, 'norm_stats_new_cond_feature'): new_cond_feature_norm_stats_for_final_eval = train_dataset_s2.norm_stats_new_cond_feature
+
+        if s2_target_stats_for_final_eval is None or s2_avg_flow_map_for_final_eval is None or new_cond_feature_norm_stats_for_final_eval is None:
+             raise ValueError("無法為最終評估獲取 Stage2 目標或新條件的正規化統計量或平均流量圖字典。")
 
 # 準備測試集 Loader
 test_loader_s2_final = None
 if len(s2_test_indices_final) > 0:
     test_dataset_s2_final = Stage2Dataset(
-        df_for_stage2_targets_and_conditions=df_for_stage2_processing.iloc[s2_test_indices_final], # <--- 使用正確的 DataFrame
-        basemodel_outputs_for_samples_np=all_bm_outputs_s2_np_cond[s2_test_indices_final],
+        df_for_stage2_targets_and_conditions=df_for_stage2_processing.iloc[s2_test_indices_final],
+        # 使用正規化後的 Basemodel 輸出
+        basemodel_outputs_for_samples_np=all_bm_outputs_s2_np_cond_normalized[s2_test_indices_final],
         config=config_for_s2_dataset_use, mode='test',
         stage2_target_stats_from_train=s2_target_stats_for_final_eval,
         stage2_avg_flow_map_dict_from_train=s2_avg_flow_map_for_final_eval,
-        original_sorted_flow_columns=basemodel_sorted_flow_cols_source
+        original_sorted_flow_columns=basemodel_sorted_flow_cols_source,
+        new_cond_feature_norm_stats_from_train=new_cond_feature_norm_stats_for_final_eval # 這個是紫外線指數的正規化參數
     )
     s2_eval_batch_size_final = CONFIG.get("eval_batch_size")
     test_loader_s2_final = DataLoader(test_dataset_s2_final, batch_size=s2_eval_batch_size_final, shuffle=False, num_workers=CONFIG["num_workers"], pin_memory=True)

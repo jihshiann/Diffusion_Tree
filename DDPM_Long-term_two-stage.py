@@ -1259,7 +1259,44 @@ def evaluate_stage2_models(
             f"{prefix}_basemodel"
         )
 
-    return results, error_grids_all_models
+    if "stage2_model" in error_grids_all_models and "basemodel_on_s2_data" in error_grids_all_models:
+        s2_errors = error_grids_all_models["stage2_model"]      # Dict[str, np.ndarray]
+        bm_errors = error_grids_all_models["basemodel_on_s2_data"] # Dict[str, np.ndarray]
+        
+        error_metrics_difference_grids = {} # 用於存儲差異指標網格
+
+        for metric_key in ['MSE', 'MAE', 'MAPE', 'SMAPE']:
+            if metric_key in s2_errors and metric_key in bm_errors:
+                s2_metric_grid = s2_errors[metric_key]
+                bm_metric_grid = bm_errors[metric_key]
+
+                if isinstance(s2_metric_grid, np.ndarray) and isinstance(bm_metric_grid, np.ndarray) and \
+                   s2_metric_grid.shape == bm_metric_grid.shape and \
+                   s2_metric_grid.shape[0] == config["H"] * config["W"]:
+                    
+                    # 計算差異： Stage2 Error - Basemodel Error
+                    # 正值表示 Stage2 在該網格的該指標上誤差更大 (表現更差)
+                    # 負值表示 Stage2 在該網格的該指標上誤差更小 (表現更好)
+                    difference_grid = s2_metric_grid - bm_metric_grid
+                    error_metrics_difference_grids[f"Diff_{metric_key}_(S2-BM)"] = difference_grid
+                else:
+                    logger.warning(f"無法計算指標 '{metric_key}' 的差異網格，"
+                                   f"因為 Stage2 或 Basemodel 的誤差網格缺失、類型錯誤或形狀不匹配。")
+            else:
+                logger.warning(f"指標 '{metric_key}' 在 Stage2 或 Basemodel 的誤差網格中缺失，無法計算差異。")
+
+        if error_metrics_difference_grids:
+            logger.info(f"為 Stage2 vs Basemodel 的誤差指標差異生成地理熱力圖 ({prefix})...")
+            plot_grid_with_error_long_term(
+                dataset_s2_obj,  # 或 config，取決於 plot_grid_with_error_long_term 的實現
+                error_metrics_difference_grids,
+                config,
+                f"{prefix}_diff_S2_minus_BM" # 新的檔名前綴
+            )
+        else:
+            logger.info(f"沒有可繪製的 Stage2 vs Basemodel 誤差指標差異網格 ({prefix})。")
+
+    return results, error_grids_all_models # 保持函數原始返回
 
 def visualize_stage2_comparison(
     stage2_model_pred_denorm: torch.Tensor,

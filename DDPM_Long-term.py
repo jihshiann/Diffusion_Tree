@@ -19,30 +19,30 @@ from torchvision import transforms
 from torchvision.models import inception_v3, Inception_V3_Weights
 from scipy.optimize import linear_sum_assignment # 用於匈牙利演算法
 from typing import Optional, Tuple, List, Dict, Any
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
-
-# ==============================================================================
-# 日誌設定
-# ==============================================================================
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
 
 # ==============================================================================
 # 組態設定
 # ==============================================================================
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
 CONFIG = {
     # --- 資料參數 ---
-    "data_path": "all_merged_sample.csv", # 資料路徑
+    "data_path": r"C:\thesis\code\Taipei_CF\all_merged.csv", # 資料路徑
     "H": 20, # 網格高度
     "W": 20, # 網格寬度
     "D": 1,  # 網格深度 (流量圖為1)
 
     # --- 模型參數 ---
     "image_channels": 1,      # 主要資料(流量圖)的通道數
-    "condition_input_channels": 2, # 條件處理器接收的原始條件通道數 (小時網格 + 星期網格)
+    "condition_input_channels": 2, # 條件處理器接收的原始條件通道數 (小時網格 + 是否假日網格)
     "condition_encode_dim": 16, # 條件處理器輸出的特徵維度 (可調)
     "base_channels_unet": 64,   # UNet3D 的基礎通道數
+    "unet_dropout_rate": 0.1,
     "time_emb_dim": 256,        # 時間嵌入維度
+    "val_calculation_freq": 4, #驗證損失計算的頻率
 
     # --- DDPM 參數 ---
     "timesteps": 1000,          # 擴散時間步長
@@ -50,23 +50,31 @@ CONFIG = {
     "beta_end": 0.02,
 
     # --- 訓練參數 ---
-    "epochs": 200, # 可調整
-    "batch_size": 16, # 依 GPU 記憶體調整
-    "lr": 1e-4, # 學習率
+    "epochs": 128, # 可調整
+    "batch_size": 128, # 依 GPU 記憶體調整
+    "lr": 1e-3, # 學習率
     "num_workers": 0, # DataLoader 工作執行緒 (Windows 建議 0, Linux 可 >0)
     "device": "cuda" if torch.cuda.is_available() else "cpu",
     "seed": 42, # 隨機種子
+    "weight_decay": 1e-5, # 優化器的權重衰減 
+    "lr_scheduler_factor": 0.5, # ReduceLROnPlateau: 學習率降低因子
+    "lr_scheduler_patience": 4,   # ReduceLROnPlateau: 多少個 epoch 驗證損失未改善則降低學習率
+    "lr_scheduler_min_lr": 1e-6,  # ReduceLROnPlateau: 學習率下限
+    "early_stopping_patience": 8, # 早停: 多少個 epoch 驗證損失未改善則停止訓練 
+    "lr_reductions_before_val_decision": 3, # 學習率調降幾次後，才開始用驗證損失做早停和模型選擇的決策
+    "resume_from_checkpoint": True,  # 是否嘗試從檢查點恢復訓練
+    "checkpoint_path": "best_ddpm_model_during_training.pth", #預設使用的檢查點檔案名
 
     # --- 評估參數 ---
-    "eval_batch_size": 16,
-    "fid_batch_size": 32,
-    "fid_num_samples": 500, # FID 計算樣本數
+    "eval_batch_size": 32,
+    "fid_batch_size": 64,
+    "fid_num_samples": 128, # FID 計算樣本數
 
     # --- 路徑與儲存 ---
     "save_dir": "results_ddpm_conditioned_flow_taipei_extra_v2", # 結果儲存目錄
     "plot_grid_mapping_path": "grid_mapping_visualization_taipei.png", # 網格映射視覺化圖片路徑
-    "train_split_ratio": 0.7, # 訓練集比例 (新增)
-    "val_split_ratio": 0.15,  # 驗證集比例 (新增)
+    "train_split_ratio": 0.7, # 訓練集比例
+    "val_split_ratio": 0.15,  # 驗證集比例
 }
 
 os.makedirs(CONFIG["save_dir"], exist_ok=True)
@@ -79,21 +87,27 @@ if CONFIG["device"] == "cuda":
     torch.cuda.manual_seed_all(CONFIG["seed"])
 logger.info(f"使用裝置: {CONFIG['device']}")
 
-# ==============================================================================
-# 資料集類別 (PeopleFlowDatasetCondition)
-# ==============================================================================
+# --------------------------------------
+# 數據處理相關
+# --------------------------------------
+def parse_lat_lon(column_name: str) -> tuple[float, float]:
+    match = re.search(r'\(([\d.-]+),\s*([\d.-]+)\)', column_name)
+    if match:
+        return float(match.group(1)), float(match.group(2))
+    raise ValueError(f"欄位名稱格式無效：{column_name}")
+
 class PeopleFlowDatasetCondition(Dataset):
     def __init__(self,
-                 df: pd.DataFrame,
+                 df: pd.DataFrame, # 傳入 DataFrame 物件
                  config: Dict[str, Any],
                  mode: str = 'train',
                  # 驗證/測試模式下，由訓練資料集實例傳入
                  average_flow_map_dict: Optional[Dict[Tuple[int, int], np.ndarray]] = None,
-                 norm_stats_flow: Optional[Dict[str, float]] = None, # 流量資料標準化用
-                 sorted_flow_columns: Optional[List[str]] = None,
-                 grid_idx_to_rc_map: Optional[Dict[int, Tuple[int,int]]] = None,
-                 # extra_cont_mean, extra_cont_std 不再使用 (額外資料未標準化)
-                 processed_extra_columns: Optional[List[str]] = None # 已處理額外資料欄位名稱
+                 norm_stats_flow: Optional[Dict[str, float]] = None,
+                 sorted_flow_columns_from_train: Optional[List[str]] = None,
+                 grid_idx_to_rc_map_from_train: Optional[Dict[int, Tuple[int,int]]] = None,
+                 processed_extra_columns_from_train: Optional[List[str]] = None,
+                 selected_sensor_info_from_train: Optional[List[Dict[str, Any]]] = None
                 ):
         super().__init__()
         self.df_original = df.reset_index(drop=True)
@@ -101,94 +115,201 @@ class PeopleFlowDatasetCondition(Dataset):
         self.mode = mode
         self.H = config["H"]
         self.W = config["W"]
-        self.D = config["D"]
-        self.image_channels = config["image_channels"]
+        self.D = config.get("D", 1)
+        self.image_channels = config.get("image_channels", 1)
         self.num_grid_cells = self.H * self.W
+        logger = logging.getLogger(__name__) # 確保 logger 可用
 
-        # --- 時間解析 (從原始 DATATIME) ---
-        if 'DATATIME' not in self.df_original.columns:
-            raise ValueError("資料中未找到 'DATATIME' 欄位。")
-        try:
-            df_datetime_processed = self.df_original.copy()
-            df_datetime_processed['DATATIME'] = pd.to_datetime(df_datetime_processed['DATATIME'])
-            self.hours_original_np = df_datetime_processed['DATATIME'].dt.hour.values
-            self.day_of_week_original_np = df_datetime_processed['DATATIME'].dt.dayofweek.values
-        except Exception as e:
-            raise ValueError(f"無法解析 'DATATIME' 欄位: {e}。")
+        # --- 時間解析 ---
+        actual_datetime_col = '時間'
+        if actual_datetime_col not in self.df_original.columns:
+            raise ValueError(f"資料中未找到指定的日期時間欄位 '{actual_datetime_col}'。")
+        df_datetime_processed = self.df_original.copy()
+        df_datetime_processed[actual_datetime_col] = pd.to_datetime(df_datetime_processed[actual_datetime_col])
+        
+        self.hours_original_np = df_datetime_processed[actual_datetime_col].dt.hour.values
+        # day_of_week_original_np 仍然被解析，但主要用於 average_flow_map_dict 的鍵
+        self.day_of_week_original_np = df_datetime_processed[actual_datetime_col].dt.dayofweek.values
 
-        # --- 處理額外資料 (氣象、假日、時間特徵等) ---
+        # --- 新增：明確儲存假日狀態 ---
+        holiday_col_name = 'holiday' # <--- 確認你的假日欄位名稱
+        if holiday_col_name not in self.df_original.columns:
+             if "hoilday" in self.df_original.columns: # 嘗試修正可能的拼寫錯誤
+                 logger.warning(f"找到 'hoilday' 欄位，將其更名為 'holiday'。")
+                 self.df_original.rename(columns={"hoilday": "holiday"}, inplace=True)
+                 df_datetime_processed.rename(columns={"hoilday": "holiday"}, inplace=True) # 同步修改複製的df
+             else:
+                 raise ValueError(f"資料中未找到指定的假日欄位 '{holiday_col_name}'。")
+
+        # 確保假日欄位是數值 0 或 1
+        if self.df_original[holiday_col_name].dtype == bool:
+            self.is_holiday_original_np = self.df_original[holiday_col_name].astype(int).values
+        elif pd.api.types.is_numeric_dtype(self.df_original[holiday_col_name]):
+             unique_holiday_vals = self.df_original[holiday_col_name].dropna().unique()
+             if not all(np.isclose(v, 0) or np.isclose(v, 1) for v in unique_holiday_vals if not np.isnan(v)): # 排除NaN再比較
+                 logger.warning(f"假日欄位 '{holiday_col_name}' 包含非 0 或 1 的數值: {unique_holiday_vals[:10]}... "
+                                f"將把非0值視為1(假日)，0值視為0(非假日)。請確認此邏輯。")
+             # 將非0值視為1 (假日)，0值視為0 (非假日)，缺失值填0
+             self.is_holiday_original_np = self.df_original[holiday_col_name].fillna(0).astype(bool).astype(int).values
+        else: # 其他類型，嘗試轉換
+            try:
+                # 先嘗試將常見的文字表示轉為0/1
+                if self.df_original[holiday_col_name].dtype == object:
+                    # 假設 '是', 'True', '1', 'Y', 'Yes' 代表假日
+                    holiday_map = {
+                        '是': 1, 'true': 1, '1': 1, 'yes': 1, 'y': 1,
+                        '否': 0, 'false': 0, '0': 0, 'no': 0, 'n': 0
+                    }
+                    # 先轉小寫處理
+                    temp_series = self.df_original[holiday_col_name].astype(str).str.lower().map(holiday_map)
+                else:
+                    temp_series = pd.Series(np.nan, index=self.df_original.index) # 初始化為 NaN
+
+                # 對於未能通過 map 轉換的值 (即仍為 NaN 的)，再嘗試 pd.to_numeric
+                numeric_conversion_needed_mask = temp_series.isna()
+                if numeric_conversion_needed_mask.any():
+                    numeric_converted_part = pd.to_numeric(self.df_original.loc[numeric_conversion_needed_mask, holiday_col_name], errors='coerce')
+                    temp_series.loc[numeric_conversion_needed_mask] = numeric_converted_part
+                
+                num_failed_conversions = temp_series.isna().sum() - self.df_original[holiday_col_name].isna().sum() # 計算新產生的NaN
+                self.is_holiday_original_np = temp_series.fillna(0).astype(bool).astype(int).values # 最終轉換為 0/1
+                
+                if num_failed_conversions > 0:
+                    logger.warning(f"假日欄位 '{holiday_col_name}' 包含無法直接解析為0/1的值，已嘗試轉換，其中 {num_failed_conversions} 個值被視為 0 (非假日)。")
+            except Exception as e:
+                raise TypeError(f"無法處理假日欄位 '{holiday_col_name}' 的資料型態。請確保它是數值 (0/1)、布林值或可明確轉換的文字。錯誤: {e}")
+        logger.info(f"已處理 'is_holiday_original_np'，其中假日 (1) 的數量: {np.sum(self.is_holiday_original_np)}, "
+                    f"非假日 (0) 的數量: {len(self.is_holiday_original_np) - np.sum(self.is_holiday_original_np)}")
+
+
+        # --- 處理額外資料 (這部分通常不變) ---
         df_for_extra_processing = self.df_original.copy()
+        if actual_datetime_col in df_for_extra_processing.columns:
+            temp_dt_series = pd.to_datetime(df_for_extra_processing[actual_datetime_col], errors='coerce')
+            if temp_dt_series.notna().all(): # 確保轉換成功
+                df_for_extra_processing['年'] = temp_dt_series.dt.year
+                df_for_extra_processing['月'] = temp_dt_series.dt.month
+                df_for_extra_processing['日'] = temp_dt_series.dt.day
+                df_for_extra_processing['時'] = temp_dt_series.dt.hour 
+                df_for_extra_processing['weekday'] = temp_dt_series.dt.dayofweek
+            else:
+                logger.error(f"df_for_extra_processing 中時間欄位 '{actual_datetime_col}' 包含無法解析的日期，額外時間特徵可能不正確。")
+        else:
+            logger.warning(f"df_for_extra_processing 中未找到時間欄位 '{actual_datetime_col}'，部分額外時間特徵可能無法生成。")
 
-        temp_dt_series = pd.to_datetime(df_for_extra_processing['DATATIME'])
-        df_for_extra_processing['年'] = temp_dt_series.dt.year
-        df_for_extra_processing['月'] = temp_dt_series.dt.month
-        df_for_extra_processing['日'] = temp_dt_series.dt.day
-        df_for_extra_processing['時'] = temp_dt_series.dt.hour # 原始小時
-        df_for_extra_processing['weekday'] = temp_dt_series.dt.dayofweek # 原始星期
-
-        self.extra_cols_list_definition = [
+        self.extra_cols_list_definition = config.get("extra_features_definition_list", [
             "測站氣壓", "海平面氣壓", "氣溫", "露點溫度", "相對溼度", "風速", "最大陣風",
             "降水量", "降水時數", "日照時數", "全天空日射量", "能見度", "紫外線指數", "總雲量",
-            "holiday", "weekday", "年", "月", "日", "時"
-        ]
+            "holiday", "weekday", "年", "月", "日", "時" 
+        ])
         wind_cols_to_process = []
         if '風向' in df_for_extra_processing.columns: wind_cols_to_process.append('風向')
         if '最大陣風風向' in df_for_extra_processing.columns: wind_cols_to_process.append('最大陣風風向')
-
         for col in wind_cols_to_process:
-            df_for_extra_processing[f'sin_{col}'] = np.sin(np.deg2rad(df_for_extra_processing[col]))
-            df_for_extra_processing[f'cos_{col}'] = np.cos(np.deg2rad(df_for_extra_processing[col]))
-            if f'sin_{col}' not in self.extra_cols_list_definition: self.extra_cols_list_definition.append(f'sin_{col}')
-            if f'cos_{col}' not in self.extra_cols_list_definition: self.extra_cols_list_definition.append(f'cos_{col}')
-
+            # 嘗試轉換風向欄位為數值，處理可能的錯誤
+            try:
+                df_for_extra_processing[col] = pd.to_numeric(df_for_extra_processing[col], errors='coerce').fillna(0) # 填充無法轉換的為0
+                df_for_extra_processing[f'sin_{col}'] = np.sin(np.deg2rad(df_for_extra_processing[col].astype(float)))
+                df_for_extra_processing[f'cos_{col}'] = np.cos(np.deg2rad(df_for_extra_processing[col].astype(float)))
+                if f'sin_{col}' not in self.extra_cols_list_definition: self.extra_cols_list_definition.append(f'sin_{col}')
+                if f'cos_{col}' not in self.extra_cols_list_definition: self.extra_cols_list_definition.append(f'cos_{col}')
+            except Exception as e:
+                logger.warning(f"處理風向欄位 {col} 時出錯: {e}. 將跳過此欄位的 sin/cos 轉換。")
         self.extra_cols_list_definition = [col for col in self.extra_cols_list_definition if col not in ['風向', '最大陣風風向']]
         
-        # 確保只選取實際存在的欄位
         present_extra_cols = [col for col in self.extra_cols_list_definition if col in df_for_extra_processing.columns]
         df_extra_subset = df_for_extra_processing[present_extra_cols].copy()
-
-
-        if "hoilday" in df_extra_subset.columns: # 修正可能的錯字
+        
+        if "hoilday" in df_extra_subset.columns and "holiday" not in df_extra_subset.columns:
             df_extra_subset.rename(columns={"hoilday": "holiday"}, inplace=True)
 
-        cat_features = ['holiday'] # 分類特徵
+        cat_features = []
+        if 'holiday' in present_extra_cols: cat_features.append('holiday')
+        if 'weekday' in present_extra_cols: cat_features.append('weekday')
+        
         actual_cat_features = [col for col in cat_features if col in df_extra_subset.columns]
-
         if actual_cat_features:
             df_extra_subset[actual_cat_features] = df_extra_subset[actual_cat_features].astype(str)
             df_cat = pd.get_dummies(df_extra_subset[actual_cat_features], prefix=actual_cat_features, dummy_na=False)
         else:
-            df_cat = pd.DataFrame(index=df_extra_subset.index)
-
+            df_cat = pd.DataFrame(index=df_extra_subset.index) # 確保索引對齊
+        
         df_cont = df_extra_subset.drop(columns=actual_cat_features, errors='ignore')
+        # 確保 df_cont 中的所有欄位都是數值型態，並填充 NaN
+        for col in df_cont.columns:
+            if not pd.api.types.is_numeric_dtype(df_cont[col]):
+                df_cont[col] = pd.to_numeric(df_cont[col], errors='coerce')
+        df_cont = df_cont.fillna(0)
 
-        # 連續額外特徵不進行標準化
-        df_extra_processed = pd.concat([df_cont, df_cat], axis=1) # 使用原始連續 + one-hot 分類
+        df_extra_processed = pd.concat([df_cont, df_cat], axis=1)
 
         if self.mode == 'train':
             self.processed_extra_columns = list(df_extra_processed.columns)
-            self.processed_extra_data_np = df_extra_processed.fillna(0).values.astype(np.float32)
-            logger.info(f"訓練集: 已處理 {len(self.processed_extra_columns)} 個額外特徵 (連續特徵未標準化)。")
+            self.processed_extra_data_np = df_extra_processed.values.astype(np.float32) # fillna(0) 已在上一步驟對 df_cont 完成
+            logger.info(f"訓練集: 已處理 {len(self.processed_extra_columns)} 個額外特徵。")
         else:
-            if processed_extra_columns is None:
-                raise ValueError("驗證/測試模式，必須提供 processed_extra_columns。")
-            self.processed_extra_columns = processed_extra_columns
-            # 確保欄位順序一致並填補缺失值 (例如 one-hot)
+            if processed_extra_columns_from_train is None:
+                raise ValueError("驗證/測試模式，必須提供 processed_extra_columns_from_train。")
+            self.processed_extra_columns = processed_extra_columns_from_train
             df_extra_processed = df_extra_processed.reindex(columns=self.processed_extra_columns, fill_value=0)
-            self.processed_extra_data_np = df_extra_processed.fillna(0).values.astype(np.float32)
-            logger.info(f"{self.mode} 資料集: 已處理額外特徵 (連續特徵未標準化)。")
-
-        # --- 流量資料網格映射與平均值計算 ---
+            self.processed_extra_data_np = df_extra_processed.values.astype(np.float32) # fillna(0) 已在上一步驟對 df_cont 完成，reindex 會用 fill_value=0 處理新欄位
+            logger.info(f"{self.mode} 資料集: 已處理額外特徵。")
+            
         if self.mode == 'train':
-            all_available_sensor_info = self._extract_all_sensor_info_from_csv()
-            self.selected_sensor_info, selected_real_coords_np = self._select_sensors(all_available_sensor_info)
-            self.grid_target_coords, self.grid_idx_to_rc_map = self._define_target_grid_cells_hierarchical_style(selected_real_coords_np)
+            all_flow_columns_with_coords = [c for c in self.df_original.columns if '(' in c and ')' in c]
+            logger.info(f"從欄位名稱中找到 {len(all_flow_columns_with_coords)} 個可能的流量/座標欄位。")
+            num_required_points = self.H * self.W
+            if len(all_flow_columns_with_coords) < num_required_points:
+                raise ValueError(
+                    f"網格大小 ({self.H}x{self.W}={num_required_points}) 大於了可用的地理座標點數量 ({len(all_flow_columns_with_coords)}). "
+                    "請減少 H*W 或提供更多座標點。"
+                )
+            all_column_info_list = []
+            for col_name in all_flow_columns_with_coords:
+                try:
+                    lon, lat = parse_lat_lon(col_name)
+                    all_column_info_list.append({'name': col_name, 'lon': lon, 'lat': lat})
+                except ValueError as e:
+                    logger.warning(f"無法解析欄位 '{col_name}' 的座標: {e}。將跳過此欄位。")
+
+            if len(all_column_info_list) < num_required_points:
+                 raise ValueError(
+                    f"成功解析的地理座標點數量 ({len(all_column_info_list)}) 不足所需的網格點 ({num_required_points})。請檢查資料欄位格式或減少 H*W。"
+                )
+            all_coords_np = np.array([(info['lon'], info['lat']) for info in all_column_info_list])
+            self.selected_sensor_info = []
+            selected_real_coords_np_for_grid_def = None
+            if len(all_column_info_list) > num_required_points:
+                logger.info(f"座標點數量 ({len(all_column_info_list)}) 多於網格數 ({num_required_points}). "
+                             f"將選擇最靠近地理中心的 {num_required_points} 個座標點進行映射。")
+                geometric_center_lon = np.mean(all_coords_np[:, 0])
+                geometric_center_lat = np.mean(all_coords_np[:, 1])
+                distances_to_geometric_center = np.sqrt(
+                    (all_coords_np[:, 0] - geometric_center_lon)**2 +
+                    (all_coords_np[:, 1] - geometric_center_lat)**2
+                )
+                selected_indices = np.argsort(distances_to_geometric_center)[:num_required_points]
+                self.selected_sensor_info = [all_column_info_list[i] for i in selected_indices]
+                selected_real_coords_np_for_grid_def = all_coords_np[selected_indices]
+            else:
+                self.selected_sensor_info = all_column_info_list
+                selected_real_coords_np_for_grid_def = all_coords_np
+            logger.info(f"已選定 {len(self.selected_sensor_info)} 個感測器進行網格映射。")
+
+            if selected_real_coords_np_for_grid_def is None or selected_real_coords_np_for_grid_def.shape[0] != num_required_points:
+                 raise ValueError(f"用於定義網格的選定座標點數量 ({selected_real_coords_np_for_grid_def.shape[0] if selected_real_coords_np_for_grid_def is not None else 0}) 與所需網格點 ({num_required_points}) 不符。")
+
+            self.grid_target_coords, self.grid_idx_to_rc_map = self._define_target_grid_cells_hierarchical_style(selected_real_coords_np_for_grid_def)
             self.sorted_flow_columns = self._map_sensors_to_target_grid_hungarian(
-                self.selected_sensor_info, selected_real_coords_np, self.grid_target_coords
+                self.selected_sensor_info,
+                selected_real_coords_np_for_grid_def,
+                self.grid_target_coords
             )
+            plot_path = os.path.join(self.config["save_dir"], self.config.get("plot_grid_mapping_path", "grid_mapping_visualization.png"))
             self._plot_grid_mapping(
-                selected_real_coords_np, self.grid_target_coords, self.grid_idx_to_rc_map, self.sorted_flow_columns,
-                os.path.join(self.config["save_dir"], self.config["plot_grid_mapping_path"])
+                self.grid_idx_to_rc_map,
+                self.sorted_flow_columns,
+                plot_path
             )
             self.average_flow_map_dict = self._calculate_average_flows()
 
@@ -196,196 +317,198 @@ class PeopleFlowDatasetCondition(Dataset):
             if not all_avg_flows_list:
                 raise ValueError("訓練集中未計算出任何平均流量。無法計算流量標準化統計量。")
             all_avg_flows_np = np.stack(all_avg_flows_list)
-            self.flow_mean_val = np.mean(all_avg_flows_np) # 流量資料標準化用
-            self.flow_std_val = np.std(all_avg_flows_np)   # 流量資料標準化用
-            if self.flow_std_val < 1e-5: self.flow_std_val = 1e-5 # 避免除以零
+            self.flow_mean_val = np.mean(all_avg_flows_np)
+            self.flow_std_val = np.std(all_avg_flows_np)
+            if self.flow_std_val < 1e-5: self.flow_std_val = 1e-5
             self.norm_stats_flow = {'mean': self.flow_mean_val, 'std': self.flow_std_val}
             logger.info(f"訓練集流量標準化統計量: 平均值={self.flow_mean_val:.4f}, 標準差={self.flow_std_val:.4f}")
-
-        else: # 驗證或測試模式
-            if not all([average_flow_map_dict, norm_stats_flow, sorted_flow_columns, grid_idx_to_rc_map]):
-                raise ValueError("average_flow_map_dict, norm_stats_flow, sorted_flow_columns, grid_idx_to_rc_map 必須為驗證/測試模式提供。")
+        else:
+            if not all([average_flow_map_dict, norm_stats_flow, sorted_flow_columns_from_train,
+                        grid_idx_to_rc_map_from_train, processed_extra_columns_from_train,
+                        selected_sensor_info_from_train]):
+                raise ValueError("驗證/測試模式下，必須提供所有必要的預計算資料。")
             self.average_flow_map_dict = average_flow_map_dict
-            self.norm_stats_flow = norm_stats_flow # 使用傳入的流量標準化統計量
+            self.norm_stats_flow = norm_stats_flow
             self.flow_mean_val = self.norm_stats_flow['mean']
             self.flow_std_val = self.norm_stats_flow['std']
-            self.sorted_flow_columns = sorted_flow_columns
-            self.grid_idx_to_rc_map = grid_idx_to_rc_map
-            logger.info(f"使用預計算的流量標準化統計量: 平均值={self.flow_mean_val:.4f}, 標準差={self.flow_std_val:.4f}")
-
-    # 輔助方法 _extract_all_sensor_info_from_csv, _select_sensors,
-    # _define_target_grid_cells_hierarchical_style, _map_sensors_to_target_grid_hungarian,
-    # _calculate_average_flows, _plot_grid_mapping 與先前版本相同。
-    # 為求類別完整性，再次貼上。
-
-    def _extract_all_sensor_info_from_csv(self) -> List[Dict[str, Any]]:
-        """從 CSV 欄位名稱提取所有感測器資訊 (名稱、經緯度)"""
-        all_sensor_info = []
-        max_sensor_idx = -1
-        # 從 flow_i, latitude_i, longitude_i 欄位找出最大索引 i
-        for col in self.df_original.columns:
-            if col.startswith('flow_') or col.startswith('latitude_') or col.startswith('longitude_'):
-                try:
-                    idx = int(col.split('_')[-1])
-                    max_sensor_idx = max(max_sensor_idx, idx)
-                except ValueError:
-                    continue # 若無法解析索引則跳過
-        if max_sensor_idx == -1:
-            raise ValueError("無法從 CSV 欄位名確定感測器索引。")
-
-        for i in range(max_sensor_idx + 1):
-            fcol, latcol, loncol = f'flow_{i}', f'latitude_{i}', f'longitude_{i}'
-            if all(c in self.df_original.columns for c in [fcol, latcol, loncol]): # 檢查欄位是否存在
-                # 取第一筆非空的經緯度資料作為此感測器的位置
-                lat_series = self.df_original[latcol].dropna()
-                lon_series = self.df_original[loncol].dropna()
-                if not lat_series.empty and not lon_series.empty:
-                    lat, lon = lat_series.iloc[0], lon_series.iloc[0]
-                    all_sensor_info.append({'name': fcol, 'lon': float(lon), 'lat': float(lat), 'original_csv_sensor_index': i})
-        if not all_sensor_info:
-            raise ValueError("無法從 CSV 提取有效感測器資料。")
-        return all_sensor_info
-
-    def _select_sensors(self, all_sensor_info: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], np.ndarray]:
-        """根據網格數量選取感測器。若感測器過多，選取最接近地理中心者。"""
-        num_required = self.num_grid_cells
-        if len(all_sensor_info) < num_required:
-            raise ValueError(f"網格點數 ({num_required}) > 可用感測器 ({len(all_sensor_info)})")
-
-        coords = np.array([(s['lon'], s['lat']) for s in all_sensor_info])
-        if len(all_sensor_info) > num_required:
-            logger.info(f"可用感測器 ({len(all_sensor_info)}) > 所需 ({num_required})。選取最接近中心的點。")
-            center = np.mean(coords, axis=0) # 計算所有感測器的地理中心
-            dists = np.sum((coords - center)**2, axis=1) # 計算各感測器到中心的距離平方
-            sel_indices = np.argsort(dists)[:num_required] # 選取距離最近的 num_required 個感測器
-            sel_info = [all_sensor_info[i] for i in sel_indices]
-            sel_coords = coords[sel_indices]
-        else: # 感測器數量剛好或不足 (已在前一步檢查不足情況)
-            sel_info = all_sensor_info
-            sel_coords = coords
-        logger.info(f"已選定 {len(sel_info)} 個感測器進行網格映射。")
-        return sel_info, sel_coords
+            if self.flow_std_val < 1e-5: self.flow_std_val = 1e-5
+            self.sorted_flow_columns = sorted_flow_columns_from_train
+            self.grid_idx_to_rc_map = grid_idx_to_rc_map_from_train
+            self.processed_extra_columns = processed_extra_columns_from_train
+            self.selected_sensor_info = selected_sensor_info_from_train
+            logger.info(f"{self.mode} 資料集使用預計算的流量標準化統計量、欄位順序、網格映射和感測器資訊。")
 
     def _define_target_grid_cells_hierarchical_style(self, selected_real_coords_np: np.ndarray) -> Tuple[np.ndarray, Dict[int, Tuple[int, int]]]:
-        """以 'hierarchical' 風格定義目標網格中心點。"""
+        logger = logging.getLogger(__name__)
         if selected_real_coords_np.shape[0] != self.num_grid_cells:
             raise ValueError(f"selected_real_coords_np 應含 {self.num_grid_cells} 點, 得到 {selected_real_coords_np.shape[0]}。")
         logger.info("使用 'hierarchical' 風格定義目標網格中心點...")
-        center_lon, center_lat = np.mean(selected_real_coords_np, axis=0) # 選定感測器的中心
+        center_lon, center_lat = np.mean(selected_real_coords_np, axis=0)
         unique_lons = np.unique(selected_real_coords_np[:,0])
         unique_lats = np.unique(selected_real_coords_np[:,1])
         lon_diffs = np.diff(np.sort(unique_lons))
         lat_diffs = np.diff(np.sort(unique_lats))
-        # 使用差值的中位數作為步長，忽略過小差值
         lon_step = np.median(lon_diffs[lon_diffs > 1e-6]) if len(lon_diffs[lon_diffs > 1e-6]) > 0 else 0.001
         lat_step = np.median(lat_diffs[lat_diffs > 1e-6]) if len(lat_diffs[lat_diffs > 1e-6]) > 0 else 0.001
-        if lon_step <= 1e-6: lon_step = 0.001 # 預設最小步長
-        if lat_step <= 1e-6: lat_step = 0.001 # 預設最小步長
+        if lon_step <= 1e-6: lon_step = 0.001 
+        if lat_step <= 1e-6: lat_step = 0.001 
         logger.info(f"目標網格中心: (lon:{center_lon:.4f}, lat:{center_lat:.4f}), 步長: (lon:{lon_step:.6f}, lat:{lat_step:.6f})")
-
-        grid_targets = np.zeros((self.num_grid_cells, 2)) # (H*W, 2) 存放目標網格的經緯度
-        idx_to_rc = {} # 將網格平面索引映射到 (row, col)
+        grid_targets = np.zeros((self.num_grid_cells, 2))
+        idx_to_rc = {}
         idx = 0
         for r_idx in range(self.H):
             for c_idx in range(self.W):
-                # 以中心點和步長計算網格點座標
-                tlon = center_lon + (c_idx - (self.W - 1) / 2.0) * lon_step
-                tlat = center_lat - (r_idx - (self.H - 1) / 2.0) * lat_step # 緯度通常由北往南增加索引
+                tlon = center_lon + (c_idx - (self.W-1)/2.0) * lon_step
+                tlat = center_lat - (r_idx - (self.H-1)/2.0) * lat_step 
                 grid_targets[idx, 0], grid_targets[idx, 1] = tlon, tlat
-                idx_to_rc[idx] = (r_idx, c_idx)
+                idx_to_rc[idx] = (r_idx,c_idx)
                 idx += 1
         return grid_targets, idx_to_rc
 
-    def _map_sensors_to_target_grid_hungarian(self, sel_info: List[Dict[str,Any]], sel_coords: np.ndarray, grid_targets: np.ndarray) -> List[str]:
-        """使用匈牙利演算法將選定感測器映射到目標網格。"""
+    def _map_sensors_to_target_grid_hungarian(self,
+                                            sel_sensor_info_list: List[Dict[str,Any]],
+                                            sel_coords_np: np.ndarray,
+                                            grid_target_coords_np: np.ndarray
+                                            ) -> List[str]:
+        logger = logging.getLogger(__name__)
         logger.info("使用匈牙利演算法將選定感測器映射到目標網格...")
-        n = self.num_grid_cells
-        if not (sel_coords.shape[0] == n and grid_targets.shape[0] == n and len(sel_info) == n):
-            raise ValueError("匈牙利分配時，輸入數量必須都等於 H*W。")
-        # 計算成本矩陣：實際感測器位置到目標網格中心的歐氏距離
-        costs = np.sum((sel_coords[:, np.newaxis, :] - grid_targets[np.newaxis, :, :])**2, axis=2)
-        costs = np.sqrt(costs)
-        real_indices, target_indices = linear_sum_assignment(costs) # 匈牙利演算法指派
-
-        target_to_real_map = {t_idx: r_idx for r_idx, t_idx in zip(real_indices, target_indices)}
-        sorted_cols = [""] * n # 存放排序後的流量欄位名稱
-        for flat_target_idx in range(n): # flat_target_idx 是目標網格的平面索引 (0 to H*W-1)
+        n_sensors = sel_coords_np.shape[0]
+        n_targets = grid_target_coords_np.shape[0]
+        if n_sensors != self.num_grid_cells or n_targets != self.num_grid_cells:
+            raise ValueError(f"感測器數量 ({n_sensors}) 或目標網格點數量 ({n_targets}) "
+                             f"必須等於 H*W ({self.num_grid_cells})。")
+        if len(sel_sensor_info_list) != n_sensors:
+             raise ValueError(f"sel_sensor_info_list 的長度 ({len(sel_sensor_info_list)}) 與 sel_coords_np ({n_sensors}) 不符。")
+        costs = np.sqrt(np.sum((sel_coords_np[:, np.newaxis, :] - grid_target_coords_np[np.newaxis, :, :])**2, axis=2))
+        assigned_real_indices, assigned_target_indices = linear_sum_assignment(costs)
+        target_to_real_map = {t_idx: r_idx for r_idx, t_idx in zip(assigned_real_indices, assigned_target_indices)}
+        sorted_flow_column_names = [""] * self.num_grid_cells
+        for flat_target_idx in range(self.num_grid_cells):
             if flat_target_idx in target_to_real_map:
-                real_idx_in_sel_list = target_to_real_map[flat_target_idx] # 取得分配到的實際感測器在 sel_info 中的索引
-                sorted_cols[flat_target_idx] = sel_info[real_idx_in_sel_list]['name']
+                real_idx_in_sel_list = target_to_real_map[flat_target_idx]
+                if real_idx_in_sel_list < len(sel_sensor_info_list):
+                    sorted_flow_column_names[flat_target_idx] = sel_sensor_info_list[real_idx_in_sel_list]['name']
+                else:
+                     raise IndexError(f"匈牙利演算法映射的真實索引 {real_idx_in_sel_list} 超出 sel_sensor_info_list 的範圍 (長度 {len(sel_sensor_info_list)})。")
             else:
-                # 理論上匈牙利演算法會為每個目標找到一個匹配 (如果數量相等)
-                raise Exception(f"目標網格 {flat_target_idx} 未分配到感測器。")
-        logger.info(f"成功為網格排序 {len(sorted_cols)} 個流量欄位。")
-        return sorted_cols
-
+                 raise ValueError(f"目標網格索引 {flat_target_idx} 未在匈牙利演算法的映射結果中找到。成本矩陣可能存在問題。")
+        logger.info(f"成功為網格排序 {len(sorted_flow_column_names)} 個流量欄位。")
+        return sorted_flow_column_names
+        
     def _calculate_average_flows(self) -> Dict[Tuple[int, int], np.ndarray]:
-        """計算每個 (小時, 星期幾) 組合的平均流量圖。"""
-        logger.info("計算 (小時, 星期幾) 平均流量圖...")
-        avg_flows = {} # (小時, 星期幾) -> (H, W) 平均流量陣列
-        for col in self.sorted_flow_columns:
-            if col not in self.df_original.columns:
-                raise ValueError(f"流量欄位 '{col}' 在 DataFrame 未找到。")
+        """計算每個 (小時, 是否假日) 組合的平均流量圖。"""
+        logger = logging.getLogger(__name__)
+        logger.info("計算 (小時, 是否為假日) 平均流量圖...") # <--- 修改日誌訊息
+        avg_flows = {}
+        if not hasattr(self, 'sorted_flow_columns') or not self.sorted_flow_columns or any(col == "" for col in self.sorted_flow_columns):
+            raise AttributeError("Dataset object missing 'sorted_flow_columns' or it's invalid. Cannot calculate average flows.")
+        
+        missing_cols = [col for col in self.sorted_flow_columns if col not in self.df_original.columns]
+        if missing_cols:
+            raise ValueError(f"以下流量欄位在 DataFrame 中未找到: {missing_cols}")
 
-        # 取得排序後的流量資料，並轉換為 (時間點數量, H*W) 的 NumPy 陣列
         flow_data_grid_alltimes = self.df_original[self.sorted_flow_columns].values.astype(np.float32)
+        
+        # 使用 self.hours_original_np 和 self.is_holiday_original_np 進行分組
+        grouping_df = pd.DataFrame({
+            'hour': self.hours_original_np,
+            'is_holiday': self.is_holiday_original_np # <--- 修改分組依據
+        })
+        grouped = grouping_df.groupby(['hour', 'is_holiday']) # <--- 修改分組依據
 
-        grouping_df = pd.DataFrame({'hour': self.hours_original_np, 'day_of_week': self.day_of_week_original_np})
+        if not grouped.groups:
+            logger.warning("無法根據 (小時, 是否為假日) 對資料進行分組。")
+            return {} 
 
-        for (hr, dow), group_indices in grouping_df.groupby(['hour', 'day_of_week']).groups.items():
-            group_flows = flow_data_grid_alltimes[group_indices] # 取得該 (小時, 星期幾) 的所有流量資料
-            mean_flow_flat = np.nanmean(group_flows, axis=0) # 沿時間軸計算平均，忽略 NaN
-            mean_flow_flat[np.isnan(mean_flow_flat)] = 0 # 將剩餘 NaN (若某網格點一直都是 NaN) 設為 0
-            avg_flows[(hr, dow)] = mean_flow_flat.reshape(self.H, self.W)
+        for (hr, is_hol), group_indices in grouped.groups.items(): # <--- 修改迭代變數
+            if len(group_indices) == 0:
+                logger.warning(f"條件 ({hr}, is_holiday={is_hol}) 沒有對應的資料。")
+                continue
+
+            group_flows_for_condition = flow_data_grid_alltimes[group_indices]
+            mean_flow_flat_for_condition = np.nanmean(group_flows_for_condition, axis=0)
+            mean_flow_flat_for_condition[np.isnan(mean_flow_flat_for_condition)] = 0 
+            avg_flows[(hr, int(is_hol))] = mean_flow_flat_for_condition.reshape(self.H, self.W) # <--- 修改字典的鍵
+
         if not avg_flows:
-            logger.warning("未計算任何平均流量。")
-        logger.info(f"計算完成 {len(avg_flows)} 個條件的平均流量。")
+            logger.warning("未計算任何 (小時, 是否為假日) 的平均流量。")
+        logger.info(f"計算完成 {len(avg_flows)} 個 (小時, 是否為假日) 條件的平均流量圖。") # <--- 修改日誌訊息
         return avg_flows
 
-    def _plot_grid_mapping(self, sel_coords, grid_targets, idx_to_rc, sorted_cols, save_path):
-        """繪製並儲存網格映射的視覺化圖。"""
-        try:
-            plt.figure(figsize=(10,10)); plt.style.use('seaborn_v0_8_whitegrid')
-            plt.scatter(sel_coords[:,0], sel_coords[:,1], c='blue', marker='o', s=25, alpha=0.7, label='選定實際感測器位置', zorder=2)
-            plt.scatter(grid_targets[:,0], grid_targets[:,1], c='red', marker='x', s=25, alpha=0.7, label='目標網格中心點', zorder=3)
-            for flat_idx in range(self.num_grid_cells):
-                r_idx, c_idx = idx_to_rc.get(flat_idx, (-1,-1))
-                if r_idx != -1:
-                    plt.text(grid_targets[flat_idx,0], grid_targets[flat_idx,1], f'T[{r_idx},{c_idx}]', fontsize=5,color='darkred',ha='center',va='bottom',zorder=4)
-            plt.xlabel("經度 (台北市)"); plt.ylabel("緯度"); plt.title(f"網格映射 ({self.H}x{self.W})")
-            plt.legend(); plt.savefig(save_path, dpi=200); plt.close()
-            logger.info(f"網格映射視覺化圖儲存至 {save_path}")
-        except Exception as e:
-            logger.error(f"繪製網格圖出錯: {e}", exc_info=True)
+    def _plot_grid_mapping(self, grid_idx_to_rc_map: Dict[int, Tuple[int,int]], sorted_flow_cols: List[str], save_path: str):
+        logger = logging.getLogger(__name__)
+        plt.figure(figsize=(12, 12)); plt.style.use('seaborn-v0_8-whitegrid')
+        if not hasattr(self, 'selected_sensor_info') or not self.selected_sensor_info or \
+           not hasattr(self, 'sorted_flow_columns') or not self.sorted_flow_columns or \
+           len(self.sorted_flow_columns) != self.num_grid_cells:
+            logger.error("_plot_grid_mapping: 內部屬性未正確初始化或長度不符。")
+            plt.close(); return
+        selected_sensor_info_dict = {info['name']: (info['lon'], info['lat']) for info in self.selected_sensor_info}
+        actual_sensor_lons, actual_sensor_lats, grid_labels = [], [], []
+        for flat_idx, col_name in enumerate(sorted_flow_cols):
+            if col_name in selected_sensor_info_dict:
+                lon, lat = selected_sensor_info_dict[col_name]
+                actual_sensor_lons.append(lon); actual_sensor_lats.append(lat)
+                r_map, c_map = grid_idx_to_rc_map.get(flat_idx, (-1,-1))
+                grid_labels.append(f'[{r_map},{c_map}]' if r_map!=-1 else f'[{flat_idx}]')
+            elif col_name and col_name.strip(): # 只有當 col_name 非空且非空白時才警告
+                logger.warning(f"欄位 '{col_name}' (索引 {flat_idx}) 在 selected_sensor_info_dict 中未找到。")
+        if not actual_sensor_lons: logger.warning("無實際感測器座標點可繪製。"); plt.close(); return
+        plt.scatter(actual_sensor_lons, actual_sensor_lats, c='blue', marker='o', s=50, alpha=0.7, label='Grid Points (Actual Sensor Location)')
+        for i, lbl in enumerate(grid_labels): plt.text(actual_sensor_lons[i], actual_sensor_lats[i], lbl, fontsize=7, color='navy', ha='right', va='bottom')
+        plt.xlabel("Longitude"); plt.ylabel("Latitude"); plt.title(f"Grid Mapping ({self.H}x{self.W})")
+        plt.grid(True, linestyle=':', alpha=0.6); plt.gca().set_aspect('equal', adjustable='box')
+        try: plt.savefig(save_path, dpi=300, bbox_inches='tight'); logger.info(f"Grid mapping visualization saved to {save_path}")
+        except Exception as e: logger.error(f"無法儲存網格映射圖至 {save_path}: {e}")
+        plt.close()
 
     def __len__(self) -> int:
         return len(self.df_original)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int, int, torch.Tensor]:
-        # --- 目標平均流量 (DDPM 的 x_start) - 已標準化 ---
+        logger = logging.getLogger(__name__)
         current_hour_original = self.hours_original_np[idx]
-        current_dow_original = self.day_of_week_original_np[idx]
+        current_is_holiday_original = self.is_holiday_original_np[idx] # <--- 獲取假日狀態作為條件
 
-        target_avg_flow_np = self.average_flow_map_dict.get((current_hour_original, current_dow_original))
-        if target_avg_flow_np is None: # 若特定 (時,星期) 無平均流量 (罕見)，則用零填充
-            logger.warning(f"在 average_flow_map_dict 中找不到 ({current_hour_original}, {current_dow_original}) 的平均流量，使用零填充。")
+        # --- 目標流量現在基於 (小時, 是否假日) ---
+        # average_flow_map_dict 的鍵現在是 (小時, 是否假日)
+        target_avg_flow_np = self.average_flow_map_dict.get((current_hour_original, current_is_holiday_original)) # <--- 修改查找鍵
+
+        if target_avg_flow_np is None:
+            logger.warning(f"在 average_flow_map_dict 中找不到 (hour={current_hour_original}, is_holiday={current_is_holiday_original}) 的平均流量 (索引 {idx})，將使用零值網格。")
             target_avg_flow_np = np.zeros((self.H, self.W), dtype=np.float32)
 
-        # 標準化流量資料
-        standardized_avg_flow_np = (target_avg_flow_np - self.flow_mean_val) / self.flow_std_val
-        target_flow_tensor = torch.from_numpy(standardized_avg_flow_np).float().unsqueeze(0).unsqueeze(0) # (1, 1, H, W)
+        if not hasattr(self, 'flow_mean_val') or not hasattr(self, 'flow_std_val'):
+            raise AttributeError("flow_mean_val 或 flow_std_val 未在 Dataset 初始化時設定。")
 
-        # --- 條件輸入: 原始小時 (0-23) 與星期 (0-6) ---
-        # DDPM3D 內部會將其轉換為正規化網格
+        std_val_safe = self.flow_std_val if self.flow_std_val > 1e-6 else 1.0
+        standardized_avg_flow_np = (target_avg_flow_np - self.flow_mean_val) / std_val_safe
+        target_flow_tensor = torch.from_numpy(standardized_avg_flow_np).float()
 
-        # --- 已處理的額外資料列 (連續特徵未標準化) ---
-        extra_data_row_tensor = torch.from_numpy(self.processed_extra_data_np[idx]).float() # (num_processed_extra_features,)
+        # Reshape (保持不變)
+        if self.D == 1 and self.image_channels == 1:
+            target_flow_tensor = target_flow_tensor.unsqueeze(0).unsqueeze(0) 
+        elif self.image_channels > 1 or self.D > 1:
+            target_flow_tensor = target_flow_tensor.unsqueeze(0)
+            if self.D > 1: target_flow_tensor = target_flow_tensor.repeat(self.D, 1, 1)
+            if self.image_channels > 1:
+                target_flow_tensor = target_flow_tensor.unsqueeze(0).repeat(self.image_channels, 1, 1, 1)
+                logger.warning(f"Target flow image_channels > 1. Repeating the single flow channel.")
+            else: target_flow_tensor = target_flow_tensor.unsqueeze(0)
+            expected_shape = (self.image_channels, self.D, self.H, self.W)
+            if target_flow_tensor.shape != expected_shape:
+                logger.warning(f"Final target_flow_tensor shape {target_flow_tensor.shape} != expected {expected_shape}.")
+        else: target_flow_tensor = target_flow_tensor.unsqueeze(0).unsqueeze(0)
 
-        return target_flow_tensor, int(current_hour_original), int(current_dow_original), extra_data_row_tensor
+        if not hasattr(self, 'processed_extra_data_np'):
+            raise AttributeError("processed_extra_data_np 未在 Dataset 初始化時設定。")
+        extra_data_row_tensor = torch.from_numpy(self.processed_extra_data_np[idx]).float()
 
+        # --- 返回修改後的元組: (流量, 小時, 是否假日, 額外特徵) ---
+        return target_flow_tensor, int(current_hour_original), int(current_is_holiday_original), extra_data_row_tensor  
+    
 # ==============================================================================
-# UNet3D, DDPM3D, FID, 評估及主訓練迴圈
-# (UNet3D, SinusoidalTimeEmbedding, DoubleConv3D, Down3D, Up3D, OutConv3D
+# UNet3D, DDPM3D
 # ==============================================================================
 
 # UNet3D 建構模組及 UNet3D 類別的預留位置
@@ -445,77 +568,109 @@ class OutConv3D(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor: return self.conv(x)
 
 class UNet3D(nn.Module):
-    """3D U-Net 模型"""
+    """3D U-Net 模型，帶有正確的時間嵌入投影"""
     def __init__(self, input_image_channels: int, base_channels: int = 64, time_emb_dim: int = 256,
-                 condition_encode_dim: Optional[int] = None, bilinear_upsample: bool = True):
+                 condition_encode_dim: Optional[int] = None, bilinear_upsample: bool = True, dropout_rate: float = 0.05):
         super().__init__()
         self.input_image_channels = input_image_channels
-        self.condition_encode_dim = condition_encode_dim or 0 # 若為 None 則設為 0
+        self.condition_encode_dim = condition_encode_dim or 0
 
-        # 時間嵌入 MLP
-        self.time_mlp = nn.Sequential(
+        # 共享的時間嵌入 MLP (輸出維度是 time_emb_dim)
+        self.shared_time_mlp = nn.Sequential(
             SinusoidalTimeEmbedding(time_emb_dim),
-            nn.Linear(time_emb_dim, time_emb_dim), nn.SiLU(),
+            nn.Linear(time_emb_dim, time_emb_dim),
+            nn.SiLU(),
             nn.Linear(time_emb_dim, time_emb_dim)
         )
 
         actual_in_channels = self.input_image_channels + self.condition_encode_dim
+        
+        # --- U-Net 結構 ---
         self.inc = DoubleConv3D(actual_in_channels, base_channels)
-        self.down1 = Down3D(base_channels, base_channels*2)
-        self.down2 = Down3D(base_channels*2, base_channels*4)
-        self.down3 = Down3D(base_channels*4, base_channels*8)
+        self.down1 = Down3D(base_channels, base_channels * 2)
+        self.down2 = Down3D(base_channels * 2, base_channels * 4)
+        self.down3 = Down3D(base_channels * 4, base_channels * 8)
         factor = 2 if bilinear_upsample else 1
-        self.down4 = Down3D(base_channels*8, base_channels*16 // factor) # 最底層
+        self.down4 = Down3D(base_channels * 8, base_channels * 16 // factor) # Bottleneck 層的前一層
+        self.dropout = nn.Dropout3d(dropout_rate) if dropout_rate > 0 else nn.Identity()
 
-        self.up1 = Up3D(base_channels*16, base_channels*8 // factor, bilinear_upsample)
-        self.up2 = Up3D(base_channels*8, base_channels*4 // factor, bilinear_upsample)
-        self.up3 = Up3D(base_channels*4, base_channels*2 // factor, bilinear_upsample)
-        self.up4 = Up3D(base_channels*2, base_channels, bilinear_upsample)
-        self.outc = OutConv3D(base_channels, self.input_image_channels) # 輸出通道數同影像通道數
+        self.up1 = Up3D(base_channels * 16, base_channels * 8 // factor, bilinear_upsample)
+        self.up2 = Up3D(base_channels * 8, base_channels * 4 // factor, bilinear_upsample)
+        self.up3 = Up3D(base_channels * 4, base_channels * 2 // factor, bilinear_upsample)
+        self.up4 = Up3D(base_channels * 2, base_channels, bilinear_upsample)
+        self.outc = OutConv3D(base_channels, self.input_image_channels)
 
-    def _add_time_embedding(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
-        """將時間嵌入加到特徵圖上"""
-        # t_emb: (N, time_emb_dim) -> (N, time_emb_dim, 1, 1, 1)
-        t_emb_expanded = t_emb.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-        return x + t_emb_expanded # 廣播加法
+        # --- 為每個需要添加時間嵌入的層級定義線性投影層 ---
+        # 這些層的輸出維度與對應特徵圖的通道數匹配
+        self.time_proj_inc = nn.Linear(time_emb_dim, base_channels)
+        self.time_proj_down1 = nn.Linear(time_emb_dim, base_channels * 2)
+        self.time_proj_down2 = nn.Linear(time_emb_dim, base_channels * 4)
+        self.time_proj_down3 = nn.Linear(time_emb_dim, base_channels * 8)
+        self.time_proj_bottleneck = nn.Linear(time_emb_dim, base_channels * 16 // factor) # 對應 down4 的輸出 (bottleneck)
+
+        self.time_proj_up1 = nn.Linear(time_emb_dim, base_channels * 8 // factor)
+        self.time_proj_up2 = nn.Linear(time_emb_dim, base_channels * 4 // factor)
+        self.time_proj_up3 = nn.Linear(time_emb_dim, base_channels * 2 // factor)
+        self.time_proj_up4 = nn.Linear(time_emb_dim, base_channels)
+
+    def _add_time_embedding(self, x: torch.Tensor, t_emb_projected: torch.Tensor) -> torch.Tensor:
+        # t_emb_projected 應該已經是 (N, C_feature_map) 的形狀
+        t_emb_expanded = t_emb_projected.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        return x + t_emb_expanded
 
     def forward(self, x_t: torch.Tensor, time_steps: torch.Tensor, processed_condition: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # x_t: (N, C_img, D, H, W)
-        # time_steps: (N,)
-        # processed_condition: (N, C_cond_enc, D, H, W)
-        t_emb = self.time_mlp(time_steps) # (N, time_emb_dim)
+        # 首先計算共享的時間嵌入 (N, time_emb_dim)
+        shared_t_emb = self.shared_time_mlp(time_steps)
 
         if processed_condition is not None:
             if x_t.shape[2:] != processed_condition.shape[2:]: # 檢查 D, H, W 是否一致
                 raise ValueError(f"x_t DHW {x_t.shape[2:]} != processed_condition DHW {processed_condition.shape[2:]}")
             x_input = torch.cat((x_t, processed_condition), dim=1) # 沿通道維度合併
-        else: # 無條件或條件已整合
+        else:
             x_input = x_t
 
-        x1 = self.inc(x_input);  x1 = self._add_time_embedding(x1, t_emb)
-        x2 = self.down1(x1);   x2 = self._add_time_embedding(x2, t_emb)
-        x3 = self.down2(x2);   x3 = self._add_time_embedding(x3, t_emb)
-        x4 = self.down3(x3);   x4 = self._add_time_embedding(x4, t_emb)
-        x5 = self.down4(x4);   x5 = self._add_time_embedding(x5, t_emb) # Bottleneck
+        x1 = self.inc(x_input)
+        x1 = self._add_time_embedding(x1, self.time_proj_inc(shared_t_emb))
 
-        x = self.up1(x5, x4);  x = self._add_time_embedding(x, t_emb)
-        x = self.up2(x, x3);  x = self._add_time_embedding(x, t_emb)
-        x = self.up3(x, x2);  x = self._add_time_embedding(x, t_emb)
-        x = self.up4(x, x1);  x = self._add_time_embedding(x, t_emb)
-        return self.outc(x) # 預測雜訊
+        x2 = self.down1(x1)
+        x2 = self._add_time_embedding(x2, self.time_proj_down1(shared_t_emb))
 
+        x3 = self.down2(x2)
+        x3 = self._add_time_embedding(x3, self.time_proj_down2(shared_t_emb))
+
+        x4 = self.down3(x3)
+        x4 = self._add_time_embedding(x4, self.time_proj_down3(shared_t_emb))
+
+        x5 = self.down4(x4) # Bottleneck 特徵
+        x5 = self._add_time_embedding(x5, self.time_proj_bottleneck(shared_t_emb)) # 使用對應的投影
+        x5 = self.dropout(x5)
+
+        # Decoder path
+        x = self.up1(x5, x4) # x4 是來自 encoder 的 skip connection
+        x = self._add_time_embedding(x, self.time_proj_up1(shared_t_emb))
+
+        x = self.up2(x, x3) # x3 是來自 encoder 的 skip connection
+        x = self._add_time_embedding(x, self.time_proj_up2(shared_t_emb))
+
+        x = self.up3(x, x2) # x2 是來自 encoder 的 skip connection
+        x = self._add_time_embedding(x, self.time_proj_up3(shared_t_emb))
+
+        x = self.up4(x, x1) # x1 是來自 encoder 的 skip connection
+        x = self._add_time_embedding(x, self.time_proj_up4(shared_t_emb))
+        
+        return self.outc(x)
 def linear_beta_schedule(timesteps: int, beta_start: float, beta_end: float) -> torch.Tensor:
     """線性 beta 排程"""
     return torch.linspace(beta_start, beta_end, timesteps)
 
 class DDPM3D(nn.Module):
-    """3D Denoising Diffusion Probabilistic Model"""
+    """3D Denoising Diffusion Probabilistic Model (條件: 小時 + 是否假日)"""
     def __init__(self,
-                 unet_model: UNet3D,
+                 unet_model: UNet3D, # 假設 UNet3D 類別已定義
                  timesteps: int,
                  image_size: Tuple[int, int, int], # (D, H, W)
                  image_channels: int,
-                 condition_input_channels: int, # 條件處理器輸入的原始通道數 (例如: 小時網格+星期網格 = 2)
+                 condition_input_channels: int, # 條件處理器輸入的原始通道數 (小時網格+假日網格 = 2)
                  condition_encode_dim: int,     # 條件處理器輸出的編碼維度
                  beta_start: float = 1e-4,
                  beta_end: float = 0.02,
@@ -536,112 +691,105 @@ class DDPM3D(nn.Module):
         self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1. - self.alphas_cumprod)
         self.posterior_variance = self.betas * (1. - self.alphas_cumprod_prev) / (1. - self.alphas_cumprod) # p(x_{t-1}|x_t, x_0) 的變異數
 
-        # --- 條件處理器 (例如：將小時、星期幾網格編碼) ---
-        # 輸入: (N, condition_input_channels, D, H, W)
-        # 輸出: (N, condition_encode_dim, D, H, W)
+        # --- 條件處理器 (接收 2 個通道: 小時網格 + 假日狀態網格) ---
         self.condition_processor = nn.Sequential(
             nn.Conv3d(condition_input_channels, condition_encode_dim // 2,
-                      kernel_size=(1, 3, 3), padding=(0, 1, 1), bias=False), # 深度維度 kernel=1, padding=0
+                      kernel_size=(1, 3, 3), padding=(0, 1, 1), bias=False), 
             nn.BatchNorm3d(condition_encode_dim // 2), nn.SiLU(),
             nn.Conv3d(condition_encode_dim // 2, condition_encode_dim,
-                      kernel_size=(1, 3, 3), padding=(0, 1, 1), bias=False), # 深度維度 kernel=1, padding=0
+                      kernel_size=(1, 3, 3), padding=(0, 1, 1), bias=False), 
             nn.BatchNorm3d(condition_encode_dim), nn.SiLU()
         ).to(device)
 
     def _extract(self, a: torch.Tensor, t: torch.Tensor, x_shape: Tuple[int, ...]) -> torch.Tensor:
-        """從 a 中提取對應 t 時刻的值，並調整形狀以匹配 x_shape"""
         batch_size = t.shape[0]
-        out = a.gather(-1, t) # (batch_size,)
-        return out.reshape(batch_size, *((1,) * (len(x_shape) - 1))) # (batch_size, 1, 1, 1, 1)
+        out = a.gather(-1, t) 
+        return out.reshape(batch_size, *((1,) * (len(x_shape) - 1)))
 
     def q_sample(self, x_start: torch.Tensor, t: torch.Tensor, noise: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """前向擴散過程 (加噪)：q(x_t | x_0)"""
         if noise is None: noise = torch.randn_like(x_start)
         sact = self._extract(self.sqrt_alphas_cumprod, t, x_start.shape)
         soma_ct = self._extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
-        return sact * x_start + soma_ct * noise # x_t
+        return sact * x_start + soma_ct * noise 
 
     def _prepare_conditional_input_grids(self,
-                                        hour_scalars_batch: torch.Tensor, # (N,) 原始 0-23
-                                        day_scalars_batch: torch.Tensor,  # (N,) 原始 0-6
-                                        ) -> torch.Tensor: # 輸出 (N, 2, D, H, W)
-        """將純量的小時和星期幾轉換為正規化的網格輸入"""
+                                    hour_scalars_batch: torch.Tensor,     # (N,) 原始 0-23
+                                    is_holiday_scalars_batch: torch.Tensor, # (N,) 原始 0/1 <--- 修改
+                                    ) -> torch.Tensor: # 輸出 (N, 2, D, H, W)
+        """將純量的小時和假日狀態轉換為正規化的網格輸入""" # <--- 修改註解
+        logger = logging.getLogger(__name__) # 添加 logger
         batch_size = hour_scalars_batch.shape[0]
-        # 在此正規化純量值
-        norm_hours = hour_scalars_batch.float().to(self.device) / 23.0 # 正規化到 [0, 1]
-        norm_days = day_scalars_batch.float().to(self.device) / 6.0   # 正規化到 [0, 1]
+        if hour_scalars_batch.shape[0] != is_holiday_scalars_batch.shape[0]:
+            logger.error(f"Batch size mismatch in _prepare_conditional_input_grids: hour_batch={hour_scalars_batch.shape[0]}, holiday_batch={is_holiday_scalars_batch.shape[0]}")
+            raise ValueError("Batch sizes for hour and holiday scalars must match.")
 
-        # 建立 HxW 的網格，每個網格的值相同
-        hour_grids_list = [torch.full((self.image_size_H, self.image_size_W), norm_hours[i].item(), device=self.device, dtype=torch.float32) for i in range(batch_size)]
-        day_grids_list = [torch.full((self.image_size_H, self.image_size_W), norm_days[i].item(), device=self.device, dtype=torch.float32) for i in range(batch_size)]
+        # 小時正規化
+        norm_hours = hour_scalars_batch.float().to(self.device) / 23.0 
+        
+        # 假日狀態 (假設已是 0 或 1，不需要額外正規化)
+        holiday_values = is_holiday_scalars_batch.float().to(self.device) 
 
-        hour_grids_t = torch.stack(hour_grids_list, dim=0).unsqueeze(1).unsqueeze(2) # (N,1,1,H,W)
-        day_grids_t = torch.stack(day_grids_list, dim=0).unsqueeze(1).unsqueeze(2)   # (N,1,1,H,W)
+        # 建立網格
+        hour_grid_vals = norm_hours.view(batch_size, 1, 1).expand(batch_size, self.image_size_H, self.image_size_W)
+        holiday_grid_vals = holiday_values.view(batch_size, 1, 1).expand(batch_size, self.image_size_H, self.image_size_W) # <--- 使用 holiday_values
 
-        # 確保深度維度匹配 self.image_size_D (在此專案中 D=1)
-        if self.image_size_D != 1: # 理論上此專案不會進入此分支
-             hour_grids_t = hour_grids_t.repeat(1,1,self.image_size_D,1,1)
-             day_grids_t = day_grids_t.repeat(1,1,self.image_size_D,1,1)
+        hour_grids_t = hour_grid_vals.unsqueeze(1).unsqueeze(2) 
+        holiday_grids_t = holiday_grid_vals.unsqueeze(1).unsqueeze(2) # <--- 修改變數名
 
-        return torch.cat((hour_grids_t, day_grids_t), dim=1) # (N, 2, D, H, W)
+        if self.image_size_D != 1:
+            hour_grids_t = hour_grids_t.repeat(1,1,self.image_size_D,1,1)
+            holiday_grids_t = holiday_grids_t.repeat(1,1,self.image_size_D,1,1) # <--- 修改變數名
+
+        return torch.cat((hour_grids_t, holiday_grids_t), dim=1)
 
     def p_losses(self, x_start: torch.Tensor, t: torch.Tensor,
-                 hour_scalars_batch: torch.Tensor, day_scalars_batch: torch.Tensor,
-                 # extra_data_batch: torch.Tensor, # 目前未直接由條件處理器使用
-                 noise: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """計算損失 (預測雜訊與真實雜訊的 MSE)"""
+             hour_scalars_batch: torch.Tensor, 
+             is_holiday_scalars_batch: torch.Tensor, # <--- 修改參數名
+             noise: Optional[torch.Tensor] = None) -> torch.Tensor:
         if noise is None: noise = torch.randn_like(x_start)
-        x_t = self.q_sample(x_start=x_start, t=t, noise=noise) # 得到加噪影像 x_t
-
-        # 準備並處理條件輸入
-        stacked_cond_grids = self._prepare_conditional_input_grids(hour_scalars_batch, day_scalars_batch) # (N, 2, D, H, W)
-        processed_condition = self.condition_processor(stacked_cond_grids) # (N, C_cond_enc, D, H, W)
-
-        predicted_noise = self.model(x_t, t, processed_condition) # U-Net 預測雜訊
+        x_t = self.q_sample(x_start=x_start, t=t, noise=noise) 
+        stacked_cond_grids = self._prepare_conditional_input_grids(hour_scalars_batch, is_holiday_scalars_batch) # <--- 修改傳遞的變數
+        processed_condition = self.condition_processor(stacked_cond_grids) 
+        predicted_noise = self.model(x_t, t, processed_condition) 
         return F.mse_loss(noise, predicted_noise)
 
     @torch.no_grad()
     def p_sample(self, x_t: torch.Tensor, t_scalar: int, t_tensor_batch: torch.Tensor,
                  processed_conditions_batch: torch.Tensor) -> torch.Tensor:
-        """逆向過程單步取樣：p(x_{t-1} | x_t)"""
-        # t_tensor_batch 是 (batch_size,)，每個元素都是 t_scalar
         betas_t = self._extract(self.betas, t_tensor_batch, x_t.shape)
         sqrt_one_minus_alphas_cumprod_t = self._extract(self.sqrt_one_minus_alphas_cumprod, t_tensor_batch, x_t.shape)
-        sqrt_recip_alphas_t = self._extract(torch.sqrt(1.0 / self.alphas), t_tensor_batch, x_t.shape) # 1/sqrt(α_t)
-
-        # 使用 U-Net 預測雜訊
+        sqrt_recip_alphas_t = self._extract(torch.sqrt(1.0 / self.alphas), t_tensor_batch, x_t.shape)
         predicted_noise = self.model(x_t, t_tensor_batch, processed_conditions_batch)
-        # 計算 x_0_hat 的均值部分 (DDPM 公式)
         model_mean = sqrt_recip_alphas_t * (x_t - betas_t * predicted_noise / sqrt_one_minus_alphas_cumprod_t)
-
-        if t_scalar == 0: # 最後一步，直接返回均值
+        if t_scalar == 0:
             return model_mean
         else:
             posterior_variance_t = self._extract(self.posterior_variance, t_tensor_batch, x_t.shape)
-            noise = torch.randn_like(x_t) # 加入隨機雜訊
+            noise = torch.randn_like(x_t) 
             return model_mean + torch.sqrt(posterior_variance_t) * noise
 
     @torch.no_grad()
-    def p_sample_loop(self, shape: Tuple[int,...], hour_scalars_batch: torch.Tensor, day_scalars_batch: torch.Tensor) -> torch.Tensor:
-        """逆向過程完整取樣迴圈"""
+    def p_sample_loop(self, shape: Tuple[int,...], 
+                  hour_scalars_batch: torch.Tensor, 
+                  is_holiday_scalars_batch: torch.Tensor) -> torch.Tensor: # <--- 修改參數名
         batch_size = shape[0]
-        img = torch.randn(shape, device=self.device) # 從純雜訊 x_T 開始
-
-        # 預先處理條件，因為在迴圈中條件是固定的
-        stacked_cond_grids = self._prepare_conditional_input_grids(hour_scalars_batch, day_scalars_batch)
-        processed_conditions = self.condition_processor(stacked_cond_grids) # (batch_size, C_cond_enc, D, H, W)
-
-        for i in tqdm(reversed(range(0, self.timesteps)), desc="DDPM 取樣迴圈", total=self.timesteps, leave=False):
+        img = torch.randn(shape, device=self.device) 
+        stacked_cond_grids = self._prepare_conditional_input_grids(hour_scalars_batch, is_holiday_scalars_batch) # <--- 修改傳遞的變數
+        processed_conditions = self.condition_processor(stacked_cond_grids) 
+        for i in tqdm(reversed(range(0, self.timesteps)), desc="DDPM Sampling Loop", total=self.timesteps, leave=False):
             t_tensor_batch = torch.full((batch_size,), i, device=self.device, dtype=torch.long)
             img = self.p_sample(img, i, t_tensor_batch, processed_conditions)
-        return img # 返回生成的影像 x_0
+        return img
 
     @torch.no_grad()
-    def sample(self, batch_size: int, hour_scalars_batch: torch.Tensor, day_scalars_batch: torch.Tensor) -> torch.Tensor:
-        """生成一批樣本"""
-        # hour_scalars_batch, day_scalars_batch 應為 (batch_size,)
+    def sample(self, batch_size: int, 
+           hour_scalars_batch: torch.Tensor, 
+           is_holiday_scalars_batch: torch.Tensor) -> torch.Tensor: # <--- 修改參數名
+        if hour_scalars_batch.shape[0] != batch_size or is_holiday_scalars_batch.shape[0] != batch_size:
+            raise ValueError(f"Provided hour/holiday scalars batch size ({hour_scalars_batch.shape[0]}/{is_holiday_scalars_batch.shape[0]}) "
+                            f"does not match requested batch_size ({batch_size})")
         s = (batch_size, self.image_channels, self.image_size_D, self.image_size_H, self.image_size_W)
-        return self.p_sample_loop(s, hour_scalars_batch, day_scalars_batch)
+        return self.p_sample_loop(s, hour_scalars_batch, is_holiday_scalars_batch)
 
 # FID 函數 (get_activations, calculate_frechet_distance, calculate_fid)
 def get_activations(images: torch.Tensor, model: nn.Module, device: str, batch_size_fid: int = 32) -> np.ndarray:
@@ -705,121 +853,346 @@ def calculate_fid(real_acts:np.ndarray, gen_acts:np.ndarray)->float:
     return calculate_frechet_distance(mu_real, sigma_real, mu_gen, sigma_gen)
 
 
+def truncate_colormap(cmap, minval: float = 0.0, maxval: float = 1.0, n: int = 256):
+    # (與 DDPM_3DUNet.ipynb 中的定義相同)
+    new_cmap = mcolors.LinearSegmentedColormap.from_list(
+        f'trunc({cmap.name},{minval:.2f},{maxval:.2f})',
+        cmap(np.linspace(minval, maxval, n))
+    )
+    return new_cmap
+
+def visualize_predictions_long_term(
+                        generated_all_denorm_t: torch.Tensor, # (N, C, D, H, W) 反正規化後的生成數據
+                        original_all_denorm_t: torch.Tensor,  # (N, C, D, H, W) 反正規化後的真實數據
+                        config: Dict[str, Any],
+                        sample_idx_to_plot: Optional[int] = 0, # 要繪製的特定樣本索引，None 表示繪製平均值
+                        prefix: str = "test_eval" # 檔名前綴
+                       ):
+    """
+    視覺化預測結果與真實值的比較 (針對 DDPM_Long-term.ipynb 的數據結構)。
+    包含生成結果、真實數據、以及誤差（MSE、MAE、MAPE、SMAPE）的網格熱力圖。
+    """
+    save_dir = config["save_dir"]
+    os.makedirs(save_dir, exist_ok=True)
+
+    if generated_all_denorm_t.shape[2] > 1 or original_all_denorm_t.shape[2] > 1:
+        logger.warning(f"visualize_predictions_long_term: 數據深度 > 1，將取 D 維度的平均值進行繪圖。")
+        generated_all_denorm_t = torch.mean(generated_all_denorm_t, dim=2, keepdim=True)
+        original_all_denorm_t = torch.mean(original_all_denorm_t, dim=2, keepdim=True)
+
+    generated_squeezed = generated_all_denorm_t.squeeze(1).squeeze(1) # (N, H, W)
+    original_squeezed = original_all_denorm_t.squeeze(1).squeeze(1)   # (N, H, W)
+
+    H, W = generated_squeezed.shape[-2], generated_squeezed.shape[-1]
+
+    if sample_idx_to_plot is None:
+        gen_data_to_plot = torch.mean(generated_squeezed, dim=0).cpu().numpy() # (H, W)
+        orig_data_to_plot = torch.mean(original_squeezed, dim=0).cpu().numpy() # (H, W)
+        title_suffix = "all_samples_avg"
+    elif sample_idx_to_plot < generated_squeezed.shape[0]:
+        gen_data_to_plot = generated_squeezed[sample_idx_to_plot].cpu().numpy()
+        orig_data_to_plot = original_squeezed[sample_idx_to_plot].cpu().numpy()
+        title_suffix = f"sample_{sample_idx_to_plot}"
+    else:
+        logger.warning(f"sample_idx_to_plot {sample_idx_to_plot} 超出範圍，將繪製平均值。")
+        gen_data_to_plot = torch.mean(generated_squeezed, dim=0).cpu().numpy()
+        orig_data_to_plot = torch.mean(original_squeezed, dim=0).cpu().numpy()
+        title_suffix = "all_samples_avg_fallback"
+
+    epsilon = 1e-8 # 避免除以零
+    mse_matrix = (gen_data_to_plot - orig_data_to_plot) ** 2
+    mae_matrix = np.abs(gen_data_to_plot - orig_data_to_plot)
+    mape_matrix = np.abs((orig_data_to_plot - gen_data_to_plot) / (np.abs(orig_data_to_plot) + epsilon)) * 100
+    smape_matrix = np.abs(gen_data_to_plot - orig_data_to_plot) / ((np.abs(orig_data_to_plot) + np.abs(gen_data_to_plot))/2 + epsilon) * 100 
+
+
+
+    overall_mse = np.mean(mse_matrix)
+    overall_mae = np.mean(mae_matrix)
+    overall_mape = np.mean(mape_matrix[np.isfinite(mape_matrix)])
+    overall_smape = np.mean(smape_matrix[np.isfinite(smape_matrix)])
+
+
+    # --- 修改開始：繪製6個子圖 ---
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10)) # 改成 2x3 的佈局
+
+    # 圖 1: Generated
+    im_gen = axes[0, 0].imshow(gen_data_to_plot, cmap='viridis')
+    axes[0, 0].set_title(f'Generated ({title_suffix})')
+    axes[0, 0].axis('off') # 隱藏座標軸
+    fig.colorbar(im_gen, ax=axes[0, 0], fraction=0.046, pad=0.04)
+
+    # 圖 2: Original
+    im_orig = axes[0, 1].imshow(orig_data_to_plot, cmap='viridis')
+    axes[0, 1].set_title(f'Original ({title_suffix})')
+    axes[0, 1].axis('off')
+    fig.colorbar(im_orig, ax=axes[0, 1], fraction=0.046, pad=0.04)
+
+    # 圖 3: MSE
+    im_mse = axes[0, 2].imshow(mse_matrix, cmap='hot')
+    axes[0, 2].set_title(f'MSE Grid (Avg: {overall_mse:.0f})')
+    axes[0, 2].axis('off')
+    fig.colorbar(im_mse, ax=axes[0, 2], fraction=0.046, pad=0.04)
+
+    # 圖 4: MAE
+    im_mae = axes[1, 0].imshow(mae_matrix, cmap='hot')
+    axes[1, 0].set_title(f'MAE Grid (Avg: {overall_mae:.0f})')
+    axes[1, 0].axis('off')
+    fig.colorbar(im_mae, ax=axes[1, 0], fraction=0.046, pad=0.04)
+
+    # 圖 5: MAPE
+    # MAPE 值可能差異很大，可以考慮使用 vmin 和 vmax 來設定顯示範圍
+    vmax_mape = np.percentile(mape_matrix[np.isfinite(mape_matrix)], 98) if np.any(np.isfinite(mape_matrix)) else 100 # 取98百分位數作為上限，避免極端值影響
+    im_mape = axes[1, 1].imshow(mape_matrix, cmap='cividis', vmin=0, vmax=vmax_mape if vmax_mape > 0 else 100)
+    axes[1, 1].set_title(f'MAPE Grid (Avg: {overall_mape:.0f})')
+    axes[1, 1].axis('off')
+    fig.colorbar(im_mape, ax=axes[1, 1], fraction=0.046, pad=0.04)
+
+    # 圖 6: SMAPE
+    # SMAPE 值通常在 0-200% 或 0-100% (取決於定義)
+    vmax_smape = np.percentile(smape_matrix[np.isfinite(smape_matrix)], 98) if np.any(np.isfinite(smape_matrix)) else 100
+    im_smape = axes[1, 2].imshow(smape_matrix, cmap='cividis', vmin=0, vmax=vmax_smape if vmax_smape > 0 else 100) # SMAPE 範圍 0-100% 或 0-200%
+    axes[1, 2].set_title(f'SMAPE Grid (Avg: {overall_smape:.0f})')
+    axes[1, 2].axis('off')
+    fig.colorbar(im_smape, ax=axes[1, 2], fraction=0.046, pad=0.04)
+  
+
+    plt.tight_layout()
+    # 更改儲存的檔名以反映是六張圖的比較
+    plt.savefig(os.path.join(save_dir, f'{prefix}_6maps_comparison_{title_suffix}.png'), dpi=300)
+    plt.close(fig)
+
+def plot_grid_with_error_long_term(
+                        dataset_for_coords: Any, # 實際應為 PeopleFlowDatasetCondition 實例
+                        error_metrics_grids: Dict[str, np.ndarray], # 例如: {'MSE': mse_grid, 'MAE': mae_grid, ...}
+                        config: Dict[str, Any],
+                        prefix: str = "test_eval"
+                       ):
+    """
+    在地理座標上繪製每個網格點的平均誤差。
+    標籤和標題已修改為英文。
+    色彩映射修改為紅到黑，圖內數字為白色整數（MSE圖不顯示數字）。
+    """
+    logger = logging.getLogger(__name__) # 確保 logger 在函數作用域內可用
+    save_dir = config["save_dir"]
+    os.makedirs(save_dir, exist_ok=True)
+
+    H, W = config["H"], config["W"]
+    if not hasattr(dataset_for_coords, 'sorted_flow_columns') or \
+       not hasattr(dataset_for_coords, 'grid_idx_to_rc_map') or \
+       not hasattr(dataset_for_coords, 'selected_sensor_info'):
+        logger.error("Dataset instance lacks necessary grid mapping information (sorted_flow_columns, grid_idx_to_rc_map, selected_sensor_info).")
+        return
+
+    selected_sensor_info_dict = {info['name']: (info['lon'], info['lat']) for info in dataset_for_coords.selected_sensor_info}
+
+    actual_sensor_lons = []
+    actual_sensor_lats = []
+    valid_grid_indices_flat = []
+
+    for flat_grid_idx in range(H * W):
+        if flat_grid_idx < len(dataset_for_coords.sorted_flow_columns):
+            col_name = dataset_for_coords.sorted_flow_columns[flat_grid_idx]
+            if col_name in selected_sensor_info_dict:
+                lon, lat = selected_sensor_info_dict[col_name]
+                actual_sensor_lons.append(lon)
+                actual_sensor_lats.append(lat)
+                valid_grid_indices_flat.append(flat_grid_idx)
+            else:
+                logger.warning(f"plot_grid_with_error: Column {col_name} (expected at grid index {flat_grid_idx}) not found in selected_sensor_info_dict.")
+        else:
+            logger.warning(f"plot_grid_with_error: flat_grid_idx {flat_grid_idx} is out of bounds for sorted_flow_columns (length: {len(dataset_for_coords.sorted_flow_columns)}).")
+
+    if not actual_sensor_lons:
+        logger.error("plot_grid_with_error: Could not retrieve coordinates for any grid points.")
+        return
+
+    # 定義從紅色到黑色的色彩映射
+    # 紅色 (低值) -> 黑色 (高值)
+    cdict_red_to_black = {
+        'red':   ((0.0, 1.0, 1.0),  # 在 0.0 (低值) 時，紅色為 1
+                  (1.0, 0.0, 0.0)), # 在 1.0 (高值) 時，紅色為 0
+        'green': ((0.0, 0.0, 0.0),  # 綠色始終為 0
+                  (1.0, 0.0, 0.0)),
+        'blue':  ((0.0, 0.0, 0.0),  # 藍色始終為 0
+                  (1.0, 0.0, 0.0))
+    }
+    red_to_black_cmap = mcolors.LinearSegmentedColormap('RedToBlack', cdict_red_to_black)
+
+    for metric_name, error_grid_flat in error_metrics_grids.items():
+        if error_grid_flat.shape[0] != H*W :
+            logger.error(f"Dimension of error_grid for metric {metric_name} ({error_grid_flat.shape}) is incorrect. Expected ({H*W},). Skipping plot.")
+            continue
+
+        error_values_for_plot = error_grid_flat[valid_grid_indices_flat]
+        
+        if len(error_values_for_plot) == 0:
+            logger.warning(f"No valid error values to plot for metric {metric_name} after filtering by valid_grid_indices_flat. Skipping plot.")
+            continue
+
+        plt.figure(figsize=(12, 12))
+        # 使用新的 red_to_black_cmap
+        scatter = plt.scatter(actual_sensor_lons, actual_sensor_lats, c=error_values_for_plot, cmap=red_to_black_cmap, marker='s', s=100)
+        plt.colorbar(scatter, label=metric_name)
+
+        # 只有非 MSE 的指標圖才在網格上顯示數字
+        if metric_name.upper() != 'MSE':
+            for i in range(len(actual_sensor_lons)):
+                val_to_text = error_values_for_plot[i]
+                plt.text(actual_sensor_lons[i], actual_sensor_lats[i],
+                         f'{val_to_text:.0f}', # 修改為顯示整數
+                         fontsize=6, color='white', ha='center', va='center') # 修改文字顏色為白色
+
+        plt.xlabel("Longitude")
+        plt.ylabel("Latitude")
+        plt.title(f"Geographic Grid Error Heatmap - {metric_name.upper()}")
+        plt.grid(True, linestyle=':', alpha=0.6)
+        plt.savefig(os.path.join(save_dir, f'{prefix}_grid_error_map_{metric_name.lower()}.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info(f"Saved {metric_name} geographic grid error map.")
+                        
+
 # evaluate_model 函數
 # (假設其定義與先前完整腳本相同，
 # 但需傳遞純量小時/星期至 ddpm_model.sample)
 @torch.no_grad()
-def evaluate_model(ddpm_model: DDPM3D,
-                   dataloader: DataLoader,
-                   inception_model_fid: nn.Module,
-                   config: Dict[str, Any],
-                   max_samples_for_fid: Optional[int] = None # FID 計算的最大樣本數
-                   ) -> Dict[str, float]:
-    """評估 DDPM 模型，計算 MSE, MAE, MAPE, SMAPE, FID。"""
+def evaluate_model(ddpm_model: DDPM3D, 
+                   dataloader: torch.utils.data.DataLoader, 
+                   inception_model_fid: torch.nn.Module, 
+                   config: Dict[str, Any], # 使用 Any 以適應 config 的多樣性
+                   max_samples_for_fid: Optional[int] = None
+                   ) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]: 
+    logger = logging.getLogger(__name__)
     ddpm_model.eval()
     inception_model_fid.eval()
 
-    all_generated_samples_for_fid = [] # 儲存正規化的生成樣本 (FID用)
-    all_original_samples_for_fid = []  # 儲存正規化的原始樣本 (FID用)
+    all_generated_samples_for_fid: List[torch.Tensor] = [] # 明確類型
+    all_original_samples_for_fid: List[torch.Tensor] = []  # 明確類型
+    all_generated_denorm_list: List[torch.Tensor] = [] # 明確類型
+    all_original_denorm_list: List[torch.Tensor] = []  # 明確類型
+    
+    max_fid_samples_limit = len(dataloader.dataset) # type: ignore
+    if max_samples_for_fid is not None:
+         max_fid_samples_limit = min(max_samples_for_fid, len(dataloader.dataset)) # type: ignore
 
-    # MSE, MAE, MAPE, SMAPE 在反正規化後的數值上操作
-    all_generated_denorm_list = []
-    all_original_denorm_list = []
+    dataset_obj = dataloader.dataset # type: ignore
+    if not hasattr(dataset_obj, 'norm_stats_flow') or dataset_obj.norm_stats_flow is None: # type: ignore
+        raise AttributeError("dataloader.dataset does not have 'norm_stats_flow'.")
+    mean_val: float = dataset_obj.norm_stats_flow['mean'] # type: ignore
+    std_val: float = dataset_obj.norm_stats_flow['std'] # type: ignore
+    if std_val < 1e-6: std_val = 1.0
+    
+    pbar = tqdm(dataloader, desc="Evaluating Model", leave=False)
+    for batch_idx, data_tuple in enumerate(pbar):
+        # DataLoader 解包: (target_flow_tensor, hour_original, is_holiday_original, extra_data_row_tensor)
+        target_avg_flow_norm, hour_scalars, is_holiday_scalars, _ = data_tuple
 
-    total_samples_processed_for_metrics = 0
-
-    # 若未指定 FID 樣本數，則使用整個資料集
-    max_fid_samples = max_samples_for_fid if max_samples_for_fid is not None else len(dataloader.dataset)
-
-    pbar = tqdm(dataloader, desc="評估模型", leave=False)
-    for batch_idx, (target_avg_flow_norm, hour_scalars, day_scalars, _) in enumerate(pbar): # _ 是 extra_data_rows
         current_batch_size = target_avg_flow_norm.shape[0]
-
         target_avg_flow_norm = target_avg_flow_norm.to(config["device"])
+        hour_scalars = hour_scalars.to(config["device"])
+        is_holiday_scalars = is_holiday_scalars.to(config["device"]) 
 
-        # 生成流量圖 (正規化)
         generated_flow_norm = ddpm_model.sample(
             batch_size=current_batch_size,
-            hour_scalars_batch=hour_scalars, # 直接傳遞，DDPM 內部處理裝置
-            day_scalars_batch=day_scalars   # 直接傳遞
-        ) # 輸出為 (N, 1, D, H, W)，已正規化
-
-        # 反正規化以計算 MSE/MAE/MAPE/SMAPE
-        if hasattr(dataloader.dataset, 'norm_stats_flow') and dataloader.dataset.norm_stats_flow is not None:
-            mean_val = dataloader.dataset.norm_stats_flow['mean']
-            std_val = dataloader.dataset.norm_stats_flow['std']
-        else: # 若找不到標準化統計量 (理論上不應發生)
-            logger.error("在資料集中找不到標準化統計量 (norm_stats_flow)。無法反正規化。")
-            mean_val, std_val = 0, 1 # 預設為無操作
-
+            hour_scalars_batch=hour_scalars, 
+            is_holiday_scalars_batch=is_holiday_scalars 
+        )
+        
         generated_flow_denorm = generated_flow_norm * std_val + mean_val
         target_avg_flow_denorm = target_avg_flow_norm * std_val + mean_val
-
         all_generated_denorm_list.append(generated_flow_denorm.cpu())
         all_original_denorm_list.append(target_avg_flow_denorm.cpu())
 
-        # 為 FID 收集正規化樣本
-        if len(all_generated_samples_for_fid) * config.get("eval_batch_size", current_batch_size) < max_fid_samples : # 確保不超出 FID 樣本限制
-             all_generated_samples_for_fid.append(generated_flow_norm.cpu())
-             all_original_samples_for_fid.append(target_avg_flow_norm.cpu())
+        # samples_collected_fid = len(all_generated_samples_for_fid) * (dataloader.batch_size if dataloader.batch_size is not None else 0)
+        samples_collected_fid = sum(s.shape[0] for s in all_generated_samples_for_fid)
 
-        total_samples_processed_for_metrics += current_batch_size
-        # 此處不提早中斷，以便 MSE/MAE 等指標能在完整驗證/測試集上計算
-        # FID 樣本數的限制主要影響 FID 計算部分
-
-    # 串接所有反正規化的批次以計算指標
-    if not all_generated_denorm_list: # 處理 dataloader 為空的情況
-        logger.warning("評估期間未處理任何資料。返回零指標。")
-        return {"mse": 0.0, "mae": 0.0, "mape": 0.0, "smape": 0.0, "fid": float('nan')} # FID 為 NaN
+        if samples_collected_fid < max_fid_samples_limit :
+             remaining_needed = max_fid_samples_limit - samples_collected_fid
+             samples_to_add = min(current_batch_size, remaining_needed)
+             if samples_to_add > 0:
+                 all_generated_samples_for_fid.append(generated_flow_norm[:samples_to_add].cpu())
+                 all_original_samples_for_fid.append(target_avg_flow_norm[:samples_to_add].cpu())
+    
+    if not all_generated_denorm_list: 
+        logger.warning("No data processed during evaluation. Returning zero/NaN metrics.")
+        nan_grid = np.full((config["H"] * config["W"],), np.nan)
+        return ({"mse": 0.0, "mae": 0.0, "mape": 0.0, "smape": 0.0, "fid": float('nan')},
+                {'MSE': nan_grid, 'MAE': nan_grid, 'MAPE': nan_grid, 'SMAPE': nan_grid})
 
     generated_all_denorm_t = torch.cat(all_generated_denorm_list, dim=0)
     original_all_denorm_t = torch.cat(all_original_denorm_list, dim=0)
-
-    # 在所有收集到的反正規化樣本上計算指標
-    epsilon = 1e-8 # 用於 MAPE/SMAPE 避免除以零
-
+    epsilon = 1e-8 
+    
     mse_total = F.mse_loss(generated_all_denorm_t, original_all_denorm_t).item()
     mae_total = F.l1_loss(generated_all_denorm_t, original_all_denorm_t).item()
+    
+    # MAPE and SMAPE calculations
+    mape_tensor = torch.abs((original_all_denorm_t - generated_all_denorm_t) / (torch.abs(original_all_denorm_t) + epsilon)) * 100
+    valid_mape_tensor = mape_tensor[torch.isfinite(mape_tensor)]
+    mape_total = torch.mean(valid_mape_tensor).item() if valid_mape_tensor.numel() > 0 else float('inf')
 
-    # MAPE 計算
-    mape_total = torch.mean(torch.abs((original_all_denorm_t - generated_all_denorm_t) /
-                                     (torch.abs(original_all_denorm_t) + epsilon))) * 100
-    mape_total = mape_total.item()
-
-    # SMAPE 計算 (常見定義: 200 * |pred - actual| / (|actual| + |pred| + epsilon))
     smape_numerator = torch.abs(generated_all_denorm_t - original_all_denorm_t)
     smape_denominator = torch.abs(original_all_denorm_t) + torch.abs(generated_all_denorm_t) + epsilon
-    smape_total = torch.mean(200 * smape_numerator / smape_denominator)
-    smape_total = smape_total.item()
+    smape_tensor = 200 * smape_numerator / smape_denominator
+    valid_smape_tensor = smape_tensor[torch.isfinite(smape_tensor)]
+    smape_total = torch.mean(valid_smape_tensor).item() if valid_smape_tensor.numel() > 0 else float('inf')
+    
+    metrics: Dict[str, float] = {"mse": mse_total, "mae": mae_total, "mape": mape_total, "smape": smape_total, "fid": float('nan')}
 
-    metrics = {"mse": mse_total, "mae": mae_total, "mape": mape_total, "smape": smape_total, "fid": float('nan')}
-
-    # --- FID 計算 (使用正規化樣本) ---
-    num_fid_samples_to_calc = 0
+    fid_score = float('nan')
     if all_generated_samples_for_fid and all_original_samples_for_fid:
-        generated_tensor_fid = torch.cat(all_generated_samples_for_fid, dim=0)[:max_fid_samples]
-        original_tensor_fid = torch.cat(all_original_samples_for_fid, dim=0)[:max_fid_samples]
-        num_fid_samples_to_calc = min(generated_tensor_fid.shape[0], original_tensor_fid.shape[0]) # 取實際收集到的較小者
+        generated_tensor_fid = torch.cat(all_generated_samples_for_fid, dim=0)[:max_fid_samples_limit]
+        original_tensor_fid = torch.cat(all_original_samples_for_fid, dim=0)[:max_fid_samples_limit]
+        num_fid_samples_to_calc = min(generated_tensor_fid.shape[0], original_tensor_fid.shape[0])
+        
+        if num_fid_samples_to_calc > 1 : 
+            logger.info(f"Calculating FID on {num_fid_samples_to_calc} samples...")
+            try:
+                act_generated = get_activations(generated_tensor_fid, inception_model_fid, config["device"], config.get("fid_batch_size", 64))
+                act_original = get_activations(original_tensor_fid, inception_model_fid, config["device"], config.get("fid_batch_size", 64))
+                if act_generated.shape[0] > 1 and act_original.shape[0] > 1:
+                     fid_score = calculate_fid(act_original, act_generated)
+                     logger.info(f"FID calculation completed: {fid_score:.4f}")
+                else: logger.warning("Insufficient features for FID after activation.")
+            except NameError as e: logger.error(f"FID: Function not defined? {e}")
+            except Exception as e: logger.error(f"FID calculation failed: {e}")
+        else: logger.warning(f"Insufficient samples ({num_fid_samples_to_calc}) for FID.")
+    else: logger.warning("Sample lists for FID are empty.")
+    metrics["fid"] = fid_score if np.isfinite(fid_score) else float('nan')
 
-        if num_fid_samples_to_calc > 1 : # 共變異數矩陣至少需要 2 個樣本
-            logger.info(f"在 {num_fid_samples_to_calc} 個樣本上計算 FID...")
-            act_generated = get_activations(generated_tensor_fid[:num_fid_samples_to_calc], inception_model_fid, config["device"], config["fid_batch_size"])
-            act_original = get_activations(original_tensor_fid[:num_fid_samples_to_calc], inception_model_fid, config["device"], config["fid_batch_size"])
+    logger.info("Generating detailed evaluation visualizations...")
+    try:
+        if generated_all_denorm_t.numel() > 0 and original_all_denorm_t.numel() > 0:
+            visualize_predictions_long_term(generated_all_denorm_t.clone().cpu(), original_all_denorm_t.clone().cpu(), config, 0, "test_eval_sample0")
+            visualize_predictions_long_term(generated_all_denorm_t.clone().cpu(), original_all_denorm_t.clone().cpu(), config, None, "test_eval_avg")
+    except NameError: logger.error("visualize_predictions_long_term not defined.")
+    except Exception as e: logger.error(f"Error in prediction visualization: {e}")
 
-            if act_generated.shape[0] > 1 and act_original.shape[0] > 1: # 確保 get_activations 後仍有足夠樣本
-                 metrics["fid"] = calculate_fid(act_original, act_generated)
-                 logger.info(f"FID 計算完成: {metrics['fid']:.4f}")
-            else:
-                logger.warning("處理後，FID 計算的有效特徵不足。")
-                metrics["fid"] = float('nan')
-        else:
-            logger.warning(f"收集或可用的 FID 計算樣本 ({num_fid_samples_to_calc}) 不足。")
-            metrics["fid"] = float('nan')
-    else:
-        logger.warning("FID 的樣本列表為空。")
-        metrics["fid"] = float('nan')
+    error_metrics_grids: Dict[str, np.ndarray] = { m: np.full((config["H"] * config["W"],), np.nan) for m in ['MSE','MAE','MAPE','SMAPE']}
+    if hasattr(dataset_obj, 'H') and hasattr(dataset_obj, 'W'): # type: ignore
+        H_ds, W_ds = dataset_obj.H, dataset_obj.W # type: ignore
+        num_grid_cells_ds = H_ds * W_ds
+        if generated_all_denorm_t.ndim == 5 and generated_all_denorm_t.shape[-2:] == (H_ds, W_ds):
+            mse_g = torch.mean((generated_all_denorm_t - original_all_denorm_t)**2, dim=(0,1,2)).cpu().numpy().flatten()
+            mae_g = torch.mean(torch.abs(generated_all_denorm_t - original_all_denorm_t), dim=(0,1,2)).cpu().numpy().flatten()
+            mape_g_tensor = torch.abs((original_all_denorm_t - generated_all_denorm_t) / (torch.abs(original_all_denorm_t) + epsilon)) * 100
+            mape_g = torch.mean(mape_g_tensor, dim=(0,1,2)).cpu().numpy().flatten()
+            smape_n_g = torch.abs(generated_all_denorm_t - original_all_denorm_t)
+            smape_d_g = torch.abs(original_all_denorm_t) + torch.abs(generated_all_denorm_t) + epsilon
+            smape_g_tensor = 200 * smape_n_g / smape_d_g
+            smape_g = torch.mean(smape_g_tensor, dim=(0,1,2)).cpu().numpy().flatten()
 
-    return metrics
+            if len(mse_g) == num_grid_cells_ds:
+                error_metrics_grids = {'MSE': mse_g, 'MAE': mae_g, 'MAPE': mape_g, 'SMAPE': smape_g}
+                try: plot_grid_with_error_long_term(dataset_obj, error_metrics_grids, config, "test_eval") # type: ignore
+                except NameError: logger.error("plot_grid_with_error_long_term not defined.")
+                except Exception as e: logger.error(f"Error in grid error plotting: {e}")
+            else: logger.warning(f"Per-grid metrics length mismatch. Skipping grid error plot.")
+        else: logger.warning("Generated tensor shape mismatch. Skipping grid error plot.")
+    else: logger.warning("Dataset missing H/W attributes. Skipping grid error plot.")
+    logger.info("Detailed evaluation visualizations finished.")
+    return metrics, error_metrics_grids
+
 
 # 主訓練腳本
 # (假設其定義與先前完整腳本相同，
@@ -830,11 +1203,11 @@ if __name__ == '__main__':
     logger.info("==========================================================")
     logger.info(f"組態設定: {json.dumps(CONFIG, indent=2)}")
 
-    try:
-        full_df = pd.read_csv(CONFIG["data_path"])
-        logger.info(f"已載入資料: {CONFIG['data_path']}. 形狀: {full_df.shape}")
-    except Exception as e:
-        logger.error(f"載入資料錯誤: {e}. 程式結束。"); exit()
+
+    full_df = pd.read_csv(CONFIG["data_path"])
+    logger.info(f"已載入資料: {CONFIG['data_path']}. 形狀: {full_df.shape}")
+
+
 
     # 資料分割
     total_len = len(full_df)
@@ -853,25 +1226,35 @@ if __name__ == '__main__':
     logger.info(f"資料分割: 訓練集={len(train_df)}, 驗證集={len(val_df)}, 測試集={len(test_df)}")
 
 
-    try:
-        logger.info("建立訓練資料集...")
-        train_dataset = PeopleFlowDatasetCondition(train_df, CONFIG, mode='train')
-        logger.info("建立驗證資料集...")
-        val_dataset = PeopleFlowDatasetCondition(val_df, CONFIG, mode='val',
-                                               average_flow_map_dict=train_dataset.average_flow_map_dict,
-                                               norm_stats_flow=train_dataset.norm_stats_flow,
-                                               sorted_flow_columns=train_dataset.sorted_flow_columns,
-                                               grid_idx_to_rc_map=train_dataset.grid_idx_to_rc_map,
-                                               processed_extra_columns=train_dataset.processed_extra_columns)
-        logger.info("建立測試資料集...")
-        test_dataset = PeopleFlowDatasetCondition(test_df, CONFIG, mode='test',
-                                                average_flow_map_dict=train_dataset.average_flow_map_dict,
-                                                norm_stats_flow=train_dataset.norm_stats_flow,
-                                                sorted_flow_columns=train_dataset.sorted_flow_columns,
-                                                grid_idx_to_rc_map=train_dataset.grid_idx_to_rc_map,
-                                                processed_extra_columns=train_dataset.processed_extra_columns)
-    except Exception as e:
-        logger.error(f"建立資料集錯誤: {e}。", exc_info=True); exit()
+    logger.info("建立訓練資料集...")
+    train_dataset = PeopleFlowDatasetCondition(train_df, CONFIG, mode='train')
+    
+    logger.info("建立驗證資料集...")
+    val_dataset = PeopleFlowDatasetCondition(
+        val_df,
+        CONFIG,
+        mode='val',
+        average_flow_map_dict=train_dataset.average_flow_map_dict,
+        norm_stats_flow=train_dataset.norm_stats_flow,
+        sorted_flow_columns_from_train=train_dataset.sorted_flow_columns,
+        grid_idx_to_rc_map_from_train=train_dataset.grid_idx_to_rc_map,
+        processed_extra_columns_from_train=train_dataset.processed_extra_columns,
+        selected_sensor_info_from_train=train_dataset.selected_sensor_info # <--- 確保傳遞此參數
+    )
+
+    logger.info("建立測試資料集...")
+    test_dataset = PeopleFlowDatasetCondition(
+        test_df,
+        CONFIG,
+        mode='test',
+        average_flow_map_dict=train_dataset.average_flow_map_dict,
+        norm_stats_flow=train_dataset.norm_stats_flow,
+        sorted_flow_columns_from_train=train_dataset.sorted_flow_columns,
+        grid_idx_to_rc_map_from_train=train_dataset.grid_idx_to_rc_map,
+        processed_extra_columns_from_train=train_dataset.processed_extra_columns,
+        selected_sensor_info_from_train=train_dataset.selected_sensor_info # <--- 確保傳遞此參數
+    )
+
 
     train_loader = DataLoader(train_dataset, batch_size=CONFIG["batch_size"], shuffle=True, num_workers=CONFIG["num_workers"], pin_memory=True, drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size=CONFIG["eval_batch_size"], shuffle=False, num_workers=CONFIG["num_workers"], pin_memory=True)
@@ -879,7 +1262,13 @@ if __name__ == '__main__':
     logger.info("DataLoaders 建立完成。")
 
     logger.info("初始化 UNet3D 模型...")
-    unet = UNet3D(CONFIG["image_channels"], CONFIG["base_channels_unet"], CONFIG["time_emb_dim"], CONFIG["condition_encode_dim"]).to(CONFIG["device"])
+    unet = UNet3D(
+        CONFIG["image_channels"],
+        CONFIG["base_channels_unet"],
+        CONFIG["time_emb_dim"],
+        CONFIG["condition_encode_dim"],
+        dropout_rate=CONFIG.get("unet_dropout_rate", 0.05) 
+    ).to(CONFIG["device"]) 
     logger.info("初始化 DDPM3D 模型...")
     ddpm = DDPM3D(unet, CONFIG["timesteps"], (CONFIG["D"],CONFIG["H"],CONFIG["W"]), CONFIG["image_channels"],
                   CONFIG["condition_input_channels"], CONFIG["condition_encode_dim"],
@@ -891,26 +1280,141 @@ if __name__ == '__main__':
     optimizer = optim.AdamW(list(ddpm.model.parameters()) + list(ddpm.condition_processor.parameters()), lr=CONFIG["lr"])
 
     logger.info("載入 InceptionV3 以計算 FID...")
-    inception_fid = inception_v3(weights=Inception_V3_Weights.DEFAULT, aux_logits=False)
-    inception_fid.fc = nn.Identity() # 移除最後的全連接層以獲取特徵
+    # 保持 aux_logits=True 以匹配預訓練權重
+    inception_fid = inception_v3(weights=Inception_V3_Weights.DEFAULT, aux_logits=True)
+
+    inception_fid.fc = nn.Identity()
+
+    # 按照您原始程式碼的風格，如果存在 AuxLogits，則將其設為 None
+    if hasattr(inception_fid, 'AuxLogits') and inception_fid.AuxLogits is not None:
+        inception_fid.AuxLogits = None
+
     inception_fid = inception_fid.to(CONFIG["device"])
     inception_fid.eval()
     logger.info("InceptionV3 載入完成。")
 
+    optimizer = optim.AdamW(
+    list(ddpm.model.parameters()) + list(ddpm.condition_processor.parameters()),
+    lr=CONFIG["lr"],
+    weight_decay=CONFIG["weight_decay"]
+)
+
+    # --- 在開始訓練迴圈之前，定義 scheduler ---
+    # (修改) Scheduler 現在監控 avg_train_loss
+    scheduler = ReduceLROnPlateau(optimizer,
+                                  mode='min', # 訓練損失越小越好
+                                  factor=CONFIG["lr_scheduler_factor"],
+                                  patience=CONFIG["lr_scheduler_patience"],
+                                  min_lr=CONFIG["lr_scheduler_min_lr"])
+
+    start_epoch = 1 # 預設從 epoch 1 開始
+    best_loss_for_early_stopping_and_scheduler = float('inf')
+    best_val_loss_for_saving = float('inf')
+    best_val_loss_epoch = 0
+    metrics_hist = {'train_loss':[], 'val_loss':[], 'lr':[]}
+    early_stopping_counter = 0
+    last_calculated_avg_val_loss = float('inf')
+
+    checkpoint_filename = CONFIG.get("checkpoint_path", "best_ddpm_model_during_training.pth")
+    checkpoint_full_path = os.path.join(CONFIG["save_dir"], checkpoint_filename)
+
+    if CONFIG.get("resume_from_checkpoint", True) and os.path.exists(checkpoint_full_path):
+        logger.info(f"找到檢查點: {checkpoint_full_path}，嘗試載入...")
+        try:
+            # 使用之前解決 UnpicklingError 的方法載入
+            import numpy
+            import pickle
+            with torch.serialization.safe_globals([numpy, numpy.float32, numpy.float64, numpy.int32, numpy.int64]):
+                chkpt = torch.load(checkpoint_full_path, map_location=CONFIG["device"], weights_only=False)
+        
+            # 載入模型狀態
+            ddpm.load_state_dict(chkpt['ddpm_state_dict'])
+        
+            # 載入優化器和排程器狀態 (如果存在)
+            if 'optimizer_state_dict' in chkpt:
+                optimizer.load_state_dict(chkpt['optimizer_state_dict'])
+                logger.info("已成功載入優化器狀態。")
+            else:
+                logger.warning("檢查點中未找到 'optimizer_state_dict'，優化器將從頭開始。")
+
+            if 'scheduler_state_dict' in chkpt:
+                scheduler.load_state_dict(chkpt['scheduler_state_dict'])
+                logger.info("已成功載入排程器狀態。")
+            else:
+                logger.warning("檢查點中未找到 'scheduler_state_dict'，排程器將從頭開始。")
+
+            # 恢復訓練進度相關的變數
+            start_epoch = chkpt.get('epoch', 0) + 1 # 從下一個 epoch 開始
+        
+            # 恢復最佳驗證損失 (用於模型保存)
+            best_val_loss_for_saving = chkpt.get('best_val_loss_for_saving', float('inf'))
+            best_val_loss_epoch = chkpt.get('epoch', 0) # epoch ที่บันทึก best_val_loss
+
+            # 恢復用於早停和 LR scheduler 的訓練損失 (如果您的邏輯是基於訓練損失)
+            # 如果您的早停和 scheduler 基於驗證損失，則不需要下面這行
+            # best_loss_for_early_stopping_and_scheduler = chkpt.get('best_train_loss_for_scheduler', float('inf')) 
+        
+            # 嘗試恢復 metrics_hist, early_stopping_counter, last_calculated_avg_val_loss
+            # 這些通常在訓練迴圈內更新，如果檢查點是 epoch 結束時存的，可以考慮恢復
+            # 但更簡單的做法是讓它們從頭開始記錄，或者只恢復 epoch 和損失，讓 scheduler 自己判斷
+            # 為了簡單起見，這裡只恢復 epoch 和關鍵損失，其他讓訓練迴圈重新建立
+        
+            # 比較儲存的CONFIG和當前的CONFIG (可選，但建議)
+            saved_config = chkpt.get('config', None)
+            if saved_config:
+                # 這裡可以加入更詳細的 CONFIG 比較邏輯
+                if saved_config['H'] != CONFIG['H'] or saved_config['W'] != CONFIG['W']:
+                    logger.warning("警告：載入的檢查點 CONFIG 與當前 CONFIG 的網格尺寸不符！可能導致錯誤。")
+                # ... 可以比較更多關鍵參數 ...
+        
+            logger.info(f"成功從 epoch {start_epoch-1} 的檢查點恢復訓練。將從 epoch {start_epoch} 開始。")
+            logger.info(f"恢復的最佳驗證損失 (用於模型保存): {best_val_loss_for_saving:.5f} (在 epoch {best_val_loss_epoch})")
+
+        except Exception as e:
+            logger.error(f"載入檢查點 {checkpoint_full_path} 失敗: {e}。將從頭開始訓練。")
+            start_epoch = 1 # 確保如果載入失敗，從頭開始
+            # 重置其他可能被部分修改的變數
+            best_loss_for_early_stopping_and_scheduler = float('inf')
+            best_val_loss_for_saving = float('inf')
+            best_val_loss_epoch = 0
+            metrics_hist = {'train_loss':[], 'val_loss':[], 'lr':[]}
+            early_stopping_counter = 0
+            last_calculated_avg_val_loss = float('inf')
+    else:
+        logger.info("未找到檢查點或未設定從檢查點恢復。將從頭開始訓練。")
+        # start_epoch 等變數已是預設值
+
     logger.info("開始訓練迴圈...")
-    best_val_metric = float('inf') # 使用 MSE 作為最佳模型判斷標準
-    metrics_hist = {'train_loss':[], 'val_loss':[], 'val_mse':[], 'val_mae':[], 'val_mape':[], 'val_smape':[], 'val_fid':[]} # 新增 MAPE, SMAPE
+
+    # 用於早停和 scheduler 的最佳訓練損失
+    best_loss_for_early_stopping_and_scheduler = float('inf')
+
+    # 用於保存最佳模型的最佳驗證損失
+    best_val_loss_for_saving = float('inf')
+    best_val_loss_epoch = 0
+
+
+    metrics_hist = {'train_loss':[], 'val_loss':[], 'lr':[]}
+
+    early_stopping_patience = CONFIG["early_stopping_patience"]
+    early_stopping_counter = 0
+
+    # (新增) 用於儲存每個 epoch 的驗證損失，即使不是每個 epoch 都計算
+    # 如果某個 epoch 不計算，則沿用上一次計算的值或者標記為無效
+    # current_epoch_val_loss 將代表當前 epoch 計算出 (或沿用) 的驗證損失
+    # last_calculated_avg_val_loss 用於記錄最近一次 *實際計算* 的驗證損失
+    last_calculated_avg_val_loss = float('inf')
+
 
     for epoch in range(1, CONFIG["epochs"] + 1):
         ddpm.train()
         total_train_loss = 0
         train_pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{CONFIG['epochs']} [訓練]", leave=False)
-        for x_start, hour_s, day_s, _ in train_pbar: # _ 是 extra_data_rows (目前未使用於損失計算)
+        for x_start, hour_s, is_holiday_s, _ in train_pbar: # <--- 修改迭代變數名
             optimizer.zero_grad()
             x_start = x_start.to(CONFIG["device"])
-            # hour_s, day_s 是 (N,)，已在 CPU 上，DDPM 內部方法會移至 device
-            t = torch.randint(0, CONFIG["timesteps"], (x_start.shape[0],), device=CONFIG["device"]).long() # 隨機取樣時間步 t
-            loss = ddpm.p_losses(x_start, t, hour_s, day_s) # 傳遞純量小時/星期
+            t = torch.randint(0, CONFIG["timesteps"], (x_start.shape[0],), device=CONFIG["device"]).long()
+            loss = ddpm.p_losses(x_start, t, hour_s, is_holiday_s) # <--- 修改傳遞的變數
             loss.backward()
             optimizer.step()
             total_train_loss += loss.item()
@@ -919,111 +1423,280 @@ if __name__ == '__main__':
         avg_train_loss = total_train_loss / len(train_loader)
         metrics_hist['train_loss'].append(avg_train_loss)
 
-        logger.info(f"Epoch {epoch} - 驗證中...")
-        val_metrics = evaluate_model(ddpm, val_loader, inception_fid, CONFIG, CONFIG["fid_num_samples"]//2) # FID 樣本數可調整
+        # --- 計算驗證集損失 (圖像 MSE) ---
+        # 初始化本 epoch 的驗證損失為 "未計算" 或上一次的值
+        current_epoch_val_loss_calculated = False # 標記本 epoch 是否實際計算了 val loss
+        avg_val_epoch_loss = last_calculated_avg_val_loss # 預設沿用，如果本 epoch 不計算
 
-        metrics_hist['val_loss'].append(val_metrics['mse']) # val_loss 以 mse 記錄
-        metrics_hist['val_mse'].append(val_metrics['mse'])
-        metrics_hist['val_mae'].append(val_metrics['mae'])
-        metrics_hist['val_mape'].append(val_metrics['mape'])
-        metrics_hist['val_smape'].append(val_metrics['smape'])
-        metrics_hist['val_fid'].append(val_metrics['fid'])
-        logger.info(f"E{epoch}: TrainL:{avg_train_loss:.5f}|ValMSE:{val_metrics['mse']:.5f}|ValMAE:{val_metrics['mae']:.5f}|ValMAPE:{val_metrics['mape']:.2f}%|ValSMAPE:{val_metrics['smape']:.2f}%|ValFID:{val_metrics['fid']:.3f}")
+        if epoch % CONFIG.get("val_calculation_freq", 1) == 0: # (修改) 從 CONFIG 讀取頻率，預設為1 (每個epoch)
+                                                              # 如果您仍想用 % 8 == 1, 請改為 (epoch -1) % 8 == 0 or epoch == 1
+                                                              # 或者更簡單： CONFIG["val_calculation_freq"] = 8, if epoch % CONFIG["val_calculation_freq"] == 0 (或 1 如果從1開始)
+            # 假設 CONFIG["val_calculation_freq"] = 8, 那就是每8個epoch計算一次
+            # 若要與您原來的 if epoch % 8 == 1 一致 (即epoch 1, 9, 17...), 可以這樣：
+            # if (epoch - 1) % CONFIG.get("val_calculation_freq", 8) == 0:PeopleFlowDatasetCondition
+            # 為了簡化，這裡假設 val_calculation_freq 指的是間隔，例如每 val_calculation_freq 個 epoch 計算一次
+            # 如果 CONFIG["val_calculation_freq"] = 1，則每個 epoch 都計算
+            # 如果 CONFIG["val_calculation_freq"] = 8，則 epoch 8, 16, 24... 計算
+            # 如果您希望是 epoch 1, 9, 17... ，則條件應為 (epoch - 1) % N == 0
 
-        if val_metrics['mse'] < best_val_metric:
-            best_val_metric = val_metrics['mse']
-            save_path = os.path.join(CONFIG["save_dir"], "best_ddpm_model.pth")
-            torch.save({
-                'epoch': epoch,
-                'ddpm_state_dict': ddpm.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'best_val_metric': best_val_metric,
-                'config': CONFIG, # 儲存當時的組態
-                'norm_stats_flow': train_dataset.norm_stats_flow, # 儲存流量標準化統計量
-                'sorted_flow_columns': train_dataset.sorted_flow_columns,
-                'grid_idx_to_rc_map': train_dataset.grid_idx_to_rc_map,
-                'processed_extra_columns': train_dataset.processed_extra_columns,
-            }, save_path)
-            logger.info(f"已儲存新的最佳模型至 {save_path} (Val MSE: {best_val_metric:.5f})")
+            # 採用每 N 個 epoch 計算一次的邏輯，N 來自 CONFIG["val_calculation_freq"]
+            # 預設 val_calculation_freq 為 1 (即每個 epoch 都計算驗證損失，以便最佳模型選擇更準確)
+            # 如果您堅持之前的每8個epoch在第1,9,17...計算，請將此條件改回 if (epoch-1)%8 == 0:
+            val_freq = CONFIG.get("val_calculation_freq", 1) # 預設每個epoch都計算
+            if epoch == 1 or (epoch % val_freq == 0) : # 在第一個epoch和之後每val_freq個epoch計算
+                current_epoch_val_loss_calculated = True
+                ddpm.eval()
+                total_val_epoch_loss_for_period = 0
+                num_val_samples_processed = 0
+                avg_val_epoch_loss = float('inf') # 重置為inf，如果驗證集為空則保持inf
 
-        # 每隔一定 epoch 或最後一個 epoch 儲存視覺化樣本
-        if epoch % (CONFIG["epochs"]//5 if CONFIG["epochs"] >=5 else 1) == 0 or epoch == CONFIG["epochs"]:
-            ddpm.eval() # 確保模型在評估模式
-            with torch.no_grad():
-                # 從驗證集取一小批資料作視覺化
-                fixed_x_s, fixed_hr_s, fixed_day_s, _ = next(iter(val_loader))
-                num_viz = min(4, fixed_hr_s.shape[0]) # 最多顯示 4 個樣本
-                fixed_hr_s = fixed_hr_s[:num_viz]
-                fixed_day_s = fixed_day_s[:num_viz]
-                fixed_x_s = fixed_x_s[:num_viz] # 也限制目標樣本數量
+                if len(val_loader.dataset) > 0:
+                    with torch.no_grad():
+                        val_pbar = tqdm(val_loader, desc=f"Epoch {epoch}/{CONFIG['epochs']} [驗證損失計算]", leave=False)
+                        for val_x_start, val_hour_s, val_is_holiday_s, _ in val_pbar:
+                            val_x_start = val_x_start.to(CONFIG["device"])
+                            generated_flow_norm = ddpm.sample(batch_size=val_x_start.shape[0], hour_scalars_batch=val_hour_s, is_holiday_scalars_batch=val_is_holiday_s)
+                            if not hasattr(train_dataset, 'norm_stats_flow') or train_dataset.norm_stats_flow is None:
+                                raise ValueError("train_dataset.norm_stats_flow 未定義或為 None，無法進行反正規化。")
+                            mean_val = train_dataset.norm_stats_flow['mean']
+                            std_val = train_dataset.norm_stats_flow['std']
+                            generated_flow_denorm = generated_flow_norm * std_val + mean_val
+                            target_avg_flow_denorm = val_x_start * std_val + mean_val
+                            batch_val_loss = F.mse_loss(generated_flow_denorm, target_avg_flow_denorm).item()
+                            total_val_epoch_loss_for_period += batch_val_loss * val_x_start.shape[0]
+                            num_val_samples_processed += val_x_start.shape[0]
 
-                logger.info(f"為 epoch {epoch} 生成視覺化樣本...")
-                gen_samples = ddpm.sample(num_viz, fixed_hr_s, fixed_day_s) # (num_viz, C, D, H, W)
+                    if num_val_samples_processed > 0:
+                        avg_val_epoch_loss = total_val_epoch_loss_for_period / num_val_samples_processed
+                        last_calculated_avg_val_loss = avg_val_epoch_loss # 更新最近 *實際計算* 的驗證損失
+                    else:
+                        logger.warning(f"Epoch {epoch}: 驗證集為空，無法計算驗證損失。")
+                        # avg_val_epoch_loss 保持 float('inf')
+                else:
+                     logger.warning(f"Epoch {epoch}: 驗證集為空，跳過驗證損失計算。")
+                     # avg_val_epoch_loss 保持 float('inf')
+    
+        metrics_hist['val_loss'].append(avg_val_epoch_loss) # 記錄當前epoch的驗證損失（可能是新算的，也可能是沿用的）
+    
+        # (修改) 更新學習率，基於 avg_train_loss
+        scheduler.step(avg_train_loss)
+        current_lr = optimizer.param_groups[0]['lr']
+        metrics_hist['lr'].append(current_lr)
+    
+        val_loss_display = f"{avg_val_epoch_loss:.5f}" if avg_val_epoch_loss != float('inf') else "N/A"
+        if current_epoch_val_loss_calculated:
+            val_loss_display += " (Calculated)"
+        else:
+            val_loss_display += " (Carried Over)"
 
-                # 反正規化以供視覺化
-                mean_v, std_v = train_dataset.norm_stats_flow['mean'], train_dataset.norm_stats_flow['std']
-                gen_denorm = gen_samples.cpu() * std_v + mean_v
-                orig_denorm = fixed_x_s.cpu() * std_v + mean_v # 目標也需反正規化
+        logger.info(f"Epoch {epoch}: Train Loss: {avg_train_loss:.5f} | Val Loss (Best Model Metric): {val_loss_display} | LR: {current_lr:.8f}")
 
-                fig, axes = plt.subplots(2, num_viz, figsize=(num_viz*3.5, 7), squeeze=False) # 調整 figsize
-                for i in range(num_viz):
-                    ax_orig, ax_gen = axes[0,i], axes[1,i]
-                    hr_title, dow_title = int(fixed_hr_s[i].item()), int(fixed_day_s[i].item())
+        # --- 早停邏輯，基於 avg_train_loss ---
+        if avg_train_loss < best_loss_for_early_stopping_and_scheduler:
+            best_loss_for_early_stopping_and_scheduler = avg_train_loss
+            early_stopping_counter = 0 # 重置早停計數器
+        else:
+            early_stopping_counter += 1
+            logger.info(f"訓練損失未改善 (current: {avg_train_loss:.5f} vs best for ES: {best_loss_for_early_stopping_and_scheduler:.5f})，早停計數: {early_stopping_counter}/{early_stopping_patience}")
+            if early_stopping_counter >= early_stopping_patience:
+                logger.info(f"早停機制觸發於 Epoch {epoch} (基於訓練損失)。")
+                break # 跳出訓練迴圈
 
-                    # 假設 D=1, C=1, 直接 squeeze()
-                    im_o = ax_orig.imshow(orig_denorm[i].squeeze().numpy(), cmap='viridis')
-                    ax_orig.set_title(f"目標 (H{hr_title} D{dow_title})")
-                    ax_orig.axis('off')
-                    fig.colorbar(im_o, ax=ax_orig, fraction=0.046, pad=0.04)
+        # --- 儲存最佳模型，基於 avg_val_epoch_loss ---
+        # 只有當本 epoch 實際計算了驗證損失，並且該損失有效時，才考慮更新最佳模型
+        if current_epoch_val_loss_calculated and avg_val_epoch_loss != float('inf'):
+            if avg_val_epoch_loss < best_val_loss_for_saving:
+                best_val_loss_for_saving = avg_val_epoch_loss
+                best_val_loss_epoch = epoch
+                save_path = os.path.join(CONFIG["save_dir"], "best_ddpm_model_during_training.pth") # 檔名保持不變或按需更改
+                torch.save({
+                    'epoch': epoch,
+                    'ddpm_state_dict': ddpm.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'best_val_loss_for_saving': best_val_loss_for_saving, # 記錄的是驗證損失
+                    'train_loss_at_best_val': avg_train_loss, # 記錄此時的訓練損失
+                    'config': CONFIG,
+                    'norm_stats_flow': train_dataset.norm_stats_flow,
+                    'sorted_flow_columns': train_dataset.sorted_flow_columns,
+                    'grid_idx_to_rc_map': train_dataset.grid_idx_to_rc_map,
+                    'selected_sensor_info': train_dataset.selected_sensor_info,
+                    'processed_extra_columns': train_dataset.processed_extra_columns,
+                }, save_path)
+                logger.info(f"已儲存新的最佳模型 (Epoch {best_val_loss_epoch} based on Val Loss: {best_val_loss_for_saving:.5f}) 至 {save_path}")
 
-                    im_g = ax_gen.imshow(gen_denorm[i].squeeze().numpy(), cmap='viridis')
-                    ax_gen.set_title(f"生成 (H{hr_title} D{dow_title})")
-                    ax_gen.axis('off')
-                    fig.colorbar(im_g, ax=ax_gen, fraction=0.046, pad=0.04)
-                plt.tight_layout()
-                plt.savefig(os.path.join(CONFIG["save_dir"],f"epoch_{epoch:03d}_samples.png"))
-                plt.close(fig)
-                logger.info(f"已儲存 epoch {epoch} 的視覺化樣本。")
     logger.info("訓練完成。")
+    if epoch < CONFIG["epochs"]:
+        logger.info(f"訓練因早停而提前結束於 Epoch {epoch}。")
 
-    logger.info("載入最佳模型以進行最終測試集評估...")
-    chkpt_path = os.path.join(CONFIG["save_dir"], "best_ddpm_model.pth")
-    if not os.path.exists(chkpt_path):
-        logger.error(f"找不到最佳模型檔案: {chkpt_path}。跳過最終評估。")
+    logger.info(f"訓練過程中，用於早停和LR調度的最低訓練損失是: {best_loss_for_early_stopping_and_scheduler:.5f}")
+    if best_val_loss_for_saving != float('inf'):
+        logger.info(f"訓練過程中，用於模型選擇的最低驗證損失發生在 epoch {best_val_loss_epoch}，Val Loss (MSE): {best_val_loss_for_saving:.5f}")
     else:
-        chkpt = torch.load(chkpt_path, map_location=CONFIG["device"])
-        cfg_chkpt = chkpt.get('config', CONFIG) # 若 checkpoint 無 config，使用當前 CONFIG (向下相容)
+        logger.info("訓練過程中，未計算或未記錄到有效的最低驗證損失用於模型保存。")
 
-        # 使用 checkpoint 中的組態重新初始化模型結構
-        final_unet = UNet3D(cfg_chkpt["image_channels"],cfg_chkpt["base_channels_unet"],cfg_chkpt["time_emb_dim"],cfg_chkpt["condition_encode_dim"]).to(CONFIG["device"])
-        final_ddpm = DDPM3D(final_unet,cfg_chkpt["timesteps"],(cfg_chkpt["D"],cfg_chkpt["H"],cfg_chkpt["W"]),cfg_chkpt["image_channels"],
-                            cfg_chkpt["condition_input_channels"],cfg_chkpt["condition_encode_dim"],
-                            beta_start=cfg_chkpt.get("beta_start", CONFIG["beta_start"]), # 向下相容
-                            beta_end=cfg_chkpt.get("beta_end", CONFIG["beta_end"]),       # 向下相容
-                            device=CONFIG["device"]) # 使用當前執行的 device
-        final_ddpm.load_state_dict(chkpt['ddpm_state_dict'])
-        logger.info("最佳模型載入完成。")
 
-        test_metrics = evaluate_model(final_ddpm, test_loader, inception_fid, CONFIG, CONFIG["fid_num_samples"]) # 在完整測試集上評估
-        logger.info(f"最終測試: MSE:{test_metrics['mse']:.5f}|MAE:{test_metrics['mae']:.5f}|MAPE:{test_metrics['mape']:.2f}%|SMAPE:{test_metrics['smape']:.2f}%|FID:{test_metrics['fid']:.3f}")
-        with open(os.path.join(CONFIG["save_dir"], "final_test_metrics.json"),'w') as f: json.dump(test_metrics,f,indent=4)
-        with open(os.path.join(CONFIG["save_dir"], "final_test_metrics.txt"),'w') as f:
-            f.write(f"最終測試指標 (FID on {CONFIG['fid_num_samples']} samples):\n日期: {pd.Timestamp.now(tz='Asia/Taipei')}\n")
-            for k,v in test_metrics.items(): f.write(f"{k.upper()}: {v:.6f}\n")
+        # --- 所有 epoch 訓練完成後，載入最佳模型並進行最終評估 ---
+logger.info("載入訓練過程中驗證損失最低的模型以進行最終測試集評估...")
+best_model_path = os.path.join(CONFIG["save_dir"], "best_ddpm_model_during_training.pth")
+
+if not os.path.exists(best_model_path):
+    logger.error(f"找不到在訓練過程中儲存的最佳模型檔案: {best_model_path}。將使用最後一個 epoch 的模型進行評估。")
+    # 如果沒有找到最佳模型（例如，如果上面的儲存邏輯有問題或被跳過），
+    # final_ddpm 會是訓練結束時的 ddpm 狀態。
+    # 也可以選擇在這裡 raise Error 或採取其他策略。
+    final_ddpm_for_eval = ddpm # 使用最後一個 epoch 的模型
+else:
+    chkpt = torch.load(best_model_path, map_location=CONFIG["device"], weights_only=False)
+    cfg_chkpt = chkpt.get('config', CONFIG)
+
+    # 重新初始化模型結構以載入狀態字典
+    final_unet_for_eval = UNet3D(
+        cfg_chkpt["image_channels"],
+        cfg_chkpt["base_channels_unet"],
+        cfg_chkpt["time_emb_dim"],
+        cfg_chkpt["condition_encode_dim"]
+    ).to(CONFIG["device"])
+
+    final_ddpm_for_eval = DDPM3D(
+        final_unet_for_eval,
+        cfg_chkpt["timesteps"],
+        (cfg_chkpt["D"], cfg_chkpt["H"], cfg_chkpt["W"]),
+        cfg_chkpt["image_channels"],
+        cfg_chkpt["condition_input_channels"],
+        cfg_chkpt["condition_encode_dim"],
+        beta_start=cfg_chkpt.get("beta_start", CONFIG["beta_start"]),
+        beta_end=cfg_chkpt.get("beta_end", CONFIG["beta_end"]),
+        device=CONFIG["device"]
+    )
+    final_ddpm_for_eval.load_state_dict(chkpt['ddpm_state_dict'])
+    logger.info(f"從 {best_model_path} 載入最佳模型 (Epoch {chkpt.get('epoch', '未知')}) 完成。")
+
+# 使用 test_loader 和載入的最佳模型 (final_ddpm_for_eval) 進行最終評估
+logger.info("在測試集上評估載入的最佳模型...")
+# 確保 inception_fid 模型已定義和載入
+if 'inception_fid' not in locals() or inception_fid is None:
+    logger.info("重新載入 InceptionV3 以計算 FID (因為可能在訓練迴圈中未持續保持)...")
+    inception_fid = inception_v3(weights=Inception_V3_Weights.DEFAULT, aux_logits=True)
+    inception_fid.fc = nn.Identity()
+    if hasattr(inception_fid, 'AuxLogits') and inception_fid.AuxLogits is not None:
+        inception_fid.AuxLogits = None
+    inception_fid = inception_fid.to(CONFIG["device"])
+    inception_fid.eval()
+    logger.info("InceptionV3 載入完成。")
+
+test_metrics, per_grid_test_metrics = evaluate_model(
+        final_ddpm_for_eval, 
+        test_loader, 
+        inception_fid, 
+        CONFIG, 
+        CONFIG["fid_num_samples"]
+    )
+logger.info(f"最終測試結果: MSE:{test_metrics['mse']:.5f}|MAE:{test_metrics['mae']:.5f}|MAPE:{test_metrics['mape']:.2f}%|SMAPE:{test_metrics['smape']:.2f}%|FID:{test_metrics['fid']:.3f}")
+
+# 儲存最終測試指標
+with open(os.path.join(CONFIG["save_dir"], "final_test_metrics.json"),'w') as f:
+    json.dump(test_metrics, f, indent=4)
+with open(os.path.join(CONFIG["save_dir"], "final_test_metrics.txt"),'w') as f:
+    f.write(f"FINAL TEST METRICS:\nDate: {pd.Timestamp.now(tz='Asia/Taipei')}\n")
+    for k,v in test_metrics.items():
+        f.write(f"{k.upper()}: {v:.6f}\n")
+
+logger.info("開始準備匯出 Excel 檔案的詳細指標...")
+H_test = CONFIG["H"]
+W_test = CONFIG["W"]
+num_grid_cells_test = H_test * W_test
+
+excel_data_rows = []
+
+# test_dataset 可以從 test_loader 獲得
+current_test_dataset = test_loader.dataset 
+
+# 準備感測器資訊以便快速查找經緯度
+sensor_info_lookup = {info['name']: {'lon': info['lon'], 'lat': info['lat']}
+                        for info in current_test_dataset.selected_sensor_info}
+
+for flat_idx in range(num_grid_cells_test):
+    grid_rc = current_test_dataset.grid_idx_to_rc_map.get(flat_idx, (-1, -1)) # (row, col)
+    
+    lon, lat = np.nan, np.nan # 預設為 NaN
+    if flat_idx < len(current_test_dataset.sorted_flow_columns):
+        col_name = current_test_dataset.sorted_flow_columns[flat_idx]
+        if col_name in sensor_info_lookup:
+            lon = sensor_info_lookup[col_name]['lon']
+            lat = sensor_info_lookup[col_name]['lat']
+        else:
+            logger.warning(f"Excel匯出：在 sensor_info_lookup 中找不到欄位 {col_name} (網格索引 {flat_idx}) 的經緯度。")
+    else:
+        logger.warning(f"Excel匯出：網格索引 {flat_idx} 超出 sorted_flow_columns 的範圍。")
+
+    row_data = {
+        '網格座標_R': grid_rc[0] if grid_rc[0] != -1 else '', # 網格橫座標
+        '網格座標_C': grid_rc[1] if grid_rc[1] != -1 else '', # 網格縱座標
+        '經度': lon,
+        '緯度': lat,
+        'MSE': per_grid_test_metrics.get('MSE')[flat_idx] if per_grid_test_metrics.get('MSE') is not None and flat_idx < len(per_grid_test_metrics.get('MSE')) else np.nan,
+        'MAE': per_grid_test_metrics.get('MAE')[flat_idx] if per_grid_test_metrics.get('MAE') is not None and flat_idx < len(per_grid_test_metrics.get('MAE')) else np.nan,
+        'MAPE': per_grid_test_metrics.get('MAPE')[flat_idx] if per_grid_test_metrics.get('MAPE') is not None and flat_idx < len(per_grid_test_metrics.get('MAPE')) else np.nan,
+        'SMAPE': per_grid_test_metrics.get('SMAPE')[flat_idx] if per_grid_test_metrics.get('SMAPE') is not None and flat_idx < len(per_grid_test_metrics.get('SMAPE')) else np.nan,
+        'FID': 'N/A' # FID 通常不是針對每個網格單元計算的
+    }
+    excel_data_rows.append(row_data)
+
+    # 準備平均指標列 (最後一列)
+    average_row_data = {
+        '網格座標_R': '整體平均',
+        '網格座標_C': '',
+        '經度': '',
+        '緯度': '',
+        'MSE': test_metrics.get('mse', np.nan),
+        'MAE': test_metrics.get('mae', np.nan),
+        'MAPE': test_metrics.get('mape', np.nan),
+        'SMAPE': test_metrics.get('smape', np.nan),
+        'FID': test_metrics.get('fid', np.nan) # 全域 FID
+    }
+    excel_data_rows.append(average_row_data)
+
+    df_excel = pd.DataFrame(excel_data_rows)
+
+    # 定義 Excel 中的欄位順序
+    excel_column_order = ['網格座標_R', '網格座標_C', '經度', '緯度', 'MSE', 'MAE', 'MAPE', 'SMAPE', 'FID']
+    df_excel = df_excel[excel_column_order]
+
+    excel_filename = "final_test_metrics_detailed.xlsx"
+    excel_save_path = os.path.join(CONFIG["save_dir"], excel_filename)
 
     try:
-        ep_rng = range(1, len(metrics_hist['train_loss']) + 1)
-        plt.figure(figsize=(20, 10)); plt.style.use('seaborn_v0_8_darkgrid') # 調整圖片大小
-
-        plt.subplot(2,3,1); plt.plot(ep_rng,metrics_hist['train_loss'],label='訓練損失'); plt.plot(ep_rng,metrics_hist['val_mse'],label='驗證 MSE'); plt.legend(); plt.title('損失/MSE'); plt.grid(True); plt.xlabel("Epoch")
-        plt.subplot(2,3,2); plt.plot(ep_rng,metrics_hist['val_mae'],label='驗證 MAE',color='orange'); plt.legend(); plt.title('驗證 MAE'); plt.grid(True); plt.xlabel("Epoch")
-        plt.subplot(2,3,3); plt.plot(ep_rng,metrics_hist['val_fid'],label='驗證 FID',color='green'); plt.legend(); plt.title('驗證 FID'); plt.grid(True); plt.xlabel("Epoch")
-        plt.subplot(2,3,4); plt.plot(ep_rng,metrics_hist['val_mape'],label='驗證 MAPE (%)',color='purple'); plt.legend(); plt.title('驗證 MAPE'); plt.grid(True); plt.xlabel("Epoch")
-        plt.subplot(2,3,5); plt.plot(ep_rng,metrics_hist['val_smape'],label='驗證 SMAPE (%)',color='brown'); plt.legend(); plt.title('驗證 SMAPE'); plt.grid(True); plt.xlabel("Epoch")
-
-        plt.tight_layout(); plt.savefig(os.path.join(CONFIG["save_dir"],"training_history_plots.png")); plt.close()
-        logger.info("已儲存訓練歷史圖表。")
+        df_excel.to_excel(excel_save_path, index=False, sheet_name='詳細測試指標')
+        logger.info(f"詳細測試指標已成功匯出至 Excel 檔案: {excel_save_path}")
     except Exception as e:
-        logger.error(f"繪製歷史圖表錯誤: {e}")
+        logger.error(f"匯出 Excel 檔案失敗: {e}")
+
+    # 繪製訓練歷史圖表 (只包含訓練損失和驗證損失)
+    num_train_epochs_recorded = len(metrics_hist.get('train_loss', []))
+    num_val_epochs_recorded = len(metrics_hist.get('val_loss', []))
+    num_epochs_to_plot = min(num_train_epochs_recorded, num_val_epochs_recorded)
+
+    if num_epochs_to_plot > 0:
+        ep_rng_plot = range(1, num_epochs_to_plot + 1)
+        train_loss_plot = metrics_hist['train_loss'][:num_epochs_to_plot]
+        val_loss_plot = metrics_hist['val_loss'][:num_epochs_to_plot]
+
+        plt.figure(figsize=(10, 5))
+        plt.style.use('seaborn-v0_8-darkgrid')
+        plt.plot(ep_rng_plot, train_loss_plot, label='Training Loss')
+        plt.plot(ep_rng_plot, val_loss_plot, label='Validation Loss (MSE)')
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.title(f'Training and Validation Loss History (up to {num_epochs_to_plot} epochs)')
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(os.path.join(CONFIG["save_dir"], "training_loss_history_plot.png"))
+        plt.close()
+        logger.info(f"已儲存訓練和驗證損失歷史圖表 (繪製了 {num_epochs_to_plot} 個 epochs)。")
+    else:
+        logger.info("沒有足夠的數據來繪製訓練和驗證損失歷史圖表 (可能由於訓練提早中斷)。")
 
     logger.info("================ 腳本執行完成 ================")
+    

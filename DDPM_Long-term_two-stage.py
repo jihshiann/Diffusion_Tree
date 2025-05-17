@@ -51,7 +51,7 @@ CONFIG = {
     "stage2_new_condition_feature_column": "紫外線指數", # 新條件的欄位名
     "stage2_new_conditional_operator": "<=",         # 新條件的運算符
     "stage2_new_conditional_value": 0.0,             # 新條件的閾值
-    "stage2_model_name": "Stage2_UVle",    # 第二階段模型的名稱
+    "stage2_model_name": "Stage2_UVIndex",    # 第二階段模型的名稱
     "stage2_ddpm_condition_input_channels": 2,       # Stage2 DDPM 的 condition_processor 輸入通道數 (固定為2: bm_out + uv_grid)
     "stage2_checkpoint_path": "best_stage2_model.pth", # Stage2 模型的檢查點檔名 (相對路徑，相對於stage2_model_save_dir)
 
@@ -463,77 +463,77 @@ class DDPM3D(nn.Module):
                 img = model_mean + torch.sqrt(posterior_variance_t) * noise_sample
         return img
 
-def apply_condition_to_dataframe(df: pd.DataFrame,
-                                 condition_feature: str,
-                                 condition_operator: str,
-                                 condition_value: Any,
-                                 logger_instance: logging.Logger) -> Optional[pd.DataFrame]:
-    """
-    對 DataFrame 應用條件進行篩選。
-    """
-    logger_instance.info(f"開始篩選 DataFrame。原始大小: {df.shape}")
-    filtered_df = df.copy()
+# def apply_condition_to_dataframe(df: pd.DataFrame,
+#                                  condition_feature: str,
+#                                  condition_operator: str,
+#                                  condition_value: Any,
+#                                  logger_instance: logging.Logger) -> Optional[pd.DataFrame]:
+#     """
+#     對 DataFrame 應用條件進行篩選。
+#     """
+#     logger_instance.info(f"開始篩選 DataFrame。原始大小: {df.shape}")
+#     filtered_df = df.copy()
 
-    if condition_feature not in filtered_df.columns:
-        logger_instance.error(f"錯誤：條件特徵 '{condition_feature}' 不在 DataFrame 的欄位中。")
-        return None
+#     if condition_feature not in filtered_df.columns:
+#         logger_instance.error(f"錯誤：條件特徵 '{condition_feature}' 不在 DataFrame 的欄位中。")
+#         return None
 
-    original_dtype = filtered_df[condition_feature].dtype
-    numeric_column = pd.to_numeric(filtered_df[condition_feature], errors='coerce')
+#     original_dtype = filtered_df[condition_feature].dtype
+#     numeric_column = pd.to_numeric(filtered_df[condition_feature], errors='coerce')
 
-    if numeric_column.isnull().all() and not pd.api.types.is_numeric_dtype(original_dtype) and df[condition_feature].notnull().any():
-        logger_instance.warning(f"警告：條件特徵 '{condition_feature}' (原類型: {original_dtype}) 在嘗試轉換為數值後所有值均為 NaN。請檢查此特徵是否適合數值比較。")
-    elif numeric_column.isnull().sum() > 0:
-         logger_instance.warning(f"警告：條件特徵 '{condition_feature}' 包含 {numeric_column.isnull().sum()} 個無法轉換為數值的項目。這些項目在比較中將被視為 NaN。")
+#     if numeric_column.isnull().all() and not pd.api.types.is_numeric_dtype(original_dtype) and df[condition_feature].notnull().any():
+#         logger_instance.warning(f"警告：條件特徵 '{condition_feature}' (原類型: {original_dtype}) 在嘗試轉換為數值後所有值均為 NaN。請檢查此特徵是否適合數值比較。")
+#     elif numeric_column.isnull().sum() > 0:
+#          logger_instance.warning(f"警告：條件特徵 '{condition_feature}' 包含 {numeric_column.isnull().sum()} 個無法轉換為數值的項目。這些項目在比較中將被視為 NaN。")
 
-    try:
-        val_for_comp = float(condition_value)
-        is_numeric_comp = True
-    except ValueError:
-        val_for_comp = condition_value
-        is_numeric_comp = False
+#     try:
+#         val_for_comp = float(condition_value)
+#         is_numeric_comp = True
+#     except ValueError:
+#         val_for_comp = condition_value
+#         is_numeric_comp = False
 
-    if condition_operator == "<=":
-        if not is_numeric_comp:
-            logger_instance.error(f"錯誤：運算符 '{condition_operator}' 需要數值比較，但條件值 '{condition_value}' 不是數值。")
-            return None
-        mask = numeric_column <= val_for_comp
-    elif condition_operator == ">=":
-        if not is_numeric_comp:
-            logger_instance.error(f"錯誤：運算符 '{condition_operator}' 需要數值比較，但條件值 '{condition_value}' 不是數值。")
-            return None
-        mask = numeric_column >= val_for_comp
-    elif condition_operator == "<":
-        if not is_numeric_comp:
-            logger_instance.error(f"錯誤：運算符 '{condition_operator}' 需要數值比較，但條件值 '{condition_value}' 不是數值。")
-            return None
-        mask = numeric_column < val_for_comp
-    elif condition_operator == ">":
-        if not is_numeric_comp:
-            logger_instance.error(f"錯誤：運算符 '{condition_operator}' 需要數值比較，但條件值 '{condition_value}' 不是數值。")
-            return None
-        mask = numeric_column > val_for_comp
-    elif condition_operator == "==":
-        if is_numeric_comp and not isinstance(val_for_comp, str): # 優先數值比較 (除非條件值本身是字串)
-            mask = numeric_column == val_for_comp
-        else:
-            mask = filtered_df[condition_feature].astype(str) == str(val_for_comp)
-    elif condition_operator == "!=":
-        if is_numeric_comp and not isinstance(val_for_comp, str):
-            mask = numeric_column != val_for_comp
-        else:
-            mask = filtered_df[condition_feature].astype(str) != str(val_for_comp)
-    else:
-        logger_instance.error(f"錯誤：不支援的運算符: {condition_operator}")
-        return None
+#     if condition_operator == "<=":
+#         if not is_numeric_comp:
+#             logger_instance.error(f"錯誤：運算符 '{condition_operator}' 需要數值比較，但條件值 '{condition_value}' 不是數值。")
+#             return None
+#         mask = numeric_column <= val_for_comp
+#     elif condition_operator == ">=":
+#         if not is_numeric_comp:
+#             logger_instance.error(f"錯誤：運算符 '{condition_operator}' 需要數值比較，但條件值 '{condition_value}' 不是數值。")
+#             return None
+#         mask = numeric_column >= val_for_comp
+#     elif condition_operator == "<":
+#         if not is_numeric_comp:
+#             logger_instance.error(f"錯誤：運算符 '{condition_operator}' 需要數值比較，但條件值 '{condition_value}' 不是數值。")
+#             return None
+#         mask = numeric_column < val_for_comp
+#     elif condition_operator == ">":
+#         if not is_numeric_comp:
+#             logger_instance.error(f"錯誤：運算符 '{condition_operator}' 需要數值比較，但條件值 '{condition_value}' 不是數值。")
+#             return None
+#         mask = numeric_column > val_for_comp
+#     elif condition_operator == "==":
+#         if is_numeric_comp and not isinstance(val_for_comp, str): # 優先數值比較 (除非條件值本身是字串)
+#             mask = numeric_column == val_for_comp
+#         else:
+#             mask = filtered_df[condition_feature].astype(str) == str(val_for_comp)
+#     elif condition_operator == "!=":
+#         if is_numeric_comp and not isinstance(val_for_comp, str):
+#             mask = numeric_column != val_for_comp
+#         else:
+#             mask = filtered_df[condition_feature].astype(str) != str(val_for_comp)
+#     else:
+#         logger_instance.error(f"錯誤：不支援的運算符: {condition_operator}")
+#         return None
 
-    filtered_df = filtered_df[mask.fillna(False)]
+#     filtered_df = filtered_df[mask.fillna(False)]
 
-    if filtered_df.empty:
-        logger_instance.warning(f"警告：應用條件 '{condition_feature} {condition_operator} {condition_value}' 後，沒有數據滿足。")
-    else:
-        logger_instance.info(f"篩選完成。篩選後 DataFrame 大小: {filtered_df.shape}")
-    return filtered_df
+#     if filtered_df.empty:
+#         logger_instance.warning(f"警告：應用條件 '{condition_feature} {condition_operator} {condition_value}' 後，沒有數據滿足。")
+#     else:
+#         logger_instance.info(f"篩選完成。篩選後 DataFrame 大小: {filtered_df.shape}")
+#     return filtered_df
 
 
 def create_stage2_model_from_basemodel_checkpoint(
@@ -1563,10 +1563,14 @@ STAGE2_MODEL_NAME = CONFIG["stage2_model_name"]
 
 
 logger.info(f"===== STAGE 2: 數據準備 =====")
-logger.info(f"Stage2 主要條件: {NEW_COND_FEATURE_COL} {NEW_COND_OPERATOR} {NEW_COND_VALUE}")
-df_for_stage2_processing = apply_condition_to_dataframe(
-    full_df.copy(), NEW_COND_FEATURE_COL, NEW_COND_OPERATOR, NEW_COND_VALUE, logger
-)
+logger.info(f"Stage2 模型將學習處理基於 '{NEW_COND_FEATURE_COL} {NEW_COND_OPERATOR} {NEW_COND_VALUE}' 條件劃分的兩個數據分支。")
+# 【【【唯一的關鍵修改點】】】
+# 不再使用 apply_condition_to_dataframe 函數根據紫外線條件預先篩選數據。
+# 讓 Stage2Dataset 接收包含所有紫外線情況的完整數據（或您期望的全局數據範圍）。
+# df_for_stage2_processing = apply_condition_to_dataframe(
+#     full_df.copy(), NEW_COND_FEATURE_COL, NEW_COND_OPERATOR, NEW_COND_VALUE, logger
+# )
+df_for_stage2_processing = full_df.copy() # 直接使用完整的 DataFrame
 if df_for_stage2_processing is None or df_for_stage2_processing.empty:
     raise ValueError("Stage2: 根據主要條件篩選後數據為空。")
 logger.info(f"Stage2: 篩選後得到 {len(df_for_stage2_processing)} 行數據。")
@@ -1629,7 +1633,6 @@ stage2_model = create_stage2_model_from_basemodel_checkpoint(
     config_for_stage2_model=config_for_stage2_model_creation,
     device=CONFIG["device"]
 )
-
 
 # --- 步驟 4: 準備 Stage2 的 Dataset 和 DataLoader ---
 s2_indices_all = np.arange(len(df_for_stage2_processing))
@@ -2038,17 +2041,94 @@ if test_loader_s2_final and len(test_loader_s2_final.dataset) > 0 :
         }
         excel_rows_final_s2.append(avg_row_eval)
 
+    if "stage2_model" in s2_final_eval_results and "basemodel_on_s2_data" in s2_final_eval_results and \
+       "stage2_model" in s2_final_error_grids and "basemodel_on_s2_data" in s2_final_error_grids:
+
+        logger.info("計算 Stage2 Model 與 Basemodel 的指標差異...")
+
+        metrics_s2 = s2_final_eval_results["stage2_model"]
+        metrics_bm = s2_final_eval_results["basemodel_on_s2_data"]
+        error_grids_s2 = s2_final_error_grids["stage2_model"]
+        error_grids_bm = s2_final_error_grids["basemodel_on_s2_data"]
+
+        # 添加差異標題行
+        excel_rows_final_s2.append({'資料來源': f"--- Difference (Stage2 - Basemodel) ---",
+                                '網格座標_R': '', '網格座標_C': '', '經度': '', '緯度': '',
+                                'MSE': '', 'MAE': '', 'MAPE': '', 'SMAPE': '', 'FID': ''})
+
+        # 計算並添加每個網格的指標差異
+        for flat_idx in range(num_grid_cells_final): # num_grid_cells_final 應該已經在前面定義了
+            grid_r_coord, grid_c_coord = 'N/A', 'N/A'
+            lon_coord, lat_coord = np.nan, np.nan
+
+            if grid_idx_to_rc_map_s2 and flat_idx in grid_idx_to_rc_map_s2:
+                grid_r_coord, grid_c_coord = grid_idx_to_rc_map_s2[flat_idx]
+
+            if sorted_flow_columns_s2 and flat_idx < len(sorted_flow_columns_s2):
+                col_name = sorted_flow_columns_s2[flat_idx]
+                if sensor_info_lookup_s2 and col_name in sensor_info_lookup_s2:
+                    lon_coord = sensor_info_lookup_s2[col_name]['lon']
+                    lat_coord = sensor_info_lookup_s2[col_name]['lat']
+            
+            diff_row_d = {
+                '資料來源': "Difference (S2-BM)",
+                '網格座標_R': grid_r_coord,
+                '網格座標_C': grid_c_coord,
+                '經度': lon_coord,
+                '緯度': lat_coord,
+                'MSE': (error_grids_s2.get('MSE')[flat_idx] - error_grids_bm.get('MSE')[flat_idx])
+                        if error_grids_s2.get('MSE') is not None and error_grids_bm.get('MSE') is not None and
+                           flat_idx < len(error_grids_s2.get('MSE')) and flat_idx < len(error_grids_bm.get('MSE'))
+                        else np.nan,
+                'MAE': (error_grids_s2.get('MAE')[flat_idx] - error_grids_bm.get('MAE')[flat_idx])
+                        if error_grids_s2.get('MAE') is not None and error_grids_bm.get('MAE') is not None and
+                           flat_idx < len(error_grids_s2.get('MAE')) and flat_idx < len(error_grids_bm.get('MAE'))
+                        else np.nan,
+                'MAPE': (error_grids_s2.get('MAPE')[flat_idx] - error_grids_bm.get('MAPE')[flat_idx])
+                        if error_grids_s2.get('MAPE') is not None and error_grids_bm.get('MAPE') is not None and
+                           flat_idx < len(error_grids_s2.get('MAPE')) and flat_idx < len(error_grids_bm.get('MAPE'))
+                        else np.nan,
+                'SMAPE': (error_grids_s2.get('SMAPE')[flat_idx] - error_grids_bm.get('SMAPE')[flat_idx])
+                         if error_grids_s2.get('SMAPE') is not None and error_grids_bm.get('SMAPE') is not None and
+                            flat_idx < len(error_grids_s2.get('SMAPE')) and flat_idx < len(error_grids_bm.get('SMAPE'))
+                         else np.nan,
+                'FID': 'N/A' # FID 不是針對每個網格計算
+            }
+            excel_rows_final_s2.append(diff_row_d)
+
+        # 計算並添加整體平均指標的差異
+        diff_avg_row_eval = {
+            '資料來源': "Difference (S2-BM)",
+            '網格座標_R': '整體平均差異', '網格座標_C': '', '經度': '', '緯度': '',
+            'MSE': (metrics_s2.get('mse', np.nan) - metrics_bm.get('mse', np.nan))
+                   if not (np.isnan(metrics_s2.get('mse', np.nan)) or np.isnan(metrics_bm.get('mse', np.nan))) else np.nan,
+            'MAE': (metrics_s2.get('mae', np.nan) - metrics_bm.get('mae', np.nan))
+                   if not (np.isnan(metrics_s2.get('mae', np.nan)) or np.isnan(metrics_bm.get('mae', np.nan))) else np.nan,
+            'MAPE': (metrics_s2.get('mape', np.nan) - metrics_bm.get('mape', np.nan))
+                    if not (np.isnan(metrics_s2.get('mape', np.nan)) or np.isnan(metrics_bm.get('mape', np.nan))) else np.nan,
+            'SMAPE': (metrics_s2.get('smape', np.nan) - metrics_bm.get('smape', np.nan))
+                     if not (np.isnan(metrics_s2.get('smape', np.nan)) or np.isnan(metrics_bm.get('smape', np.nan))) else np.nan,
+            'FID': (metrics_s2.get('fid', np.nan) - metrics_bm.get('fid', np.nan))
+                   if not (np.isnan(metrics_s2.get('fid', np.nan)) or np.isnan(metrics_bm.get('fid', np.nan))) else np.nan, # FID 差異通常也關注
+        }
+        excel_rows_final_s2.append(diff_avg_row_eval)
+        logger.info("指標差異計算並添加到 Excel 數據中。")
+    else:
+        logger.warning("無法計算指標差異，因為 Stage2 Model 或 Basemodel 的結果缺失。")
+
     if excel_rows_final_s2:
         df_excel_final_s2 = pd.DataFrame(excel_rows_final_s2)
         excel_column_order_s2 = ['資料來源', '網格座標_R', '網格座標_C', '經度', '緯度', 'MSE', 'MAE', 'MAPE', 'SMAPE', 'FID']
-        # 重新排序列，如果某列不存在，則會產生 KeyError，所以要小心
         df_excel_final_s2 = df_excel_final_s2.reindex(columns=excel_column_order_s2)
 
         excel_final_path_s2 = os.path.join(CONFIG["stage2_model_save_dir"], f"final_test_metrics_detailed_{STAGE2_MODEL_NAME}.xlsx")
         df_excel_final_s2.to_excel(excel_final_path_s2, index=False)
-        logger.info(f"Stage2 詳細測試評估指標已匯出至: {excel_final_path_s2}")
+        logger.info(f"Stage2 詳細測試評估指標 (包含差異) 已匯出至: {excel_final_path_s2}")
 
 else:
     logger.warning("Stage2 最終評估的測試數據集為空，跳過評估。")
 
 logger.info(f"===== Stage2 流程全部結束 ({STAGE2_MODEL_NAME}) =====")
+
+
+

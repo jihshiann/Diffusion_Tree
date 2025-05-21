@@ -51,7 +51,7 @@ CONFIG = {
     "stage2_new_condition_feature_column": "露點溫度", # 新條件的欄位名
     "stage2_new_conditional_operator": "<=",         # 新條件的運算符
     "stage2_new_conditional_value": 23.5,             # 新條件的閾值
-    "stage2_model_name": "Stage2_HourLe21",    # 第二階段模型的名稱
+    "stage2_model_name": "Stage2_dew_point_le_23_5",    # 第二階段模型的名稱
     "stage2_ddpm_condition_input_channels": 2,       # Stage2 DDPM 的 condition_processor 輸入通道數 (固定為2: bm_out + uv_grid)
     "stage2_checkpoint_path": "best_stage2_model_dew_point_le_23_5.pth", # Stage2 模型的檢查點檔名 (相對路徑，相對於stage2_model_save_dir)
 
@@ -868,7 +868,6 @@ class Stage2Dataset(Dataset):
         
         return target_flow_tensor, condition_grid_1_tensor, condition_grid_2_tensor, \
                original_hour_scalar_tensor, original_is_holiday_scalar_tensor
-
 # FID 函數 (get_activations, calculate_frechet_distance, calculate_fid)
 def get_activations(images: torch.Tensor, model: nn.Module, device: str, batch_size_fid: int = 32) -> np.ndarray:
     """使用 Inception 模型提取影像特徵。"""
@@ -928,7 +927,7 @@ def calculate_fid(real_acts:np.ndarray, gen_acts:np.ndarray)->float:
     """計算給定真實與生成影像特徵的 FID 分數。"""
     mu_real, sigma_real = real_acts.mean(axis=0), np.cov(real_acts, rowvar=False)
     mu_gen, sigma_gen = gen_acts.mean(axis=0), np.cov(gen_acts, rowvar=False)
-    return calculate_frechet_distance(mu_real, sigma_real, mu_gen, sigma_gen)
+    return calculate_frechet_distance(mu_real, sigma_real, mu_gen, sigma_gen)    
 
 # Cell: 評估與視覺化函數 
 def visualize_predictions_long_term(
@@ -1224,7 +1223,7 @@ def evaluate_stage2_models(
         nan_metrics = {"mse": float('nan'), "mae": float('nan'), "mape": float('nan'), "smape": float('nan'), "fid": float('nan')}
         nan_grids_dict = {'MSE': np.array([np.nan]), 'MAE': np.array([np.nan]), 'MAPE': np.array([np.nan]), 'SMAPE': np.array([np.nan])}
         return {"stage2_model": nan_metrics, "basemodel_on_s2_data": nan_metrics}, \
-               {"stage2_model": nan_grids_dict, "basemodel_on_s2_data": nan_grids_dict}..
+               {"stage2_model": nan_grids_dict, "basemodel_on_s2_data": nan_grids_dict}
     
     if target_std_for_denorm < 1e-6:
         logger.warning(f"evaluate_stage2_models: 用於反正規化的標準差 ({target_std_for_denorm}) 過小，將其視為 1.0。")
@@ -1474,6 +1473,7 @@ def evaluate_stage2_models(
 
     return results, error_grids_all_models
 
+
 if __name__ == '__main__':
     logger.info(f"===== DDPM Stage 2 Training and Evaluation =====")
     logger.info(f"Full CONFIG: {json.dumps(CONFIG, indent=2)}")
@@ -1562,12 +1562,7 @@ STAGE2_MODEL_NAME = CONFIG["stage2_model_name"]
 
 logger.info(f"===== STAGE 2: 數據準備 =====")
 logger.info(f"Stage2 模型將學習處理基於 '{NEW_COND_FEATURE_COL} {NEW_COND_OPERATOR} {NEW_COND_VALUE}' 條件劃分的兩個數據分支。")
-# 【【【唯一的關鍵修改點】】】
-# 不再使用 apply_condition_to_dataframe 函數根據紫外線條件預先篩選數據。
-# 讓 Stage2Dataset 接收包含所有紫外線情況的完整數據（或您期望的全局數據範圍）。
-# df_for_stage2_processing = apply_condition_to_dataframe(
-#     full_df.copy(), NEW_COND_FEATURE_COL, NEW_COND_OPERATOR, NEW_COND_VALUE, logger
-# )
+
 df_for_stage2_processing = full_df.copy() # 直接使用完整的 DataFrame
 
 logger.info("Stage2: 生成 basemodel 輸出作為條件...")
@@ -1663,6 +1658,13 @@ if len(s2_val_indices_final) > 0:
     else:
         logger.error("CRITICAL: train_dataset_s2.average_flow_map_dict_s2 IS NONE BEFORE val_dataset_s2 creation!")
 
+    s2_target_stats_for_val_test = None
+    if hasattr(train_dataset_s2, 'norm_stats_stage2_target') and \
+       train_dataset_s2.norm_stats_stage2_target is not None:
+        s2_target_stats_for_val_test = train_dataset_s2.norm_stats_stage2_target
+    else:
+        logger.warning("無法從 train_dataset_s2 獲取 norm_stats_stage2_target 傳遞給 val_dataset_s2。這可能導致錯誤或使用預設值。")
+
     val_dataset_s2 = Stage2Dataset(
         df_for_stage2_processing=df_for_stage2_processing.iloc[s2_val_indices_final],
         basemodel_outputs_for_samples_np=all_bm_outputs_s2_np_cond_normalized[s2_val_indices_final],
@@ -1670,7 +1672,8 @@ if len(s2_val_indices_final) > 0:
         mode='val',
         stage2_avg_flow_map_dict_from_train=train_dataset_s2.average_flow_map_dict_s2,
         original_sorted_flow_columns=basemodel_sorted_flow_cols_source,
-        new_cond_feature_norm_stats_from_train=train_dataset_s2.norm_stats_new_cond_feature
+        new_cond_feature_norm_stats_from_train=train_dataset_s2.norm_stats_new_cond_feature,
+        stage2_target_norm_stats_from_train=s2_target_stats_for_val_test
     )
     s2_eval_batch_size = CONFIG.get("eval_batch_size") 
     val_loader_s2 = DataLoader(val_dataset_s2, batch_size=s2_eval_batch_size, shuffle=False, num_workers=CONFIG["num_workers"], pin_memory=True)
@@ -1972,7 +1975,7 @@ if len(s2_test_indices_final) > 0:
         mode='test',
         stage2_avg_flow_map_dict_from_train=s2_avg_flow_map_for_final_eval, 
         original_sorted_flow_columns=basemodel_sorted_flow_cols_source,
-        new_cond_feature_norm_stats_from_train=new_cond_feature_norm_stats_for_final_eval 
+        new_cond_feature_norm_stats_from_train=new_cond_feature_norm_stats_for_final_eval, 
         stage2_target_norm_stats_from_train=stage2_target_norm_stats_for_final_eval if CONFIG.get("use_dedicated_stage2_target_norm", False) else None
     )
     s2_eval_batch_size_final = CONFIG.get("eval_batch_size")
@@ -2148,4 +2151,3 @@ else:
     logger.warning("Stage2 最終評估的測試數據集為空，跳過評估。")
 
 logger.info(f"===== Stage2 流程全部結束 ({STAGE2_MODEL_NAME}) =====")
-    

@@ -48,12 +48,12 @@ CONFIG = {
     "basemodel_checkpoint_to_load_for_stage2": r"C:\thesis\code\DIFFUSION_TREE\results_ddpm_long-term\best_ddpm_model_during_training.pth",
 
     # === Stage2 特定配置 ===
-    "stage2_new_condition_feature_column": "露點溫度", # 新條件的欄位名
-    "stage2_new_conditional_operator": "<=",         # 新條件的運算符
-    "stage2_new_conditional_value": 23.5,             # 新條件的閾值
-    "stage2_model_name": "Stage2_dew_point_le_23_5",    # 第二階段模型的名稱
+    "stage2_new_condition_feature_column": "月", # 新條件的欄位名
+    "stage2_new_conditional_operator": "==",         # 新條件的運算符
+    "stage2_new_conditional_value": 4,             # 新條件的閾值
+    "stage2_model_name": "Stage2_MonthE4",    # 第二階段模型的名稱
     "stage2_ddpm_condition_input_channels": 2,       # Stage2 DDPM 的 condition_processor 輸入通道數 (固定為2: bm_out + uv_grid)
-    "stage2_checkpoint_path": "best_stage2_model_dew_point_le_23_5.pth", # Stage2 模型的檢查點檔名 (相對路徑，相對於stage2_model_save_dir)
+    "stage2_checkpoint_path": "best_stage2_model_Month_E_4.pth", # Stage2 模型的檢查點檔名 (相對路徑，相對於stage2_model_save_dir)
 
     # --- DDPM 擴散參數 ---
     "timesteps": 1000,          # 擴散時間步長
@@ -74,7 +74,7 @@ CONFIG = {
     "weight_decay": 1e-5,
     "lr_scheduler_factor": 0.5,
     "lr_scheduler_patience": 3,
-    "lr_scheduler_min_lr": 1e-6, 
+    "lr_scheduler_min_lr": 1e-7, 
     "early_stopping_patience": 6,
     "val_calculation_freq": 4,  
 
@@ -459,7 +459,6 @@ class DDPM3D(nn.Module):
                 noise_sample = torch.randn_like(img)
                 img = model_mean + torch.sqrt(posterior_variance_t) * noise_sample
         return img
-
 
 def create_stage2_model_from_basemodel_checkpoint(
                                basemodel_checkpoint_path: str,
@@ -868,7 +867,8 @@ class Stage2Dataset(Dataset):
         
         return target_flow_tensor, condition_grid_1_tensor, condition_grid_2_tensor, \
                original_hour_scalar_tensor, original_is_holiday_scalar_tensor
-# FID 函數 (get_activations, calculate_frechet_distance, calculate_fid)
+
+    # FID 函數 (get_activations, calculate_frechet_distance, calculate_fid)
 def get_activations(images: torch.Tensor, model: nn.Module, device: str, batch_size_fid: int = 32) -> np.ndarray:
     """使用 Inception 模型提取影像特徵。"""
     model.eval()
@@ -927,7 +927,7 @@ def calculate_fid(real_acts:np.ndarray, gen_acts:np.ndarray)->float:
     """計算給定真實與生成影像特徵的 FID 分數。"""
     mu_real, sigma_real = real_acts.mean(axis=0), np.cov(real_acts, rowvar=False)
     mu_gen, sigma_gen = gen_acts.mean(axis=0), np.cov(gen_acts, rowvar=False)
-    return calculate_frechet_distance(mu_real, sigma_real, mu_gen, sigma_gen)    
+    return calculate_frechet_distance(mu_real, sigma_real, mu_gen, sigma_gen)
 
 # Cell: 評估與視覺化函數 
 def visualize_predictions_long_term(
@@ -1473,7 +1473,6 @@ def evaluate_stage2_models(
 
     return results, error_grids_all_models
 
-
 if __name__ == '__main__':
     logger.info(f"===== DDPM Stage 2 Training and Evaluation =====")
     logger.info(f"Full CONFIG: {json.dumps(CONFIG, indent=2)}")
@@ -1553,7 +1552,7 @@ if __name__ == '__main__':
         logger.info("cached_basemodel_mean = {:.4f}".format(CONFIG["cached_basemodel_mean"]))
         logger.info("cached_basemodel_std = {:.4f}".format(CONFIG["cached_basemodel_std"]))
 
-# --- 步驟 2: 準備 Stage2 數據 ---
+    # --- 步驟 2: 準備 Stage2 數據 ---
 NEW_COND_FEATURE_COL = CONFIG["stage2_new_condition_feature_column"]
 NEW_COND_OPERATOR = CONFIG["stage2_new_conditional_operator"]
 NEW_COND_VALUE = CONFIG["stage2_new_conditional_value"]
@@ -1681,7 +1680,7 @@ if len(s2_val_indices_final) > 0:
 else:
     logger.info("Stage2 驗證集為空。")
 
-# --- 步驟 5: 訓練 Stage2 模型 ---
+    # --- 步驟 5: 訓練 Stage2 模型 ---
 # --- 初始化 optimizer, scheduler, 狀態變數 ---
 optimizer_s2 = optim.AdamW(list(stage2_model.parameters()), lr=CONFIG.get("lr_stage2", CONFIG.get("lr", 1e-3)), weight_decay=CONFIG.get("weight_decay", 1e-5))
 scheduler_factor_s2 = CONFIG.get("lr_scheduler_factor", 0.5)
@@ -1911,7 +1910,7 @@ logger.info(f"最終訓練統計: Train Loss: {final_train_loss:.5f}, Last Recor
 if best_val_loss_s2_train != float('inf'):
     logger.info(f"最佳驗證損失記錄: {best_val_loss_s2_train:.5f}")
 
-# --- Stage2 模型最終評估 ---
+    # --- Stage2 模型最終評估 ---
 logger.info(f"===== STAGE 2: 最終模型評估 ({STAGE2_MODEL_NAME}) =====")
 if not os.path.exists(stage2_model_save_checkpoint_path_full):
     logger.warning(f"找不到最佳 Stage2 模型檔案: {stage2_model_save_checkpoint_path_full}。將使用訓練結束時的 Stage2 模型狀態進行評估。")
@@ -1976,7 +1975,7 @@ if len(s2_test_indices_final) > 0:
         stage2_avg_flow_map_dict_from_train=s2_avg_flow_map_for_final_eval, 
         original_sorted_flow_columns=basemodel_sorted_flow_cols_source,
         new_cond_feature_norm_stats_from_train=new_cond_feature_norm_stats_for_final_eval, 
-        stage2_target_norm_stats_from_train=stage2_target_norm_stats_for_final_eval if CONFIG.get("use_dedicated_stage2_target_norm", False) else None
+        stage2_target_norm_stats_from_train=stage2_target_norm_stats_for_final_eval
     )
     s2_eval_batch_size_final = CONFIG.get("eval_batch_size")
     test_loader_s2_final = DataLoader(test_dataset_s2_final, batch_size=s2_eval_batch_size_final, shuffle=False, num_workers=CONFIG["num_workers"], pin_memory=True)

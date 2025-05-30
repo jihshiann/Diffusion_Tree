@@ -58,12 +58,11 @@ CONFIG = {
     "seed": 42, # 隨機種子
     "weight_decay": 1e-5, # 優化器的權重衰減 
     "lr_scheduler_factor": 0.5, # ReduceLROnPlateau: 學習率降低因子
-    "lr_scheduler_patience": 4,   # ReduceLROnPlateau: 多少個 epoch 驗證損失未改善則降低學習率
+    "lr_scheduler_patience": 3,   # ReduceLROnPlateau: 多少個 epoch 驗證損失未改善則降低學習率
     "lr_scheduler_min_lr": 1e-6,  # ReduceLROnPlateau: 學習率下限
-    "early_stopping_patience": 8, # 早停: 多少個 epoch 驗證損失未改善則停止訓練 
-    "lr_reductions_before_val_decision": 3, # 學習率調降幾次後，才開始用驗證損失做早停和模型選擇的決策
+    "early_stopping_patience": 6, # 早停: 多少個 epoch 驗證損失未改善則停止訓練 
     "resume_from_checkpoint": True,  # 是否嘗試從檢查點恢復訓練
-    "checkpoint_path": "best_ddpm_model_during_training.pth", #預設使用的檢查點檔案名
+    "checkpoint_path": "best_ddpm_model_training.pth", #預設使用的檢查點檔案名
 
     # --- 評估參數 ---
     "eval_batch_size": 32,
@@ -71,7 +70,7 @@ CONFIG = {
     "fid_num_samples": 128, # FID 計算樣本數
 
     # --- 路徑與儲存 ---
-    "save_dir": "results_ddpm_conditioned_flow_taipei_extra_v2", # 結果儲存目錄
+    "save_dir": "results_ddpm_long-term", # 結果儲存目錄
     "plot_grid_mapping_path": "grid_mapping_visualization_taipei.png", # 網格映射視覺化圖片路徑
     "train_split_ratio": 0.7, # 訓練集比例
     "val_split_ratio": 0.15,  # 驗證集比例
@@ -128,8 +127,10 @@ class PeopleFlowDatasetCondition(Dataset):
         df_datetime_processed[actual_datetime_col] = pd.to_datetime(df_datetime_processed[actual_datetime_col])
         
         self.hours_original_np = df_datetime_processed[actual_datetime_col].dt.hour.values
-        # day_of_week_original_np 仍然被解析，但主要用於 average_flow_map_dict 的鍵
-        self.day_of_week_original_np = df_datetime_processed[actual_datetime_col].dt.dayofweek.values
+        self.hour_category_for_grouping_np = (self.hours_original_np > 8).astype(int)
+        logger.info(f"已生成用於分組的小時類別 (0: hr <= 8, 1: hr > 8)。 "
+                            f"類別0 數量: {np.sum(self.hour_category_for_grouping_np == 0)}, "
+                            f"類別1 數量: {np.sum(self.hour_category_for_grouping_np == 1)}")
 
         # --- 新增：明確儲存假日狀態 ---
         holiday_col_name = 'holiday' # <--- 確認你的假日欄位名稱
@@ -398,7 +399,7 @@ class PeopleFlowDatasetCondition(Dataset):
     def _calculate_average_flows(self) -> Dict[Tuple[int, int], np.ndarray]:
         """計算每個 (小時, 是否假日) 組合的平均流量圖。"""
         logger = logging.getLogger(__name__)
-        logger.info("計算 (小時, 是否為假日) 平均流量圖...") # <--- 修改日誌訊息
+        logger.info("計算 (小時類別, 是否為假日) 平均流量圖...") 
         avg_flows = {}
         if not hasattr(self, 'sorted_flow_columns') or not self.sorted_flow_columns or any(col == "" for col in self.sorted_flow_columns):
             raise AttributeError("Dataset object missing 'sorted_flow_columns' or it's invalid. Cannot calculate average flows.")
@@ -411,28 +412,28 @@ class PeopleFlowDatasetCondition(Dataset):
         
         # 使用 self.hours_original_np 和 self.is_holiday_original_np 進行分組
         grouping_df = pd.DataFrame({
-            'hour': self.hours_original_np,
+            'hour_category': self.hour_category_for_grouping_np,
             'is_holiday': self.is_holiday_original_np # <--- 修改分組依據
         })
-        grouped = grouping_df.groupby(['hour', 'is_holiday']) # <--- 修改分組依據
+        grouped = grouping_df.groupby(['hour_category', 'is_holiday'])
 
         if not grouped.groups:
             logger.warning("無法根據 (小時, 是否為假日) 對資料進行分組。")
             return {} 
 
-        for (hr, is_hol), group_indices in grouped.groups.items(): # <--- 修改迭代變數
+        for (hr_cat, is_hol), group_indices in grouped.groups.items(): # 新
             if len(group_indices) == 0:
-                logger.warning(f"條件 ({hr}, is_holiday={is_hol}) 沒有對應的資料。")
+                logger.warning(f"條件 (hour_category={hr_cat}, is_holiday={is_hol}) 沒有對應的資料。") # 新
                 continue
 
             group_flows_for_condition = flow_data_grid_alltimes[group_indices]
             mean_flow_flat_for_condition = np.nanmean(group_flows_for_condition, axis=0)
             mean_flow_flat_for_condition[np.isnan(mean_flow_flat_for_condition)] = 0 
-            avg_flows[(hr, int(is_hol))] = mean_flow_flat_for_condition.reshape(self.H, self.W) # <--- 修改字典的鍵
+            avg_flows[(hr_cat, int(is_hol))] = mean_flow_flat_for_condition.reshape(self.H, self.W)
 
         if not avg_flows:
-            logger.warning("未計算任何 (小時, 是否為假日) 的平均流量。")
-        logger.info(f"計算完成 {len(avg_flows)} 個 (小時, 是否為假日) 條件的平均流量圖。") # <--- 修改日誌訊息
+            logger.warning("未計算任何 (小時類別, 是否為假日) 的平均流量。")
+        logger.info(f"計算完成 {len(avg_flows)} 個 (小時類別, 是否為假日) 條件的平均流量圖。") # <--- 修改日誌訊息
         return avg_flows
 
     def _plot_grid_mapping(self, grid_idx_to_rc_map: Dict[int, Tuple[int,int]], sorted_flow_cols: List[str], save_path: str):
@@ -468,11 +469,10 @@ class PeopleFlowDatasetCondition(Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int, int, torch.Tensor]:
         logger = logging.getLogger(__name__)
         current_hour_original = self.hours_original_np[idx]
-        current_is_holiday_original = self.is_holiday_original_np[idx] # <--- 獲取假日狀態作為條件
+        current_hour_category_for_grouping = self.hour_category_for_grouping_np[idx] # 新增，用於查找目標
+        current_is_holiday_original = self.is_holiday_original_np[idx]
 
-        # --- 目標流量現在基於 (小時, 是否假日) ---
-        # average_flow_map_dict 的鍵現在是 (小時, 是否假日)
-        target_avg_flow_np = self.average_flow_map_dict.get((current_hour_original, current_is_holiday_original)) # <--- 修改查找鍵
+        target_avg_flow_np = self.average_flow_map_dict.get((current_hour_category_for_grouping, current_is_holiday_original)) 
 
         if target_avg_flow_np is None:
             logger.warning(f"在 average_flow_map_dict 中找不到 (hour={current_hour_original}, is_holiday={current_is_holiday_original}) 的平均流量 (索引 {idx})，將使用零值網格。")
@@ -507,7 +507,7 @@ class PeopleFlowDatasetCondition(Dataset):
         # --- 返回修改後的元組: (流量, 小時, 是否假日, 額外特徵) ---
         return target_flow_tensor, int(current_hour_original), int(current_is_holiday_original), extra_data_row_tensor     
 
-# ==============================================================================
+    # ==============================================================================
 # UNet3D, DDPM3D
 # ==============================================================================
 
@@ -791,7 +791,7 @@ class DDPM3D(nn.Module):
         s = (batch_size, self.image_channels, self.image_size_D, self.image_size_H, self.image_size_W)
         return self.p_sample_loop(s, hour_scalars_batch, is_holiday_scalars_batch)
 
-# FID 函數 (get_activations, calculate_frechet_distance, calculate_fid)
+    # FID 函數 (get_activations, calculate_frechet_distance, calculate_fid)
 def get_activations(images: torch.Tensor, model: nn.Module, device: str, batch_size_fid: int = 32) -> np.ndarray:
     """使用 Inception 模型提取影像特徵。"""
     model.eval()
@@ -1049,8 +1049,8 @@ def plot_grid_with_error_long_term(
         plt.savefig(os.path.join(save_dir, f'{prefix}_grid_error_map_{metric_name.lower()}.png'), dpi=300, bbox_inches='tight')
         plt.close()
         logger.info(f"Saved {metric_name} geographic grid error map.")
-                      
-# evaluate_model 函數
+
+    # evaluate_model 函數
 # (假設其定義與先前完整腳本相同，
 # 但需傳遞純量小時/星期至 ddpm_model.sample)
 @torch.no_grad()
@@ -1289,8 +1289,8 @@ if __name__ == '__main__':
     inception_fid = inception_fid.to(CONFIG["device"])
     inception_fid.eval()
     logger.info("InceptionV3 載入完成。")
-    
-optimizer = optim.AdamW(
+
+    optimizer = optim.AdamW(
     list(ddpm.model.parameters()) + list(ddpm.condition_processor.parameters()),
     lr=CONFIG["lr"],
     weight_decay=CONFIG["weight_decay"]
@@ -1532,7 +1532,7 @@ if best_val_loss_for_saving != float('inf'):
 else:
     logger.info("訓練過程中，未計算或未記錄到有效的最低驗證損失用於模型保存。")
 
-# --- 所有 epoch 訓練完成後，載入最佳模型並進行最終評估 ---
+    # --- 所有 epoch 訓練完成後，載入最佳模型並進行最終評估 ---
 logger.info("載入訓練過程中驗證損失最低的模型以進行最終測試集評估...")
 best_model_path = os.path.join(CONFIG["save_dir"], "best_ddpm_model_during_training.pth")
 

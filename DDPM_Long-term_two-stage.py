@@ -22,6 +22,7 @@ from typing import Optional, Tuple, List, Dict, Any
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 
+
 # ==============================================================================
 # 組態設定
 # ==============================================================================
@@ -48,25 +49,22 @@ CONFIG = {
     "basemodel_checkpoint_to_load_for_stage2": r"C:\thesis\code\DIFFUSION_TREE\results_ddpm_long-term\best_ddpm_model_during_training.pth",
 
     # === Stage2 特定配置 ===
-    "stage2_new_condition_feature_column": "月", # 新條件的欄位名
-    "stage2_new_conditional_operator": "==",         # 新條件的運算符
-    "stage2_new_conditional_value": 4,             # 新條件的閾值
-    "stage2_model_name": "Stage2_MonthE4",    # 第二階段模型的名稱
+    "stage2_new_condition_feature_column": "露點溫度", # 新條件的欄位名
+    "stage2_new_conditional_operator": "<=",         # 新條件的運算符
+    "stage2_new_conditional_value": 23.5,             # 新條件的閾值
+    "stage2_model_name": "Stage2_dewPointLe235",    # 第二階段模型的名稱
     "stage2_ddpm_condition_input_channels": 2,       # Stage2 DDPM 的 condition_processor 輸入通道數 (固定為2: bm_out + uv_grid)
-    "stage2_checkpoint_path": "best_stage2_model_Month_E_4.pth", # Stage2 模型的檢查點檔名 (相對路徑，相對於stage2_model_save_dir)
+    "stage2_checkpoint_path": "best_stage2_model_dew_point_le_23_5.pth", # Stage2 模型的檢查點檔名 (相對路徑，相對於stage2_model_save_dir)
 
     # --- DDPM 擴散參數 ---
     "timesteps": 1000,          # 擴散時間步長
     "beta_start": 1e-4,
     "beta_end": 0.02,
 
-    # --- 訓練參數 (Stage2 將優先使用 epochs_stage2, lr_stage2 等，若無則回退到通用版本) ---
+    # --- 訓練參數 ---
     "epochs": 128, 
-    "batch_size": 128,
+    "batch_size": 256,
     "lr": 1e-3, 
-    
-    "epochs_stage2": 128, # 可為 Stage2 設定不同的 epoch 數
-    "lr_stage2": 1e-3,   # 可為 Stage2 設定不同的學習率
 
     "num_workers": 0,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
@@ -76,15 +74,12 @@ CONFIG = {
     "lr_scheduler_patience": 3,
     "lr_scheduler_min_lr": 1e-7, 
     "early_stopping_patience": 6,
-    "val_calculation_freq": 4,  
-
-    "resume_from_stage2_checkpoint": True,  # Stage2 訓練是否從自己的檢查點續訓
+    "val_calculation_freq": 3,  
 
     # --- 評估參數 ---
-    "eval_batch_size": 32,
-    "fid_batch_size": 64,
+    "eval_batch_size": 256,
+    "fid_batch_size": 256,
     "fid_num_samples": 128, # 通用FID樣本數
-    "fid_num_samples_stage2": 128, # Stage2 FID 計算樣本數 (可與通用相同或不同)
 
 
     # --- 路徑與儲存 ---
@@ -560,8 +555,9 @@ class Stage2Dataset(Dataset):
 
         if '時' not in self.df_s2.columns:
             raise KeyError("DataFrame 中找不到 '時' 欄位。")
-        dt_series_for_base_cond = pd.to_datetime(self.df_s2['時'])
-        self.hours_for_target_np = dt_series_for_base_cond.dt.hour.values
+        self.hours_for_target_np = self.df_s2['時'].values.astype(int) # 直接獲取數值並確保是整數
+        if not ((self.hours_for_target_np >= 0) & (self.hours_for_target_np <= 23)).all():
+            self.logger.warning(f"Stage2Dataset (mode={self.mode}): '時' 欄位包含不在 0-23 範圍內的值。請檢查數據。")
         self.hour_category_for_target_grouping_np = (self.hours_for_target_np > 8).astype(int)
         self.logger.info(f"Stage2Dataset (mode={self.mode}): 已生成用於目標分組的 Base Model 小時類別。 "
                         f"類別0 (hr <= 8) 數量: {np.sum(self.hour_category_for_target_grouping_np == 0)}, "
@@ -868,7 +864,7 @@ class Stage2Dataset(Dataset):
         return target_flow_tensor, condition_grid_1_tensor, condition_grid_2_tensor, \
                original_hour_scalar_tensor, original_is_holiday_scalar_tensor
 
-    # FID 函數 (get_activations, calculate_frechet_distance, calculate_fid)
+# FID 函數 (get_activations, calculate_frechet_distance, calculate_fid)
 def get_activations(images: torch.Tensor, model: nn.Module, device: str, batch_size_fid: int = 32) -> np.ndarray:
     """使用 Inception 模型提取影像特徵。"""
     model.eval()
@@ -1132,12 +1128,14 @@ def plot_grid_with_error_long_term(
         
         plt.colorbar(scatter, label=metric_name)
 
-        if metric_name.upper() != 'MSE': # 只有非 MSE 的指標圖才在網格上顯示數字
+        text_format = '{:.0f}'
+
+        if metric_name.upper() != 'MSE': 
             for i in range(len(actual_sensor_lons)):
                 val_to_text = error_values_for_plot_display[i]
                 if not np.isnan(val_to_text): # 只顯示有限的數值
                     plt.text(actual_sensor_lons[i], actual_sensor_lats[i],
-                             f'{val_to_text:.0f}',
+                             text_format.format(val_to_text), # 使用統一的整數格式
                              fontsize=6, color='white', ha='center', va='center')
 
         plt.xlabel("Longitude")
@@ -1149,7 +1147,6 @@ def plot_grid_with_error_long_term(
         plt.close()
         logger_func.info(f"Saved {metric_name} geographic grid error map for {prefix}.")
                         
-
 def truncate_colormap(cmap, minval: float = 0.0, maxval: float = 1.0, n: int = 256):
     new_cmap = mcolors.LinearSegmentedColormap.from_list(
         f'trunc({cmap.name},{minval:.2f},{maxval:.2f})',
@@ -1255,6 +1252,11 @@ def evaluate_stage2_models(
             new_condition_feature_grid_batch=uv_eval_cond
         )
         s2_generated_eval_denorm = s2_generated_eval_norm * target_std_for_denorm + target_mean_for_denorm
+        logger.info(f"Stage2 Eval - Batch {pbar_s2_eval.n + 1} - RAW S2 NORM Output Stats: "
+                f"Min: {torch.min(s2_generated_eval_norm).item():.4f}, "
+                f"Max: {torch.max(s2_generated_eval_norm).item():.4f}, "
+                f"Mean: {torch.mean(s2_generated_eval_norm).item():.4f}, "
+                f"Std: {torch.std(s2_generated_eval_norm).item():.4f}")
 
         # 2. Basemodel 在相同原始條件下的生成
         bm_generated_norm_on_s2_conditions = basemodel_eval_instance.sample(
@@ -1311,14 +1313,59 @@ def evaluate_stage2_models(
         mse = F.mse_loss(pred_t, s2_target_all_t).item()
         mae = F.l1_loss(pred_t, s2_target_all_t).item()
 
-        mape_tensor = torch.abs((s2_target_all_t - pred_t) / (torch.abs(s2_target_all_t) + epsilon)) * 100
-        mape = torch.mean(mape_tensor[torch.isfinite(mape_tensor)]).item() if torch.isfinite(mape_tensor).any() else float('inf')
+        # 原來的 MAPE (平均網格點的百分比誤差)
+        actual_values_for_mape = torch.abs(s2_target_all_t) # 真實目標值的絕對值
+        errors_for_mape = torch.abs(s2_target_all_t - pred_t)   # 預測的絕對誤差
+        
+        # 設定一個閾值，例如，我們只關心真實人流量絕對值大於 1.0 的情況下的 MAPE
+        # 這個閾值可以根據您數據的實際情況和業務需求來調整
+        threshold_for_mape_calc = 1.0 
+        
+        # 創建一個 mask，標記哪些真實值是有效的（絕對值大於閾值）
+        valid_for_mape_calc_mask = actual_values_for_mape > threshold_for_mape_calc
+        
+        if torch.sum(valid_for_mape_calc_mask).item() > 0: # 確保有有效的點（真實值大於閾值）
+            # 只對有效的點計算百分比誤差
+            # 注意：這裡的分母 actual_values_for_mape[valid_for_mape_calc_mask] 已經保證大於 threshold_for_mape_calc，
+            # 所以如果 threshold_for_mape_calc 是一個合理的正數 (例如1.0)，則不太需要再加 epsilon 來防止除以零，
+            # 但為了極端情況下的穩健性，可以保留或使用一個更小的 epsilon。
+            # 這裡我們暫時移除 epsilon，因為分母已經被過濾了。
+            mape_per_element_filtered = (errors_for_mape[valid_for_mape_calc_mask] / actual_values_for_mape[valid_for_mape_calc_mask]) * 100
+            
+            # 在有效的百分比誤差中，進一步過濾掉可能由其他原因產生的 inf/nan
+            # (例如，如果 errors_for_mape 和 actual_values_for_mape 都極小導致的不穩定)
+            mape_per_element_filtered_finite = mape_per_element_filtered[torch.isfinite(mape_per_element_filtered)]
+            
+            if mape_per_element_filtered_finite.numel() > 0:
+                mape_avg_grid = torch.mean(mape_per_element_filtered_finite).item()
+            else:
+                # 如果過濾掉 inf/nan 後沒有有效值了
+                logger.warning(f"在模型 {model_name} 的 MAPE (avg_grid) 計算中，過濾掉 inf/nan 後沒有有效值（在真實值 > {threshold_for_mape_calc} 的點中）。MAPE 設為 inf。")
+                mape_avg_grid = float('inf')
+                
+        else: # 如果沒有任何一個真實值大於閾值
+            logger.warning(f"在模型 {model_name} 的 MAPE (avg_grid) 計算中，沒有真實值的絕對值大於閾值 {threshold_for_mape_calc} 的點。MAPE 設為 inf。")
+            mape_avg_grid = float('inf') # 或者可以設為 NaN，或記錄為不適用
 
-        smape_num = torch.abs(pred_t - s2_target_all_t)
-        smape_den = (torch.abs(s2_target_all_t) + torch.abs(pred_t)) / 2.0 + epsilon
-        smape_tensor = (smape_num / smape_den) * 100
-        smape = torch.mean(smape_tensor[torch.isfinite(smape_tensor)]).item() if torch.isfinite(smape_tensor).any() else float('inf')
+        # 原來的 SMAPE (平均網格點的對稱百分比誤差)
+        smape_numerator_per_element = torch.abs(pred_t - s2_target_all_t)
+        smape_denominator_per_element = (torch.abs(s2_target_all_t) + torch.abs(pred_t)) / 2.0 + epsilon # 經典定義的分母
+        smape_tensor_per_element = (smape_numerator_per_element / smape_denominator_per_element) * 100
+        valid_smape_tensor_per_element = smape_tensor_per_element[torch.isfinite(smape_tensor_per_element)]
+        smape_avg_grid = torch.mean(valid_smape_tensor_per_element).item() if valid_smape_tensor_per_element.numel() > 0 else float('inf')
+        
+        # --- 新增：計算總體 MAPE (Overall MAPE) ---
+        # MAPE_overall = Sum(|Actual - Forecast|) / Sum(|Actual|) * 100
+        mape_overall_numerator = torch.sum(torch.abs(s2_target_all_t - pred_t))
+        mape_overall_denominator = torch.sum(torch.abs(s2_target_all_t) + epsilon) # 加 epsilon 避免分母為0
+        mape_overall = (mape_overall_numerator / mape_overall_denominator).item() * 100 if mape_overall_denominator > 1e-7 else float('inf')
 
+        # --- 新增：計算總體 SMAPE (Overall SMAPE) ---
+        # SMAPE_overall = Sum(2 * |Actual - Forecast|) / Sum(|Actual| + |Forecast|) * 100
+        # 或 Sum(|Actual - Forecast|) / Sum((|Actual| + |Forecast|)/2) * 100
+        smape_overall_numerator = torch.sum(torch.abs(s2_target_all_t - pred_t))
+        smape_overall_denominator_sum_abs = torch.sum(torch.abs(s2_target_all_t) + torch.abs(pred_t)) # 分母是絕對值之和
+        smape_overall = (200.0 * smape_overall_numerator / (smape_overall_denominator_sum_abs + epsilon) ).item() if smape_overall_denominator_sum_abs > 1e-7 else float('inf')
         fid = float('nan')
         current_generated_norm_for_fid_list_to_use: List[torch.Tensor] = []
         if model_name == "stage2_model":
@@ -1355,7 +1402,15 @@ def evaluate_stage2_models(
         else:
             logger.warning(f"FID for {model_name}: FID sample lists were empty before concatenation.")
 
-        results[model_name] = {"mse": mse, "mae": mae, "mape": mape, "smape": smape, "fid": fid if np.isfinite(fid) else float('nan')}
+        results[model_name] = {
+            "mse": mse, 
+            "mae": mae, 
+            "mape_avg_grid": mape_avg_grid, # 原來的 MAPE
+            "smape_avg_grid": smape_avg_grid, # 原來的 SMAPE
+            "mape_overall": mape_overall, # 新增的總體 MAPE
+            "smape_overall": smape_overall, # 新增的總體 SMAPE
+            "fid": fid if np.isfinite(fid) else float('nan')
+        }
         logger.info(f"Metrics for {model_name} ({prefix}): {results[model_name]}")
 
         # 計算每個網格的誤差指標
@@ -1565,8 +1620,12 @@ logger.info(f"Stage2 模型將學習處理基於 '{NEW_COND_FEATURE_COL} {NEW_CO
 df_for_stage2_processing = full_df.copy() # 直接使用完整的 DataFrame
 
 logger.info("Stage2: 生成 basemodel 輸出作為條件...")
-temp_dt_s2_bm_in = pd.to_datetime(df_for_stage2_processing['時間'])
-hours_for_bm_in_s2_scalar = torch.tensor(temp_dt_s2_bm_in.dt.hour.values, dtype=torch.long) # .to(CONFIG["device"])
+if '時' not in df_for_stage2_processing.columns:
+    raise KeyError("在 df_for_stage2_processing 中為 Basemodel 輸出準備條件時找不到 '時' 欄位。")
+hours_for_bm_in_s2_scalar_values = df_for_stage2_processing['時'].values.astype(int)
+if not ((hours_for_bm_in_s2_scalar_values >= 0) & (hours_for_bm_in_s2_scalar_values <= 23)).all():
+    logger.warning("為 Basemodel 輸出準備條件時，'時' 欄位包含不在 0-23 範圍內的值。請檢查數據。")
+hours_for_bm_in_s2_scalar = torch.tensor(hours_for_bm_in_s2_scalar_values, dtype=torch.long)
 
 if 'holiday' not in df_for_stage2_processing.columns and 'hoilday' in df_for_stage2_processing.columns:
     df_for_stage2_processing.rename(columns={"hoilday": "holiday"}, inplace=True)
@@ -1680,9 +1739,9 @@ if len(s2_val_indices_final) > 0:
 else:
     logger.info("Stage2 驗證集為空。")
 
-    # --- 步驟 5: 訓練 Stage2 模型 ---
+# --- 步驟 5: 訓練 Stage2 模型 ---
 # --- 初始化 optimizer, scheduler, 狀態變數 ---
-optimizer_s2 = optim.AdamW(list(stage2_model.parameters()), lr=CONFIG.get("lr_stage2", CONFIG.get("lr", 1e-3)), weight_decay=CONFIG.get("weight_decay", 1e-5))
+optimizer_s2 = optim.AdamW(list(stage2_model.parameters()), lr=CONFIG.get("lr", 1e-3), weight_decay=CONFIG.get("weight_decay", 1e-5))
 scheduler_factor_s2 = CONFIG.get("lr_scheduler_factor", 0.5)
 scheduler_patience_s2 = CONFIG.get("lr_scheduler_patience", 3)
 scheduler_min_lr_s2 = CONFIG.get("lr_scheduler_min_lr", 1e-6)
@@ -1700,8 +1759,8 @@ early_stopping_counter_s2_train = 0
 stage2_model_save_checkpoint_path_full = CONFIG["stage2_checkpoint_full_path"]
 metrics_hist_s2_train = {'train_loss':[], 'val_loss':[], 'lr':[]}
 
-# --- 從檢查點恢復 (如果設定) ---
-if CONFIG.get("resume_from_stage2_checkpoint", True) and os.path.exists(stage2_model_save_checkpoint_path_full):
+# --- 從檢查點恢復 ---
+if os.path.exists(stage2_model_save_checkpoint_path_full):
     logger.info(f"從 Stage2 檢查點恢復訓練: {stage2_model_save_checkpoint_path_full}")
     try:
         chkpt_s2_resume = torch.load(stage2_model_save_checkpoint_path_full, map_location=CONFIG["device"], weights_only=False)
@@ -1728,7 +1787,7 @@ if CONFIG.get("resume_from_stage2_checkpoint", True) and os.path.exists(stage2_m
         early_stopping_counter_s2_train = 0
         metrics_hist_s2_train = {'train_loss':[], 'val_loss':[], 'lr':[]}
 
-epochs_to_run_s2 = CONFIG.get("epochs_stage2", CONFIG.get("epochs", 100))
+epochs_to_run_s2 = CONFIG.get("epochs", 100)
 logger.info(f"開始訓練 Stage2 模型: {STAGE2_MODEL_NAME} for {epochs_to_run_s2} epochs...")
 
 # --- 主 Epoch 迴圈 ---
@@ -1784,7 +1843,8 @@ for epoch_s2_current in epoch_pbar:
     if val_loader_s2:
         if epoch_s2_current == epochs_to_run_s2:
             should_validate_this_epoch = True
-        elif epoch_s2_current > start_epoch_s2_train and (epoch_s2_current - start_epoch_s2_train) % val_freq_s2 == 0:
+        elif (epoch_s2_current == start_epoch_s2_train) or \
+             (epoch_s2_current > start_epoch_s2_train and (epoch_s2_current - start_epoch_s2_train) % val_freq_s2 == 0):
             should_validate_this_epoch = True
 
     if should_validate_this_epoch:
@@ -1909,244 +1969,3 @@ final_lr = metrics_hist_s2_train['lr'][-1] if metrics_hist_s2_train['lr'] else f
 logger.info(f"最終訓練統計: Train Loss: {final_train_loss:.5f}, Last Recorded Val Loss: {final_val_loss:.5f}, Final LR: {final_lr:.8f}")
 if best_val_loss_s2_train != float('inf'):
     logger.info(f"最佳驗證損失記錄: {best_val_loss_s2_train:.5f}")
-
-    # --- Stage2 模型最終評估 ---
-logger.info(f"===== STAGE 2: 最終模型評估 ({STAGE2_MODEL_NAME}) =====")
-if not os.path.exists(stage2_model_save_checkpoint_path_full):
-    logger.warning(f"找不到最佳 Stage2 模型檔案: {stage2_model_save_checkpoint_path_full}。將使用訓練結束時的 Stage2 模型狀態進行評估。")
-    final_s2_model_for_eval_load = stage2_model
-    chkpt_s2_final_for_eval = {'epoch': epochs_to_run_s2 } # 模擬一個檢查點字典
-    # 嘗試從 train_dataset_s2 獲取統計數據，如果模型是訓練結束時的狀態
-    s2_target_stats_for_final_eval = train_dataset_s2.norm_stats_target_s2 if hasattr(train_dataset_s2, 'norm_stats_target_s2') else None
-    s2_avg_flow_map_for_final_eval = train_dataset_s2.average_flow_map_dict_s2 if hasattr(train_dataset_s2, 'average_flow_map_dict_s2') else None
-    new_cond_feature_norm_stats_for_final_eval = train_dataset_s2.norm_stats_new_cond_feature if hasattr(train_dataset_s2, 'norm_stats_new_cond_feature') else None
-    stage2_target_norm_stats_for_final_eval = train_dataset_s2.norm_stats_stage2_target if hasattr(train_dataset_s2, 'norm_stats_stage2_target') else None
-else:
-    logger.info(f"從 {stage2_model_save_checkpoint_path_full} 載入最佳 Stage2 模型進行評估...")
-    chkpt_s2_final_for_eval = torch.load(stage2_model_save_checkpoint_path_full, map_location=CONFIG["device"], weights_only=False)
-    
-    # 使用儲存在檢查點中的配置（如果存在）或當前配置來初始化模型結構
-    config_from_s2_chkpt_eval = chkpt_s2_final_for_eval.get('config_snapshot_at_save', CONFIG)
-    
-    eval_s2_unet_final = UNet3D(
-        config_from_s2_chkpt_eval.get("image_channels", CONFIG["image_channels"]),
-        config_from_s2_chkpt_eval.get("base_channels_unet", CONFIG["base_channels_unet"]),
-        config_from_s2_chkpt_eval.get("time_emb_dim", CONFIG["time_emb_dim"]),
-        config_from_s2_chkpt_eval.get("condition_encode_dim", CONFIG["condition_encode_dim"]),
-        dropout_rate=config_from_s2_chkpt_eval.get("unet_dropout_rate", CONFIG.get("unet_dropout_rate", 0.05))
-    ).to(CONFIG["device"])
-
-    final_s2_model_to_eval = DDPM3D(
-        eval_s2_unet_final,
-        config_from_s2_chkpt_eval.get("timesteps", CONFIG["timesteps"]),
-        (config_from_s2_chkpt_eval.get("D", CONFIG["D"]), config_from_s2_chkpt_eval.get("H", CONFIG["H"]), config_from_s2_chkpt_eval.get("W", CONFIG["W"])),
-        config_from_s2_chkpt_eval.get("image_channels", CONFIG["image_channels"]),
-        config_from_s2_chkpt_eval.get("stage2_ddpm_condition_input_channels", CONFIG.get("stage2_ddpm_condition_input_channels", 2)),
-        config_from_s2_chkpt_eval.get("condition_encode_dim", CONFIG["condition_encode_dim"]),
-        beta_start=config_from_s2_chkpt_eval.get("beta_start", CONFIG["beta_start"]),
-        beta_end=config_from_s2_chkpt_eval.get("beta_end", CONFIG["beta_end"]),
-        device=CONFIG["device"]
-    )
-    final_s2_model_to_eval.load_state_dict(chkpt_s2_final_for_eval['ddpm_state_dict'])
-    logger.info(f"最佳 Stage2 模型 (Epoch {chkpt_s2_final_for_eval.get('epoch','未知')}) 載入完成。")
-    s2_avg_flow_map_for_final_eval = chkpt_s2_final_for_eval.get('stage2_avg_flow_map_dict')
-    new_cond_feature_norm_stats_for_final_eval = chkpt_s2_final_for_eval.get('new_cond_feature_norm_stats')
-    stage2_target_norm_stats_for_final_eval = train_dataset_s2.norm_stats_stage2_target if hasattr(train_dataset_s2, 'norm_stats_stage2_target') else None
-
-if s2_avg_flow_map_for_final_eval is None :
-    if hasattr(train_dataset_s2, 'average_flow_map_dict_s2'): s2_avg_flow_map_for_final_eval = train_dataset_s2.average_flow_map_dict_s2
-if new_cond_feature_norm_stats_for_final_eval is None :
-    if hasattr(train_dataset_s2, 'norm_stats_new_cond_feature'): new_cond_feature_norm_stats_for_final_eval = train_dataset_s2.norm_stats_new_cond_feature
-if CONFIG.get("use_dedicated_stage2_target_norm", False) and stage2_target_norm_stats_for_final_eval is None:
-    if hasattr(train_dataset_s2, 'norm_stats_stage2_target'): stage2_target_norm_stats_for_final_eval = train_dataset_s2.norm_stats_stage2_target
-
-if s2_avg_flow_map_for_final_eval is None or new_cond_feature_norm_stats_for_final_eval is None or \
-   (CONFIG.get("use_dedicated_stage2_target_norm", False) and stage2_target_norm_stats_for_final_eval is None):
-     raise ValueError("無法為最終評估獲取必要的統計量 (avg_flow_map, new_cond_norm_stats, 或 stage2_target_norm_stats)。")
-
-# 準備測試集 Loader
-test_loader_s2_final = None
-if len(s2_test_indices_final) > 0:
-    test_dataset_s2_final = Stage2Dataset(
-        df_for_stage2_processing=df_for_stage2_processing.iloc[s2_test_indices_final],
-        basemodel_outputs_for_samples_np=all_bm_outputs_s2_np_cond_normalized[s2_test_indices_final],
-        config=config_for_s2_dataset_use,
-        mode='test',
-        stage2_avg_flow_map_dict_from_train=s2_avg_flow_map_for_final_eval, 
-        original_sorted_flow_columns=basemodel_sorted_flow_cols_source,
-        new_cond_feature_norm_stats_from_train=new_cond_feature_norm_stats_for_final_eval, 
-        stage2_target_norm_stats_from_train=stage2_target_norm_stats_for_final_eval
-    )
-    s2_eval_batch_size_final = CONFIG.get("eval_batch_size")
-    test_loader_s2_final = DataLoader(test_dataset_s2_final, batch_size=s2_eval_batch_size_final, shuffle=False, num_workers=CONFIG["num_workers"], pin_memory=True)
-    logger.info(f"Stage2 最終評估測試數據集創建，含 {len(test_dataset_s2_final)} 樣本。")
-
-if test_loader_s2_final and len(test_loader_s2_final.dataset) > 0 :
-    # 載入 Inception 模型
-    inception_fid_eval = inception_v3(weights=Inception_V3_Weights.DEFAULT, aux_logits=True).to(CONFIG["device"])
-    inception_fid_eval.fc = nn.Identity()
-    if hasattr(inception_fid_eval, 'AuxLogits') and inception_fid_eval.AuxLogits is not None: inception_fid_eval.AuxLogits = None
-    inception_fid_eval.eval()
-
-    s2_final_eval_results, s2_final_error_grids = evaluate_stage2_models(
-        stage2_model_trained=final_s2_model_to_eval,
-        basemodel_eval_instance=basemodel_for_output_generation,
-        dataloader_s2=test_loader_s2_final,
-        inception_model_fid=inception_fid_eval,
-        config=CONFIG,
-        max_samples_for_fid=CONFIG.get("fid_num_samples_stage2"),
-        prefix=f"final_eval_{STAGE2_MODEL_NAME}"
-    )
-    logger.info(f"--- Stage2 模型 ({STAGE2_MODEL_NAME}) 最終評估結果 (測試集) ---")
-    if "stage2_model" in s2_final_eval_results: logger.info(f"Stage2 Model: {s2_final_eval_results['stage2_model']}")
-    if "basemodel_on_s2_data" in s2_final_eval_results: logger.info(f"Basemodel (on S2 data): {s2_final_eval_results['basemodel_on_s2_data']}")
-    
-    # 保存指標到 JSON
-    eval_metrics_path = os.path.join(CONFIG["stage2_model_save_dir"], f"final_evaluation_metrics_{STAGE2_MODEL_NAME}.json")
-    with open(eval_metrics_path, 'w') as f: json.dump(s2_final_eval_results, f, indent=4)
-    logger.info(f"Stage2 評估指標已儲存至: {eval_metrics_path}")
-    
-    # Excel 輸出
-    excel_rows_final_s2 = []
-    num_grid_cells_final = CONFIG["H"] * CONFIG["W"]
-    grid_idx_to_rc_map_s2 = CONFIG.get("cached_basemodel_grid_idx_to_rc_map")
-    sorted_flow_columns_s2 = CONFIG.get("cached_basemodel_sorted_flow_columns")
-    selected_sensor_info_s2 = CONFIG.get("cached_basemodel_selected_sensor_info")
-    if not grid_idx_to_rc_map_s2 or not sorted_flow_columns_s2 or not selected_sensor_info_s2:
-        logger.error("無法獲取用於 Excel 報告的網格映射資訊。座標將不正確。")
-        # 可以選擇在這裡返回或用預設值填充
-
-    sensor_info_lookup_s2 = {info['name']: {'lon': info['lon'], 'lat': info['lat']}
-                            for info in selected_sensor_info_s2 if isinstance(info, dict) and 'name' in info}
-    for model_key_eval in ["stage2_model", "basemodel_on_s2_data"]:
-        if model_key_eval not in s2_final_eval_results or model_key_eval not in s2_final_error_grids:
-            continue
-        metrics_eval = s2_final_eval_results[model_key_eval]
-        error_grids_eval = s2_final_error_grids[model_key_eval]
-        excel_rows_final_s2.append({'資料來源': f"--- {model_key_eval} (Test Set) ---",
-                                '網格座標_R': '', '網格座標_C': '', '經度': '', '緯度': '',
-                                'MSE': '', 'MAE': '', 'MAPE': '', 'SMAPE': '', 'FID': ''}) # 添加分隔行
-
-        for flat_idx in range(num_grid_cells_final):
-            grid_r_coord, grid_c_coord = 'N/A', 'N/A'
-            lon_coord, lat_coord = np.nan, np.nan
-
-            if grid_idx_to_rc_map_s2 and flat_idx in grid_idx_to_rc_map_s2:
-                grid_r_coord, grid_c_coord = grid_idx_to_rc_map_s2[flat_idx]
-
-            if sorted_flow_columns_s2 and flat_idx < len(sorted_flow_columns_s2):
-                col_name = sorted_flow_columns_s2[flat_idx]
-                if sensor_info_lookup_s2 and col_name in sensor_info_lookup_s2:
-                    lon_coord = sensor_info_lookup_s2[col_name]['lon']
-                    lat_coord = sensor_info_lookup_s2[col_name]['lat']
-
-            row_d = {
-                '資料來源': model_key_eval,
-                '網格座標_R': grid_r_coord,
-                '網格座標_C': grid_c_coord,
-                '經度': lon_coord,
-                '緯度': lat_coord,
-                'MSE': error_grids_eval.get('MSE')[flat_idx] if error_grids_eval.get('MSE') is not None and flat_idx < len(error_grids_eval.get('MSE')) else np.nan,
-                'MAE': error_grids_eval.get('MAE')[flat_idx] if error_grids_eval.get('MAE') is not None and flat_idx < len(error_grids_eval.get('MAE')) else np.nan,
-                'MAPE': error_grids_eval.get('MAPE')[flat_idx] if error_grids_eval.get('MAPE') is not None and flat_idx < len(error_grids_eval.get('MAPE')) else np.nan,
-                'SMAPE': error_grids_eval.get('SMAPE')[flat_idx] if error_grids_eval.get('SMAPE') is not None and flat_idx < len(error_grids_eval.get('SMAPE')) else np.nan,
-                'FID': 'N/A' # FID 通常不是針對每個網格計算
-            }
-            excel_rows_final_s2.append(row_d)
-
-        avg_row_eval = {
-            '資料來源': model_key_eval, '網格座標_R': '整體平均', '網格座標_C': '', '經度': '', '緯度': '',
-            'MSE': metrics_eval.get('mse', np.nan), 'MAE': metrics_eval.get('mae', np.nan),
-            'MAPE': metrics_eval.get('mape', np.nan), 'SMAPE': metrics_eval.get('smape', np.nan),
-            'FID': metrics_eval.get('fid', np.nan)
-        }
-        excel_rows_final_s2.append(avg_row_eval)
-
-    if "stage2_model" in s2_final_eval_results and "basemodel_on_s2_data" in s2_final_eval_results and \
-       "stage2_model" in s2_final_error_grids and "basemodel_on_s2_data" in s2_final_error_grids:
-
-        logger.info("計算 Stage2 Model 與 Basemodel 的指標差異...")
-
-        metrics_s2 = s2_final_eval_results["stage2_model"]
-        metrics_bm = s2_final_eval_results["basemodel_on_s2_data"]
-        error_grids_s2 = s2_final_error_grids["stage2_model"]
-        error_grids_bm = s2_final_error_grids["basemodel_on_s2_data"]
-
-        # 添加差異標題行
-        excel_rows_final_s2.append({'資料來源': f"--- Difference (Stage2 - Basemodel) ---",
-                                '網格座標_R': '', '網格座標_C': '', '經度': '', '緯度': '',
-                                'MSE': '', 'MAE': '', 'MAPE': '', 'SMAPE': '', 'FID': ''})
-
-        # 計算並添加每個網格的指標差異
-        for flat_idx in range(num_grid_cells_final): # num_grid_cells_final 應該已經在前面定義了
-            grid_r_coord, grid_c_coord = 'N/A', 'N/A'
-            lon_coord, lat_coord = np.nan, np.nan
-
-            if grid_idx_to_rc_map_s2 and flat_idx in grid_idx_to_rc_map_s2:
-                grid_r_coord, grid_c_coord = grid_idx_to_rc_map_s2[flat_idx]
-
-            if sorted_flow_columns_s2 and flat_idx < len(sorted_flow_columns_s2):
-                col_name = sorted_flow_columns_s2[flat_idx]
-                if sensor_info_lookup_s2 and col_name in sensor_info_lookup_s2:
-                    lon_coord = sensor_info_lookup_s2[col_name]['lon']
-                    lat_coord = sensor_info_lookup_s2[col_name]['lat']
-            
-            diff_row_d = {
-                '資料來源': "Difference (S2-BM)",
-                '網格座標_R': grid_r_coord,
-                '網格座標_C': grid_c_coord,
-                '經度': lon_coord,
-                '緯度': lat_coord,
-                'MSE': (error_grids_s2.get('MSE')[flat_idx] - error_grids_bm.get('MSE')[flat_idx])
-                        if error_grids_s2.get('MSE') is not None and error_grids_bm.get('MSE') is not None and
-                           flat_idx < len(error_grids_s2.get('MSE')) and flat_idx < len(error_grids_bm.get('MSE'))
-                        else np.nan,
-                'MAE': (error_grids_s2.get('MAE')[flat_idx] - error_grids_bm.get('MAE')[flat_idx])
-                        if error_grids_s2.get('MAE') is not None and error_grids_bm.get('MAE') is not None and
-                           flat_idx < len(error_grids_s2.get('MAE')) and flat_idx < len(error_grids_bm.get('MAE'))
-                        else np.nan,
-                'MAPE': (error_grids_s2.get('MAPE')[flat_idx] - error_grids_bm.get('MAPE')[flat_idx])
-                        if error_grids_s2.get('MAPE') is not None and error_grids_bm.get('MAPE') is not None and
-                           flat_idx < len(error_grids_s2.get('MAPE')) and flat_idx < len(error_grids_bm.get('MAPE'))
-                        else np.nan,
-                'SMAPE': (error_grids_s2.get('SMAPE')[flat_idx] - error_grids_bm.get('SMAPE')[flat_idx])
-                         if error_grids_s2.get('SMAPE') is not None and error_grids_bm.get('SMAPE') is not None and
-                            flat_idx < len(error_grids_s2.get('SMAPE')) and flat_idx < len(error_grids_bm.get('SMAPE'))
-                         else np.nan,
-                'FID': 'N/A' # FID 不是針對每個網格計算
-            }
-            excel_rows_final_s2.append(diff_row_d)
-
-        # 計算並添加整體平均指標的差異
-        diff_avg_row_eval = {
-            '資料來源': "Difference (S2-BM)",
-            '網格座標_R': '整體平均差異', '網格座標_C': '', '經度': '', '緯度': '',
-            'MSE': (metrics_s2.get('mse', np.nan) - metrics_bm.get('mse', np.nan))
-                   if not (np.isnan(metrics_s2.get('mse', np.nan)) or np.isnan(metrics_bm.get('mse', np.nan))) else np.nan,
-            'MAE': (metrics_s2.get('mae', np.nan) - metrics_bm.get('mae', np.nan))
-                   if not (np.isnan(metrics_s2.get('mae', np.nan)) or np.isnan(metrics_bm.get('mae', np.nan))) else np.nan,
-            'MAPE': (metrics_s2.get('mape', np.nan) - metrics_bm.get('mape', np.nan))
-                    if not (np.isnan(metrics_s2.get('mape', np.nan)) or np.isnan(metrics_bm.get('mape', np.nan))) else np.nan,
-            'SMAPE': (metrics_s2.get('smape', np.nan) - metrics_bm.get('smape', np.nan))
-                     if not (np.isnan(metrics_s2.get('smape', np.nan)) or np.isnan(metrics_bm.get('smape', np.nan))) else np.nan,
-            'FID': (metrics_s2.get('fid', np.nan) - metrics_bm.get('fid', np.nan))
-                   if not (np.isnan(metrics_s2.get('fid', np.nan)) or np.isnan(metrics_bm.get('fid', np.nan))) else np.nan, # FID 差異通常也關注
-        }
-        excel_rows_final_s2.append(diff_avg_row_eval)
-        logger.info("指標差異計算並添加到 Excel 數據中。")
-    else:
-        logger.warning("無法計算指標差異，因為 Stage2 Model 或 Basemodel 的結果缺失。")
-
-    if excel_rows_final_s2:
-        df_excel_final_s2 = pd.DataFrame(excel_rows_final_s2)
-        excel_column_order_s2 = ['資料來源', '網格座標_R', '網格座標_C', '經度', '緯度', 'MSE', 'MAE', 'MAPE', 'SMAPE', 'FID']
-        df_excel_final_s2 = df_excel_final_s2.reindex(columns=excel_column_order_s2)
-
-        excel_final_path_s2 = os.path.join(CONFIG["stage2_model_save_dir"], f"final_test_metrics_detailed_{STAGE2_MODEL_NAME}.xlsx")
-        df_excel_final_s2.to_excel(excel_final_path_s2, index=False)
-        logger.info(f"Stage2 詳細測試評估指標 (包含差異) 已匯出至: {excel_final_path_s2}")
-
-else:
-    logger.warning("Stage2 最終評估的測試數據集為空，跳過評估。")
-
-logger.info(f"===== Stage2 流程全部結束 ({STAGE2_MODEL_NAME}) =====")

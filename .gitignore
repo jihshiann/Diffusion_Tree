@@ -392,3 +392,6 @@ FodyWeavers.xsd
 /results_ddpm_stage2/Stage2_UVIndex
 /results_ddpm_stage2/Stage2_HourLe21
 /results_ddpm_stage2
+/results_ddpm_stage3/Stage2_DewPointLe235
+/results_ddpm_stage3/Stage3_Dayle7
+/results_ddpm_stage3/model_outputs_cache

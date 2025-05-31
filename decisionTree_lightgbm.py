@@ -49,12 +49,13 @@ feature_mapping = {
     '總雲量': 'Total_Cloud_Cover',
     'hoilday': 'Holiday',
     'weekday': 'Weekday',
-    '年': 'Year',
+    #'年': 'Year',
     '月': 'Month',
     '日': 'Day',
     '時': 'Hour'
 }
-
+reverse_mapping = {v: k for k, v in feature_mapping.items()}
+rule_statistics = {} # 用於存儲規則及其累計分數
 df_original = df.copy()
 
 # 提取座標欄位（假設格式為 "(經度, 緯度)"）
@@ -370,11 +371,9 @@ for target in target_columns:
     # 出現在第二層的規則，每出現一次+2分
     # 出現在第三層的規則，每出現一次+1分
     feature_names_from_model = list(X_train_tree.columns) # 這些是英文特徵名稱
-    reverse_mapping = {v: k for k, v in feature_mapping.items()}
-    rule_statistics = {} # 用於存儲規則及其累計分數
     # cat_features 已經定義為英文名稱，例如 ['Holiday']
     collect_rules_with_scores(best_tree, 1, 3, feature_names_from_model, cat_features, rule_statistics, reverse_mapping)
-    time.sleep(1)
+    #time.sleep(1)
 
 print("\n開始匯出決策規則統計...")
 excel_data_for_rules = []
@@ -649,7 +648,6 @@ for group_prefix, targets in group_to_targets.items():
     group_representative[group_prefix] = best_target
 
 # 將群代表的模型視覺化，同時標示出該群的規則
-reverse_mapping = {v: k for k, v in feature_mapping.items()}
 for group_prefix, rep_target in group_representative.items():
     model = target_models[rep_target]
     best_tree_index = target_best_tree_index[rep_target]

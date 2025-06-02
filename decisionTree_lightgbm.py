@@ -256,30 +256,30 @@ for target in target_columns:
     # cat_features 已經定義為英文名稱，例如 ['Holiday']
     #collect_rules_with_scores(best_tree, 1, 3, feature_names_from_model, cat_features, rule_statistics, reverse_mapping)
     #time.sleep(1)
-#%%
-print("\n開始匯出決策規則統計...")
-excel_data_for_rules = []
-for rule_desc, score in rule_statistics.items():
-    excel_data_for_rules.append({
-        "決策規則 (中文)": rule_desc,
-        "總分數": score
-    })
 
-df_rule_stats = pd.DataFrame(excel_data_for_rules)
-# 按分數降序排序
-df_rule_stats = df_rule_stats.sort_values(by="總分數", ascending=False)
+# print("\n開始匯出決策規則統計...")
+# excel_data_for_rules = []
+# for rule_desc, score in rule_statistics.items():
+#     excel_data_for_rules.append({
+#         "決策規則 (中文)": rule_desc,
+#         "總分數": score
+#     })
 
-rule_stats_excel_path = os.path.join(result_dir, "decision_rule_statistics.xlsx")
-try:
-    df_rule_stats.to_excel(rule_stats_excel_path, index=False, engine='openpyxl')
-    print(f"決策規則統計已儲存至: {rule_stats_excel_path}")
-except ImportError:
-    print("請安裝 'openpyxl' 套件以支援 Excel (.xlsx) 檔案匯出：pip install openpyxl")
+# df_rule_stats = pd.DataFrame(excel_data_for_rules)
+# # 按分數降序排序
+# df_rule_stats = df_rule_stats.sort_values(by="總分數", ascending=False)
+
+# rule_stats_excel_path = os.path.join(result_dir, "decision_rule_statistics.xlsx")
+# try:
+#     df_rule_stats.to_excel(rule_stats_excel_path, index=False, engine='openpyxl')
+#     print(f"決策規則統計已儲存至: {rule_stats_excel_path}")
+# except ImportError:
+#     print("請安裝 'openpyxl' 套件以支援 Excel (.xlsx) 檔案匯出：pip install openpyxl")
     
-    rule_stats_csv_path = os.path.join(result_dir, "decision_rule_statistics.csv")
-    df_rule_stats.to_csv(rule_stats_csv_path, index=False, encoding='utf-8-sig')
-    print(f"決策規則統計已儲存為 CSV 格式至: {rule_stats_csv_path}")
-
+#     rule_stats_csv_path = os.path.join(result_dir, "decision_rule_statistics.csv")
+#     df_rule_stats.to_csv(rule_stats_csv_path, index=False, encoding='utf-8-sig')
+#     print(f"決策規則統計已儲存為 CSV 格式至: {rule_stats_csv_path}")
+#%%
 # 定義結果儲存目錄
 result_dir = r"C:\\thesis\\code\\result_lgb"  # 請根據實際路徑調整
 shared_result_dir = os.path.join(result_dir, "shared_model")
@@ -786,8 +786,10 @@ for target_coord_str in target_columns:
 # 或者手動指定顏色以更好地控制相似性
 # 假設 group_id 0-3 源於 R1 的第一種主要分裂，4-7 源於第二種
 colors = [
-    '#1f77b4', '#aec7e8', '#ff7f0e', '#ffbb78',  # R1_typeA (藍/橙系)
-    '#2ca02c', '#98df8a', '#d62728', '#ff9896'   # R1_typeB (綠/紅系)
+    '#1f77b4', '#aec7e8',  # R1_typeA 分支 -> 子分支1 (藍色系) -> 組別 0, 1
+    '#2ca02c', '#98df8a',  # R1_typeA 分支 -> 子分支2 (綠色系) -> 組別 2, 3
+    '#ff7f0e', '#ffbb78',  # R1_typeB 分支 -> 子分支1 (橙色系) -> 組別 4, 5
+    '#d62728', '#ff9896'   # R1_typeB 分支 -> 子分支2 (紅色系) -> 組別 6, 7
 ]
 # 如果 final_eight_groups_details 的順序確實反映了分裂層次，這個顏色列表可以直接用
 # 否則，需要根據 group_rules_dict 中的 R1, R2, R3 類型來動態決定顏色

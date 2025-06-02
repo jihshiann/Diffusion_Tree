@@ -49,21 +49,21 @@ CONFIG = {
     "basemodel_checkpoint_to_load_for_stage2": r"C:\thesis\code\DIFFUSION_TREE\results_ddpm_long-term\best_ddpm_model_during_training.pth", # Basemodel檢查點
 
     # === Stage2 特定配置 ===
-    "stage2_new_condition_feature_column": "時", # Stage2 新條件的欄位名
+    "stage2_new_condition_feature_column": "氣溫", # Stage2 新條件的欄位名
     "stage2_new_conditional_operator": "<=",         # Stage2 新條件的運算符
-    "stage2_new_conditional_value": 20,             # Stage2 新條件的閾值
-    "stage2_model_name": "Stage2_HourLe20",    # 第二階段模型的名稱
+    "stage2_new_conditional_value": 13.5,             # Stage2 新條件的閾值
+    "stage2_model_name": "Stage2_TemperatureLe135",    # 第二階段模型的名稱
     "stage2_ddpm_condition_input_channels": 2,       # Stage2 DDPM 的 condition_processor 輸入通道數 (固定為2: bm_out + uv_grid_s2)
-    "stage2_checkpoint_path": "best_stage2_model_hour_le_20.pth", # Stage2 模型的檢查點檔名 (相對路徑)
+    "stage2_checkpoint_path": "best_stage2_model_temperature_le_13_5.pth", # Stage2 模型的檢查點檔名 (相對路徑)
     "basemodel_checkpoint_to_load_for_stage3": r"C:\thesis\code\DIFFUSION_TREE\results_ddpm_stage2\Stage2_HourLe20\best_stage2_model_hour_le_20.pth", # Stage2檢查點 (用於載入給Stage3)
 
     # === Stage3 特定配置 ===
-    "stage3_new_condition_feature_column": "露點溫度", # Stage3 新條件的欄位名 
+    "stage3_new_condition_feature_column": "時", # Stage3 新條件的欄位名 
     "stage3_new_conditional_operator": "<=",         # Stage3 新條件的運算符
-    "stage3_new_conditional_value": 23.5,             # Stage3 新條件的閾值 (例如: 4 代表週一到週五)
-    "stage3_model_name": "Stage2_DewPointLe235",    # 第三階段模型的名稱
+    "stage3_new_conditional_value": 20,             # Stage3 新條件的閾值 (例如: 4 代表週一到週五)
+    "stage3_model_name": "Stage3_HourLe20",    # 第三階段模型的名稱
     "stage3_ddpm_condition_input_channels": 2,       # Stage3 DDPM 的 condition_processor 輸入通道數 (固定為2: s2_out + uv_grid_s3)
-    "stage3_checkpoint_path": "best_stage3_model_dew_point_le_23_5.pth", # Stage3 模型的檢查點檔名 (相對路徑)
+    "stage3_checkpoint_path": "best_stage3_model_hour_le_20.pth", # Stage3 模型的檢查點檔名 (相對路徑)
 
     # --- DDPM 擴散參數 ---
     "timesteps": 1000,          # 擴散時間步長

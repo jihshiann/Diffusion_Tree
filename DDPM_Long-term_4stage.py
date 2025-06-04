@@ -22,6 +22,7 @@ from scipy.optimize import linear_sum_assignment # 用於匈牙利演算法
 from typing import Optional, Tuple, List, Dict, Any
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
+from enum import Enum
 
 # ==============================================================================
 # 組態設定
@@ -62,12 +63,19 @@ CONFIG = {
     "stage3_model_name": "Stage3_WeekdayLe3",    # 第三階段模型的名稱
     "stage3_checkpoint_path": "best_stage3_model_weekday_le_3.pth", # Stage3 模型的檢查點檔名 (相對路徑)
 
+    # === Stage4 特定配置 ===
+    "stage4_new_condition_feature_column": "weekday", # stage4 新條件的欄位名 
+    "stage4_new_conditional_operator": "<=",         # stage4 新條件的運算符
+    "stage4_new_conditional_value": 3,             # stage4 新條件的閾值
+    "stage4_model_name": "stage4_WeekdayLe3",    # 第三階段模型的名稱
+    "stage4_checkpoint_path": "best_stage4_model_weekday_le_3.pth", # stage4 模型的檢查點檔名 (相對路徑)
+
     # --- DDPM 擴散參數 ---
     "timesteps": 1000,          # 擴散時間步長
     "beta_start": 1e-4,
     "beta_end": 0.02,
 
-    # --- 訓練參數 (Stage2/Stage3 將優先使用 epochs_stageX, lr_stageX 等，若無則回退到通用版本) ---
+    # --- 訓練參數 ---
     "epochs": 128,
     "batch_size": 256,
     "lr": 1e-3,
@@ -89,7 +97,8 @@ CONFIG = {
 
     # --- 路徑與儲存 ---
     "save_dir_stage2": "results_ddpm_stage2",
-    "save_dir": "results_ddpm_stage3", # 主結果儲存目錄的基礎名稱
+    "save_dir_stage3": "results_ddpm_stage3",
+    "save_dir": "results_ddpm_stage4", # 主結果儲存目錄的基礎名稱
     
     "train_split_ratio": 0.7,
     "val_split_ratio": 0.15,
@@ -100,7 +109,12 @@ CONFIG = {
     "cached_stage2_outputs_for_s3_filename": "stage2_outputs_for_s3_normalized.npy",
 }
 
+# 根據當前活躍的最高階段來設定通用的 condition_input_channels
+# 這主要影響模型實例化時 DDPM3D 的 condition_processor。
+# 在訓練/採樣時，我們會明確傳遞該階段所需的條件網格數量。
+# 這裡假設每個階段的 DDPM condition_processor 都期望2個輸入通道。
 CONFIG["condition_input_channels"] = 2
+
 
 # 更新/生成 Stage2 相關路徑
 CONFIG["stage2_model_save_dir"] = os.path.join(CONFIG["save_dir_stage2"], CONFIG["stage2_model_name"])
@@ -111,6 +125,11 @@ CONFIG["stage2_checkpoint_full_path"] = os.path.join(CONFIG["stage2_model_save_d
 CONFIG["stage3_model_save_dir"] = os.path.join(CONFIG["save_dir"], CONFIG["stage3_model_name"])
 os.makedirs(CONFIG["stage3_model_save_dir"], exist_ok=True)
 CONFIG["stage3_checkpoint_full_path"] = os.path.join(CONFIG["stage3_model_save_dir"], CONFIG["stage3_checkpoint_path"])
+
+# 更新/生成 Stage4 相關路徑
+CONFIG["stage4_model_save_dir"] = os.path.join(CONFIG["save_dir"], CONFIG["stage4_model_name"])
+os.makedirs(CONFIG["stage4_model_save_dir"], exist_ok=True)
+CONFIG["stage3_checkpoint_full_path"] = os.path.join(CONFIG["stage4_model_save_dir"], CONFIG["stage4_checkpoint_path"])
 
 # 建立快取目錄路徑
 CONFIG["cache_dir_full_path"] = os.path.join(CONFIG["save_dir"], CONFIG["cache_dir_name"])
@@ -128,13 +147,20 @@ torch.manual_seed(CONFIG["seed"])
 if CONFIG["device"] == "cuda":
     torch.cuda.manual_seed_all(CONFIG["seed"])
 logger.info(f"使用裝置: {CONFIG['device']}")
-logger.info(f"Stage2 結果將儲存於: {CONFIG['stage2_model_save_dir']}")
-logger.info(f"Stage3 結果將儲存於: {CONFIG['stage3_model_save_dir']}")
+logger.info(f"Stage4 結果將儲存於: {CONFIG['stage4_model_save_dir']}")
 
 if not os.path.exists(CONFIG["basemodel_checkpoint"]):
     logger.error(f"【【【警告】】】 Basemodel 檢查點路徑未設定或檔案不存在: {CONFIG['basemodel_checkpoint']}")
-if not os.path.exists(CONFIG["stage2_checkpoint_full_path"]): # 檢查 Stage2 檢查點路徑
+if not os.path.exists(CONFIG["stage2_checkpoint_full_path"]): 
     logger.error(f"【【【警告】】】 Stage2 檢查點路徑 (用於載入給Stage3) 未設定或檔案不存在: {CONFIG['stage2_checkpoint_full_path']}")
+if not os.path.exists(CONFIG["stage3_checkpoint_full_path"]): 
+    logger.error(f"【【【警告】】】 Stage3 檢查點路徑 (用於載入給Stage4) 未設定或檔案不存在: {CONFIG['stage3_checkpoint_full_path']}")
+class ConditionMode(Enum):
+    BASEMODEL = 1
+    STAGE2 = 2
+    STAGE3 = 3
+    STAGE4 = 4
+
 #%%
 # ==============================================================================
 # UNet3D, DDPM3D
@@ -366,79 +392,84 @@ class DDPM3D(nn.Module):
         final_stacked_grids = torch.cat((hour_grids_t, holiday_grids_t), dim=1)
         return final_stacked_grids.to(self.device)
 
-    def _prepare_stage2_condition_grids(self,
+    def _prepare_stage_condition_grids(self,
                                      condition_grid_1_batch: torch.Tensor,
                                      condition_grid_2_batch: torch.Tensor
                                      ) -> torch.Tensor:
         expected_single_grid_shape = (1, self.image_size_D, self.image_size_H, self.image_size_W)
-        # 檢查第一個條件網格的通道數是否為1 (因為通常是單一來源的網格，如BM輸出或S2輸出)
+        # 檢查第一個條件網格的通道數是否為1 (因為通常是單一來源的網格，如BM輸出)
         if condition_grid_1_batch.shape[1] != 1:
-            self.logger.warning(f"Stage2/3 condition_grid_1_batch has {condition_grid_1_batch.shape[1]} channels, expected 1. Using as is.")
-            # Consider raising error or taking first channel if strictly 1 channel is expected before cat.
+            self.logger.warning(f"Stage condition_grid_1_batch has {condition_grid_1_batch.shape[1]} channels, expected 1. Using as is.")
+
         # 檢查第二個條件網格的通道數是否為1 (因為通常是單一來源的網格，如新特徵網格)
         if condition_grid_2_batch.shape[1] != 1:
-            self.logger.warning(f"Stage2/3 condition_grid_2_batch has {condition_grid_2_batch.shape[1]} channels, expected 1. Using as is.")
+            self.logger.warning(f"Stage condition_grid_2_batch has {condition_grid_2_batch.shape[1]} channels, expected 1. Using as is.")
 
         # 確保空間維度 (D, H, W) 匹配
         if condition_grid_1_batch.shape[2:] != expected_single_grid_shape[1:] or \
            condition_grid_2_batch.shape[2:] != expected_single_grid_shape[1:]:
-            self.logger.error(f"Stage 2/3 condition input grid spatial dimensions (D,H,W) are incorrect or mismatched. "
+            self.logger.error(f"Stage condition input grid spatial dimensions (D,H,W) are incorrect or mismatched. "
                               f"Grid1 spatial: {condition_grid_1_batch.shape[2:]}, Grid2 spatial: {condition_grid_2_batch.shape[2:]}. "
                               f"Expected spatial: {expected_single_grid_shape[1:]}")
-            # Consider raising an error.
+
         
-        # 這裡假設 condition_processor 的輸入通道數是 2
         if self.condition_processor[0].in_channels != 2:
-             self.logger.warning(f"_prepare_stage2_condition_grids (used by Stage2/3): Condition processor input channels ({self.condition_processor[0].in_channels}) is not 2, but this method produces 2 channels by concatenating two 1-channel grids.")
+             self.logger.warning(f"_prepare_stage_condition_grids: Condition processor input channels ({self.condition_processor[0].in_channels}) is not 2, but this method produces 2 channels by concatenating two 1-channel grids.")
         return torch.cat((condition_grid_1_batch, condition_grid_2_batch), dim=1)
 
     def p_losses(self, x_start_target_flow: torch.Tensor, t: torch.Tensor,
-                 noise: Optional[torch.Tensor] = None,
-                 # 條件參數 - 擇一組提供
-                 # Basemodel 條件
-                 hour_scalars_batch: Optional[torch.Tensor] = None,
-                 is_holiday_scalars_batch: Optional[torch.Tensor] = None,
-                 # Stage2 條件
-                 basemodel_output_grid_batch: Optional[torch.Tensor] = None,
-                 stage2_new_condition_feature_grid_batch: Optional[torch.Tensor] = None,
-                 # Stage3 條件
-                 stage2_output_grid_batch_for_s3: Optional[torch.Tensor] = None,
-                 stage3_new_condition_feature_grid_batch: Optional[torch.Tensor] = None
-                 ) -> torch.Tensor:
+                 mode: ConditionMode, # 明確的模式參數
+                 condition_args: Dict[str, Optional[torch.Tensor]], # 一個包含所有可能條件的字典
+                 noise: Optional[torch.Tensor] = None) -> torch.Tensor:
 
         if noise is None: noise = torch.randn_like(x_start_target_flow)
         x_t_noisy_target = self.q_sample(x_start=x_start_target_flow, t=t, noise=noise)
-
         stacked_cond_grids: Optional[torch.Tensor] = None
-        # 判斷是哪種條件模式
-        if hour_scalars_batch is not None and is_holiday_scalars_batch is not None:
-            # Basemodel (原始) 條件模式
-            if basemodel_output_grid_batch is not None or stage2_new_condition_feature_grid_batch is not None or \
-               stage2_output_grid_batch_for_s3 is not None or stage3_new_condition_feature_grid_batch is not None:
-                raise ValueError("p_losses (Basemodel mode): Cannot provide scalar (hour/holiday) and other grid conditions simultaneously.")
-            stacked_cond_grids = self._prepare_original_conditional_input_grids(
-                hour_scalars_batch, is_holiday_scalars_batch
-            )
-        elif basemodel_output_grid_batch is not None and stage2_new_condition_feature_grid_batch is not None:
-            # Stage2 條件模式
-            if hour_scalars_batch is not None or is_holiday_scalars_batch is not None or \
-               stage2_output_grid_batch_for_s3 is not None or stage3_new_condition_feature_grid_batch is not None:
-                raise ValueError("p_losses (Stage2 mode): Cannot provide Stage2 grid conditions and other mode conditions simultaneously.")
-            stacked_cond_grids = self._prepare_stage2_condition_grids( # Reusing this method
-                basemodel_output_grid_batch,
-                stage2_new_condition_feature_grid_batch
-            )
-        elif stage2_output_grid_batch_for_s3 is not None and stage3_new_condition_feature_grid_batch is not None:
-            # Stage3 條件模式
-            if hour_scalars_batch is not None or is_holiday_scalars_batch is not None or \
-               basemodel_output_grid_batch is not None or stage2_new_condition_feature_grid_batch is not None:
-                raise ValueError("p_losses (Stage3 mode): Cannot provide Stage3 grid conditions and other mode conditions simultaneously.")
-            stacked_cond_grids = self._prepare_stage2_condition_grids( # Reusing this method
-                stage2_output_grid_batch_for_s3,
-                stage3_new_condition_feature_grid_batch
-            )
+        
+        self.logger.debug(f"p_losses called with mode: {mode}, condition_args keys: {list(condition_args.keys())}")
+
+        if mode == ConditionMode.BASEMODEL:
+            hour_s = condition_args.get("hour_scalars_batch")
+            is_hol_s = condition_args.get("is_holiday_scalars_batch")
+            if hour_s is None or is_hol_s is None:
+                raise ValueError("p_losses (Basemodel mode): Requires 'hour_scalars_batch' and 'is_holiday_scalars_batch' in condition_args.")
+            # 檢查是否提供了其他不應存在的鍵 (可選，但更穩健)
+            unexpected_keys = [k for k in condition_args if k not in ["hour_scalars_batch", "is_holiday_scalars_batch"]]
+            if unexpected_keys:
+                self.logger.warning(f"p_losses (Basemodel mode): Unexpected keys in condition_args: {unexpected_keys}")
+            stacked_cond_grids = self._prepare_original_conditional_input_grids(hour_s, is_hol_s)
+        
+        elif mode == ConditionMode.STAGE2:
+            bm_out = condition_args.get("basemodel_output_grid_batch")
+            s2_new_feat = condition_args.get("stage2_new_condition_feature_grid_batch")
+            if bm_out is None or s2_new_feat is None:
+                raise ValueError("p_losses (Stage2 mode): Requires 'basemodel_output_grid_batch' and 'stage2_new_condition_feature_grid_batch' in condition_args.")
+            unexpected_keys = [k for k in condition_args if k not in ["basemodel_output_grid_batch", "stage2_new_condition_feature_grid_batch"]]
+            if unexpected_keys:
+                self.logger.warning(f"p_losses (Stage2 mode): Unexpected keys in condition_args: {unexpected_keys}")
+            stacked_cond_grids = self._prepare_stage_condition_grids(bm_out, s2_new_feat)
+
+        elif mode == ConditionMode.STAGE3:
+            s2_out = condition_args.get("stage2_output_grid_batch_for_s3")
+            s3_new_feat = condition_args.get("stage3_new_condition_feature_grid_batch")
+            if s2_out is None or s3_new_feat is None:
+                raise ValueError("p_losses (Stage3 mode): Requires 'stage2_output_grid_batch_for_s3' and 'stage3_new_condition_feature_grid_batch' in condition_args.")
+            unexpected_keys = [k for k in condition_args if k not in ["stage2_output_grid_batch_for_s3", "stage3_new_condition_feature_grid_batch"]]
+            if unexpected_keys:
+                self.logger.warning(f"p_losses (Stage3 mode): Unexpected keys in condition_args: {unexpected_keys}")
+            stacked_cond_grids = self._prepare_stage_condition_grids(s2_out, s3_new_feat)
+
+        elif mode == ConditionMode.STAGE4: # 新增 Stage4 處理
+            s3_out = condition_args.get("stage3_output_grid_batch_for_s4")
+            s4_new_feat = condition_args.get("stage4_new_condition_feature_grid_batch")
+            if s3_out is None or s4_new_feat is None:
+                raise ValueError("p_losses (Stage4 mode): Requires 'stage3_output_grid_batch_for_s4' and 'stage4_new_condition_feature_grid_batch' in condition_args.")
+            unexpected_keys = [k for k in condition_args if k not in ["stage3_output_grid_batch_for_s4", "stage4_new_condition_feature_grid_batch"]]
+            if unexpected_keys:
+                self.logger.warning(f"p_losses (Stage4 mode): Unexpected keys in condition_args: {unexpected_keys}")
+            stacked_cond_grids = self._prepare_stage_condition_grids(s3_out, s4_new_feat)
         else:
-            raise ValueError("p_losses: Insufficient or ambiguous condition arguments provided for any mode.")
+            raise ValueError(f"p_losses: Unsupported condition mode: {mode}")
 
         expected_cond_proc_input_channels = self.condition_processor[0].in_channels
         if stacked_cond_grids.shape[1] != expected_cond_proc_input_channels:
@@ -452,55 +483,57 @@ class DDPM3D(nn.Module):
 
     @torch.no_grad()
     def sample(self, batch_size: int,
-               # Basemodel 條件
-               hour_scalars_batch: Optional[torch.Tensor] = None,
-               is_holiday_scalars_batch: Optional[torch.Tensor] = None,
-               # Stage2 條件
-               basemodel_output_grid_batch: Optional[torch.Tensor] = None,
-               stage2_new_condition_feature_grid_batch: Optional[torch.Tensor] = None,
-               # Stage3 條件
-               stage2_output_grid_batch_for_s3: Optional[torch.Tensor] = None,
-               stage3_new_condition_feature_grid_batch: Optional[torch.Tensor] = None
+               mode: ConditionMode, # 明確的模式參數
+               condition_args: Dict[str, Optional[torch.Tensor]] # 一個包含所有可能條件的字典
                ) -> torch.Tensor:
 
         img_shape = (batch_size, self.image_channels, self.image_size_D, self.image_size_H, self.image_size_W)
         img = torch.randn(img_shape, device=self.device)
-
         stacked_cond_grids: Optional[torch.Tensor] = None
-        if hour_scalars_batch is not None and is_holiday_scalars_batch is not None:
-            # Basemodel (原始) 條件模式
-            if basemodel_output_grid_batch is not None or stage2_new_condition_feature_grid_batch is not None or \
-               stage2_output_grid_batch_for_s3 is not None or stage3_new_condition_feature_grid_batch is not None:
-                raise ValueError("sample (Basemodel mode): Cannot provide scalar (hour/holiday) and other grid conditions simultaneously.")
-            if hour_scalars_batch.shape[0] != batch_size or is_holiday_scalars_batch.shape[0] != batch_size:
-                raise ValueError(f"Original condition batch sizes ({hour_scalars_batch.shape[0]},{is_holiday_scalars_batch.shape[0]}) != requested batch_size ({batch_size})")
-            stacked_cond_grids = self._prepare_original_conditional_input_grids(
-                hour_scalars_batch, is_holiday_scalars_batch
-            ).to(self.device)
-        elif basemodel_output_grid_batch is not None and stage2_new_condition_feature_grid_batch is not None:
-            # Stage2 條件模式
-            if hour_scalars_batch is not None or is_holiday_scalars_batch is not None or \
-               stage2_output_grid_batch_for_s3 is not None or stage3_new_condition_feature_grid_batch is not None:
-                raise ValueError("sample (Stage2 mode): Cannot provide Stage2 grid conditions and other mode conditions simultaneously.")
-            if basemodel_output_grid_batch.shape[0] != batch_size or stage2_new_condition_feature_grid_batch.shape[0] != batch_size:
-                raise ValueError(f"Stage2 condition batch sizes ({basemodel_output_grid_batch.shape[0]},{stage2_new_condition_feature_grid_batch.shape[0]}) != requested batch_size ({batch_size})")
-            stacked_cond_grids = self._prepare_stage2_condition_grids( # Reusing
-                basemodel_output_grid_batch,
-                stage2_new_condition_feature_grid_batch
-            )
-        elif stage2_output_grid_batch_for_s3 is not None and stage3_new_condition_feature_grid_batch is not None:
-            # Stage3 條件模式
-            if hour_scalars_batch is not None or is_holiday_scalars_batch is not None or \
-               basemodel_output_grid_batch is not None or stage2_new_condition_feature_grid_batch is not None:
-                raise ValueError("sample (Stage3 mode): Cannot provide Stage3 grid conditions and other mode conditions simultaneously.")
-            if stage2_output_grid_batch_for_s3.shape[0] != batch_size or stage3_new_condition_feature_grid_batch.shape[0] != batch_size:
-                raise ValueError(f"Stage3 condition batch sizes ({stage2_output_grid_batch_for_s3.shape[0]},{stage3_new_condition_feature_grid_batch.shape[0]}) != requested batch_size ({batch_size})")
-            stacked_cond_grids = self._prepare_stage2_condition_grids( # Reusing
-                stage2_output_grid_batch_for_s3,
-                stage3_new_condition_feature_grid_batch
-            )
+        
+        self.logger.debug(f"sample called with mode: {mode}, condition_args keys: {list(condition_args.keys())}")
+
+        if mode == ConditionMode.BASEMODEL:
+            hour_s = condition_args.get("hour_scalars_batch")
+            is_hol_s = condition_args.get("is_holiday_scalars_batch")
+            if hour_s is None or is_hol_s is None or hour_s.shape[0] != batch_size or is_hol_s.shape[0] != batch_size:
+                raise ValueError("sample (Basemodel mode): Requires 'hour_scalars_batch' and 'is_holiday_scalars_batch' matching batch_size.")
+            unexpected_keys = [k for k in condition_args if k not in ["hour_scalars_batch", "is_holiday_scalars_batch"]]
+            if unexpected_keys:
+                self.logger.warning(f"sample (Basemodel mode): Unexpected keys in condition_args: {unexpected_keys}")
+            stacked_cond_grids = self._prepare_original_conditional_input_grids(hour_s, is_hol_s).to(self.device)
+        
+        elif mode == ConditionMode.STAGE2:
+            bm_out = condition_args.get("basemodel_output_grid_batch")
+            s2_new_feat = condition_args.get("stage2_new_condition_feature_grid_batch")
+            if bm_out is None or s2_new_feat is None or bm_out.shape[0] != batch_size or s2_new_feat.shape[0] != batch_size:
+                raise ValueError("sample (Stage2 mode): Requires 'basemodel_output_grid_batch' and 'stage2_new_condition_feature_grid_batch' matching batch_size.")
+            unexpected_keys = [k for k in condition_args if k not in ["basemodel_output_grid_batch", "stage2_new_condition_feature_grid_batch"]]
+            if unexpected_keys:
+                self.logger.warning(f"sample (Stage2 mode): Unexpected keys in condition_args: {unexpected_keys}")
+            stacked_cond_grids = self._prepare_stage_condition_grids(bm_out, s2_new_feat)
+
+        elif mode == ConditionMode.STAGE3:
+            s2_out = condition_args.get("stage2_output_grid_batch_for_s3")
+            s3_new_feat = condition_args.get("stage3_new_condition_feature_grid_batch")
+            if s2_out is None or s3_new_feat is None or s2_out.shape[0] != batch_size or s3_new_feat.shape[0] != batch_size:
+                raise ValueError("sample (Stage3 mode): Requires 'stage2_output_grid_batch_for_s3' and 'stage3_new_condition_feature_grid_batch' matching batch_size.")
+            unexpected_keys = [k for k in condition_args if k not in ["stage2_output_grid_batch_for_s3", "stage3_new_condition_feature_grid_batch"]]
+            if unexpected_keys:
+                self.logger.warning(f"sample (Stage3 mode): Unexpected keys in condition_args: {unexpected_keys}")
+            stacked_cond_grids = self._prepare_stage_condition_grids(s2_out, s3_new_feat)
+
+        elif mode == ConditionMode.STAGE4: # 新增 Stage4 處理
+            s3_out = condition_args.get("stage3_output_grid_batch_for_s4")
+            s4_new_feat = condition_args.get("stage4_new_condition_feature_grid_batch")
+            if s3_out is None or s4_new_feat is None or s3_out.shape[0] != batch_size or s4_new_feat.shape[0] != batch_size:
+                raise ValueError("sample (Stage4 mode): Requires 'stage3_output_grid_batch_for_s4' and 'stage4_new_condition_feature_grid_batch' matching batch_size.")
+            unexpected_keys = [k for k in condition_args if k not in ["stage3_output_grid_batch_for_s4", "stage4_new_condition_feature_grid_batch"]]
+            if unexpected_keys:
+                self.logger.warning(f"sample (Stage4 mode): Unexpected keys in condition_args: {unexpected_keys}")
+            stacked_cond_grids = self._prepare_stage_condition_grids(s3_out, s4_new_feat)
         else:
-            raise ValueError("sample: Insufficient or ambiguous condition arguments provided for any mode.")
+            raise ValueError(f"sample: Unsupported condition mode: {mode}")
 
         # 驗证準備好的條件網格形狀
         if stacked_cond_grids.shape[1] != self.condition_processor[0].in_channels:
@@ -526,147 +559,109 @@ class DDPM3D(nn.Module):
                 img = model_mean + torch.sqrt(posterior_variance_t) * noise_sample
         return img
     
-def create_stage2_model_from_basemodel_checkpoint(
-                               basemodel_checkpoint_path: str,
-                               config_for_stage2_model: Dict[str, Any],
-                               device: str
-                               ) -> DDPM3D:
-    logger.info(f"從 Basemodel 檢查點 {basemodel_checkpoint_path} 創建並初始化 Stage2 模型...")
-    
-    chkpt_basemodel = torch.load(basemodel_checkpoint_path, map_location=device, weights_only = False)
-    if 'ddpm_state_dict' not in chkpt_basemodel:
-        raise KeyError(f"Basemodel 檢查點 {basemodel_checkpoint_path} 中未找到 'ddpm_state_dict'。")
-    if 'selected_sensor_info' not in chkpt_basemodel: # 確保 selected_sensor_info 存在
-        raise KeyError(f"'selected_sensor_info' 不存在於 Basemodel 檢查點 {basemodel_checkpoint_path} 中。")
-    
-    basemodel_original_config = chkpt_basemodel.get('config', config_for_stage2_model)
 
-    # Stage2 模型的 UNet 架構應與 Basemodel 一致
-    stage2_unet = UNet3D(
-        input_image_channels=basemodel_original_config.get("image_channels", config_for_stage2_model["image_channels"]),
-        base_channels=basemodel_original_config.get("base_channels_unet", config_for_stage2_model["base_channels_unet"]),
-        time_emb_dim=basemodel_original_config.get("time_emb_dim", config_for_stage2_model["time_emb_dim"]),
-        condition_encode_dim=basemodel_original_config.get("condition_encode_dim", config_for_stage2_model["condition_encode_dim"]),
-        dropout_rate=basemodel_original_config.get("unet_dropout_rate", config_for_stage2_model.get("unet_dropout_rate", 0.05))
+def create_next_stage_model_from_previous_checkpoint(
+    config_for_current_stage_and_global: Dict[str, Any], # 傳入包含所有配置的字典
+    device: str,
+    current_stage_mode: ConditionMode # 使用 Enum 作為參數
+) -> 'DDPM3D': # 假設 DDPM3D 類別已在此文件或已導入
+    
+    current_stage_name_for_log = current_stage_mode.name # 例如 "STAGE2", "STAGE3"
+    previous_stage_checkpoint_path = "" 
+    previous_stage_name_for_log = ""
+
+    # 根據 current_stage_mode 動態決定 previous_stage_checkpoint_path 和 previous_stage_name_for_log
+    if current_stage_mode == ConditionMode.STAGE2:
+        previous_stage_checkpoint_path = config_for_current_stage_and_global['basemodel_checkpoint']
+        previous_stage_name_for_log = "Basemodel"
+    elif current_stage_mode == ConditionMode.STAGE3:
+        previous_stage_checkpoint_path = config_for_current_stage_and_global['stage2_checkpoint_full_path']
+        previous_stage_name_for_log = ConditionMode.STAGE2.name # "STAGE2"
+    elif current_stage_mode == ConditionMode.STAGE4:
+        previous_stage_checkpoint_path = config_for_current_stage_and_global['stage3_checkpoint_full_path']
+        previous_stage_name_for_log = ConditionMode.STAGE3.name # "STAGE3"
+    # 根據需要為更多階段添加 elif
+    else:
+        # 通常不應該為 BASEMODEL 模式呼叫此函數，因為它沒有 "前一階段" 的檢查點來載入
+        raise ValueError(f"不支援的 current_stage_mode '{current_stage_name_for_log}' 用於從前一階段創建模型，或缺少對應的檢查點路徑配置。")
+
+    if not previous_stage_checkpoint_path or not os.path.exists(previous_stage_checkpoint_path):
+        raise FileNotFoundError(f"為 {current_stage_name_for_log} 模式確定的前一階段檢查點路徑 '{previous_stage_checkpoint_path}' 無效或檔案不存在。")
+
+    logger.info(f"從 {previous_stage_name_for_log} 檢查點 {previous_stage_checkpoint_path} 創建並初始化 {current_stage_name_for_log} 模型...")
+    
+    chkpt_previous = torch.load(previous_stage_checkpoint_path, map_location=device, weights_only=False)
+    if 'ddpm_state_dict' not in chkpt_previous:
+        raise KeyError(f"{previous_stage_name_for_log} 檢查點 {previous_stage_checkpoint_path} 中未找到 'ddpm_state_dict'。")
+    
+    previous_chkpt_config = chkpt_previous.get('config_snapshot_at_save', 
+                                             chkpt_previous.get('config', config_for_current_stage_and_global))
+
+    current_stage_unet = UNet3D(
+        input_image_channels=previous_chkpt_config.get("image_channels", config_for_current_stage_and_global["image_channels"]),
+        base_channels=previous_chkpt_config.get("base_channels_unet", config_for_current_stage_and_global["base_channels_unet"]),
+        time_emb_dim=previous_chkpt_config.get("time_emb_dim", config_for_current_stage_and_global["time_emb_dim"]),
+        condition_encode_dim=previous_chkpt_config.get("condition_encode_dim", config_for_current_stage_and_global["condition_encode_dim"]),
+        dropout_rate=previous_chkpt_config.get("unet_dropout_rate", config_for_current_stage_and_global.get("unet_dropout_rate", 0.05))
     ).to(device)
 
-    stage2_model_condition_input_channels = config_for_stage2_model.get("condition_input_channels", 2)
-    logger.info(f"Stage2 模型將使用 {stage2_model_condition_input_channels} 個條件輸入通道。")
+    current_stage_config_key_prefix = current_stage_name_for_log.lower() 
+    
+    current_model_condition_input_channels = config_for_current_stage_and_global.get(
+        f"{current_stage_config_key_prefix}_ddpm_condition_input_channels", 
+        config_for_current_stage_and_global.get("condition_input_channels", 2) 
+    )
+    logger.info(f"{current_stage_name_for_log} 模型將使用 {current_model_condition_input_channels} 個條件輸入通道。")
 
-    stage2_model_instance = DDPM3D(
-        unet_model=stage2_unet,
-        timesteps=config_for_stage2_model["timesteps"],
-        image_size=(config_for_stage2_model["D"], config_for_stage2_model["H"], config_for_stage2_model["W"]),
-        image_channels=config_for_stage2_model["image_channels"],
-        condition_input_channels=stage2_model_condition_input_channels,
-        condition_encode_dim=config_for_stage2_model["condition_encode_dim"],
-        beta_start=config_for_stage2_model["beta_start"],
-        beta_end=config_for_stage2_model["beta_end"],
+    current_stage_model_instance = DDPM3D(
+        unet_model=current_stage_unet,
+        timesteps=config_for_current_stage_and_global.get("timesteps"),
+        image_size=(config_for_current_stage_and_global.get("D"),
+                      config_for_current_stage_and_global.get("H"),
+                      config_for_current_stage_and_global.get("W")),
+        image_channels=config_for_current_stage_and_global.get("image_channels"),
+        condition_input_channels=current_model_condition_input_channels,
+        condition_encode_dim=config_for_current_stage_and_global.get("condition_encode_dim"),
+        beta_start=config_for_current_stage_and_global.get("beta_start"),
+        beta_end=config_for_current_stage_and_global.get("beta_end"),
         device=device
     )
 
-    logger.info(f"將 Basemodel 的權重載入到新的 Stage2 模型實例 (condition_input_channels={stage2_model_condition_input_channels})...")
+    logger.info(f"將 {previous_stage_name_for_log} 的權重載入到新的 {current_stage_name_for_log} 模型實例 (condition_input_channels={current_model_condition_input_channels})...")
     try:
-        # 嘗試載入完整的 state_dict
-        stage2_model_instance.load_state_dict(chkpt_basemodel['ddpm_state_dict'])
-        logger.info("Stage2 模型權重從 Basemodel 完整遷移完成。")
+        current_stage_model_instance.load_state_dict(chkpt_previous['ddpm_state_dict'])
+        logger.info(f"{current_stage_name_for_log} 模型權重從 {previous_stage_name_for_log} 完整遷移完成。")
     except RuntimeError as e:
-        logger.warning(f"直接載入 Basemodel state_dict 到 Stage2 模型失敗: {e}")
-        logger.warning("這可能是因為 Stage2 模型的 condition_processor 與 Basemodel 的不同 (例如不同的輸入通道數)。")
+        logger.warning(f"直接載入 {previous_stage_name_for_log} state_dict 到 {current_stage_name_for_log} 模型失敗: {e}")
+        logger.warning(f"這可能是因為 {current_stage_name_for_log} 模型的 condition_processor 與 {previous_stage_name_for_log} 的不同。")
         logger.warning("嘗試僅載入 UNet (model) 部分的權重，並重新初始化 condition_processor...")
         
-        # 載入 UNet 權重
-        unet_state_dict = {k.replace('model.', ''): v for k, v in chkpt_basemodel['ddpm_state_dict'].items() if k.startswith('model.')}
-        stage2_model_instance.model.load_state_dict(unet_state_dict)
-        logger.info("僅 UNet 權重從 Basemodel 遷移完成。")
+        unet_state_dict_to_load = {k.replace('model.', ''): v 
+                                   for k, v in chkpt_previous['ddpm_state_dict'].items() 
+                                   if k.startswith('model.')}
+        if not unet_state_dict_to_load:
+            logger.error(f"無法從 {previous_stage_name_for_log} 的 state_dict 中提取 UNet (model.) 權重。遷移失敗。")
+            # 這裡可以選擇拋出錯誤或返回未初始化權重的模型，取決於您的錯誤處理策略
+            raise ValueError(f"無法從 {previous_stage_name_for_log} 的 state_dict 中提取 UNet 權重。")
+            
+        current_stage_model_instance.model.load_state_dict(unet_state_dict_to_load)
+        logger.info(f"僅 UNet 權重從 {previous_stage_name_for_log} 遷移完成。")
 
-        # 重新初始化 Stage2 模型的 condition_processor
-        # 確保 condition_processor 使用 Stage2 配置的輸入通道數
-        stage2_cond_input_ch = config_for_stage2_model.get("condition_input_channels", 2)
-        stage2_cond_encode_dim = config_for_stage2_model.get("condition_encode_dim", CONFIG.get("condition_encode_dim"))
+        cs_cond_input_ch = current_model_condition_input_channels
+        cs_cond_encode_dim = config_for_current_stage_and_global.get("condition_encode_dim")
         
-        stage2_model_instance.condition_processor = nn.Sequential(
-            nn.Conv3d(stage2_cond_input_ch, stage2_cond_encode_dim // 2,
+        # 重新初始化 condition_processor
+        current_stage_model_instance.condition_processor = nn.Sequential(
+            nn.Conv3d(cs_cond_input_ch, cs_cond_encode_dim // 2,
                       kernel_size=(1, 3, 3), padding=(0, 1, 1), bias=False),
-            nn.BatchNorm3d(stage2_cond_encode_dim // 2), nn.SiLU(),
-            nn.Conv3d(stage2_cond_encode_dim // 2, stage2_cond_encode_dim,
+            nn.BatchNorm3d(cs_cond_encode_dim // 2), nn.SiLU(),
+            nn.Conv3d(cs_cond_encode_dim // 2, cs_cond_encode_dim,
                       kernel_size=(1, 3, 3), padding=(0, 1, 1), bias=False),
-            nn.BatchNorm3d(stage2_cond_encode_dim), nn.SiLU()
+            nn.BatchNorm3d(cs_cond_encode_dim), nn.SiLU()
         ).to(device)
-        logger.info(f"Stage2 模型的 condition_processor 已使用 {stage2_cond_input_ch} 輸入通道重新初始化。")
+        logger.info(f"{current_stage_name_for_log} 模型的 condition_processor 已使用 {cs_cond_input_ch} 輸入通道重新初始化。")
 
-    return stage2_model_instance
-
-# --------------------------------------
-# Stage3 模型創建函數
-# --------------------------------------
-def create_stage3_model_from_stage2_checkpoint(
-                               stage2_checkpoint_path: str,
-                               config_for_stage3_model: Dict[str, Any],
-                               device: str
-                               ) -> DDPM3D:
-    logger.info(f"從 Stage2 檢查點 {stage2_checkpoint_path} 創建並初始化 Stage3 模型...")
-    
-    chkpt_stage2 = torch.load(stage2_checkpoint_path, map_location=device, weights_only=False)
-    if 'ddpm_state_dict' not in chkpt_stage2:
-        raise KeyError(f"Stage2 檢查點 {stage2_checkpoint_path} 中未找到 'ddpm_state_dict'。")
-    
-    # Stage3 模型的 UNet 架構應與 Stage2 (以及 Basemodel) 一致
-    # 從 Stage2 檢查點的 config 或傳入的 config_for_stage3_model 獲取 UNet 參數
-    s2_chkpt_config = chkpt_stage2.get('config_snapshot_at_save', config_for_stage3_model)
-
-    stage3_unet = UNet3D(
-        input_image_channels=s2_chkpt_config.get("image_channels", config_for_stage3_model["image_channels"]),
-        base_channels=s2_chkpt_config.get("base_channels_unet", config_for_stage3_model["base_channels_unet"]),
-        time_emb_dim=s2_chkpt_config.get("time_emb_dim", config_for_stage3_model["time_emb_dim"]),
-        condition_encode_dim=s2_chkpt_config.get("condition_encode_dim", config_for_stage3_model["condition_encode_dim"]),
-        dropout_rate=s2_chkpt_config.get("unet_dropout_rate", config_for_stage3_model.get("unet_dropout_rate", 0.05))
-    ).to(device)
-
-    # Stage3 模型的 condition_processor 輸入通道數
-    stage3_model_condition_input_channels = config_for_stage3_model.get("condition_input_channels",2)
-    logger.info(f"Stage3 模型將使用 {stage3_model_condition_input_channels} 個條件輸入通道。")
-
-    stage3_model_instance = DDPM3D(
-        unet_model=stage3_unet,
-        timesteps=config_for_stage3_model["timesteps"],
-        image_size=(config_for_stage3_model["D"], config_for_stage3_model["H"], config_for_stage3_model["W"]),
-        image_channels=config_for_stage3_model["image_channels"],
-        condition_input_channels=stage3_model_condition_input_channels, # 使用 Stage3 的配置
-        condition_encode_dim=config_for_stage3_model["condition_encode_dim"],
-        beta_start=config_for_stage3_model["beta_start"],
-        beta_end=config_for_stage3_model["beta_end"],
-        device=device
-    )
-
-    logger.info(f"將 Stage2 模型的權重載入到新的 Stage3 模型實例 (condition_input_channels={stage3_model_condition_input_channels})...")
-    try:
-        stage3_model_instance.load_state_dict(chkpt_stage2['ddpm_state_dict'])
-        logger.info("Stage3 模型權重從 Stage2 完整遷移完成。")
-    except RuntimeError as e:
-        logger.warning(f"直接載入 Stage2 state_dict 到 Stage3 模型失敗: {e}")
-        logger.warning("這可能是因為 Stage3 模型的 condition_processor 與 Stage2 的不同 (例如不同的輸入通道數)。")
-        logger.warning("嘗試僅載入 UNet (model) 部分的權重，並重新初始化 condition_processor...")
-        
-        unet_state_dict_s3 = {k.replace('model.', ''): v for k, v in chkpt_stage2['ddpm_state_dict'].items() if k.startswith('model.')}
-        stage3_model_instance.model.load_state_dict(unet_state_dict_s3)
-        logger.info("僅 UNet 權重從 Stage2 遷移完成。")
-
-        s3_cond_input_ch = config_for_stage3_model.get("condition_input_channels", 2)
-        s3_cond_encode_dim = config_for_stage3_model.get("condition_encode_dim", CONFIG.get("condition_encode_dim"))
-        
-        stage3_model_instance.condition_processor = nn.Sequential(
-            nn.Conv3d(s3_cond_input_ch, s3_cond_encode_dim // 2,
-                      kernel_size=(1, 3, 3), padding=(0, 1, 1), bias=False),
-            nn.BatchNorm3d(s3_cond_encode_dim // 2), nn.SiLU(),
-            nn.Conv3d(s3_cond_encode_dim // 2, s3_cond_encode_dim,
-                      kernel_size=(1, 3, 3), padding=(0, 1, 1), bias=False),
-            nn.BatchNorm3d(s3_cond_encode_dim), nn.SiLU()
-        ).to(device)
-        logger.info(f"Stage3 模型的 condition_processor 已使用 {s3_cond_input_ch} 輸入通道重新初始化。")
-
-    return stage3_model_instance
-
+    return current_stage_model_instance
 # --------------------------------------
 # 數據處理相關
 # --------------------------------------
@@ -1366,18 +1361,26 @@ def evaluate_stage3_models(
                     f"Mean: {torch.mean(s2_new_feat_grid_for_s2_eval_cond).item():.4f}, Std: {torch.std(s2_new_feat_grid_for_s2_eval_cond).item():.4f}")
 
         # 1. Stage3 模型生成
+        condition_arguments_for_s3_sample = {
+            "stage2_output_grid_batch_for_s3": s2_out_grid_for_s3_cond,
+            "stage3_new_condition_feature_grid_batch": s3_new_feat_grid_for_s3_cond
+        }
         s3_generated_eval_norm = stage3_model_trained.sample(
             batch_size=current_batch_size,
-            stage2_output_grid_batch_for_s3=s2_out_grid_for_s3_cond,
-            stage3_new_condition_feature_grid_batch=s3_new_feat_grid_for_s3_cond
+            mode=ConditionMode.STAGE3,  # 明確指定這是 Stage3 模式
+            condition_args=condition_arguments_for_s3_sample
         )
         s3_generated_eval_denorm = s3_generated_eval_norm * target_std_for_denorm + target_mean_for_denorm
         
         # 2. Stage2 模型在 S3 數據上的生成
+        condition_arguments_for_s2_sample_in_eval = {
+            "basemodel_output_grid_batch": bm_out_grid_for_s2_eval_cond,
+            "stage2_new_condition_feature_grid_batch": s2_new_feat_grid_for_s2_eval_cond
+        }
         s2_generated_eval_norm_on_s3_data = stage2_model_eval_instance.sample(
             batch_size=current_batch_size,
-            basemodel_output_grid_batch=bm_out_grid_for_s2_eval_cond,
-            stage2_new_condition_feature_grid_batch=s2_new_feat_grid_for_s2_eval_cond
+            mode=ConditionMode.STAGE2,
+            condition_args=condition_arguments_for_s2_sample_in_eval
         )
         logger.info(f"RAW S2 NORM Output - Min: {torch.min(s2_generated_eval_norm_on_s3_data).item():.4f}, "
             f"Max: {torch.max(s2_generated_eval_norm_on_s3_data).item():.4f}, "
@@ -1809,7 +1812,7 @@ if __name__ == '__main__':
     basemodel_sorted_flow_cols_source = chkpt_basemodel['sorted_flow_columns'] 
     CONFIG["cached_basemodel_mean"] = float(basemodel_norm_stats_source['mean'])
     CONFIG["cached_basemodel_std"] = float(basemodel_norm_stats_source['std'])
-    if CONFIG["cached_basemodel_std"] < 1e-6: CONFIG["cached_basemodel_std"] = 1.0
+    if CONFIG["cached_basemodel_std"] < 0.1: CONFIG["cached_basemodel_std"] = 1.0
     CONFIG["cached_basemodel_sorted_flow_columns"] = basemodel_sorted_flow_cols_source
     CONFIG["cached_basemodel_selected_sensor_info"] = chkpt_basemodel.get('selected_sensor_info')
     CONFIG["cached_basemodel_grid_idx_to_rc_map"] = chkpt_basemodel.get('grid_idx_to_rc_map')
@@ -1878,14 +1881,14 @@ if __name__ == '__main__':
             for i in tqdm(range(0, num_s2_samples_for_bm_pred, pred_bs_s2), desc="Basemodel Outputs for S2 Cond"):
                 b_hrs_s = hours_for_bm_in_s2_scalar[i:i+pred_bs_s2].to(CONFIG["device"])
                 b_hols_s = is_holiday_for_bm_in_s2_scalar[i:i+pred_bs_s2].to(CONFIG["device"])
-            
-                # 調用 basemodel_for_output_generation.sample
-                # basemodel_for_output_generation 的 DDPM3D 實例需要能處理小時/假日純量
-                # 假設它的 _prepare_conditional_input_grids (或類似方法) 會將純量轉網格
+                condition_args_for_basemodel_sample = {
+                    "hour_scalars_batch": b_hrs_s,
+                    "is_holiday_scalars_batch": b_hols_s
+                }
                 bm_pred_norm_b = basemodel_for_output_generation.sample(
                     batch_size=len(b_hrs_s),
-                    hour_scalars_batch=b_hrs_s, 
-                    is_holiday_scalars_batch=b_hols_s
+                    mode=ConditionMode.BASEMODEL, 
+                    condition_args=condition_args_for_basemodel_sample
                 )
                 bm_pred_denorm_b = bm_pred_norm_b * CONFIG["cached_basemodel_std"] + CONFIG["cached_basemodel_mean"]
                 bm_outputs_s2_list_cond.append(bm_pred_denorm_b.cpu().numpy()) # (N, C, D, H, W)
@@ -1902,7 +1905,7 @@ if __name__ == '__main__':
 
         if bm_mean_for_norm is None or bm_std_for_norm is None:
             raise ValueError("CONFIG 中缺少 cached_basemodel_mean 或 cached_basemodel_std，無法正規化 basemodel 的輸出。")
-        if bm_std_for_norm < 1e-6: # 避免除以過小的數，與之前邏輯保持一致
+        if bm_std_for_norm < 1e-3: # 避免除以過小的數，與之前邏輯保持一致
             logger.warning(f"Cached basemodel_std ({bm_std_for_norm}) 過小，將其視為 1.0 進行正規化。")
             bm_std_for_norm = 1.0
 
@@ -1929,7 +1932,7 @@ if __name__ == '__main__':
 
     logger.info(f"Stage2 資料分割: 訓練集={len(s2_train_indices_final)}, 驗證集={len(s2_val_indices_final)}, 測試集={len(s2_test_indices_final)}")
 
-    config_for_s2_dataset_use = CONFIG.copy() # 可能仍被 test_dataset_s3_final 使用
+    config_for_s2_dataset_use = CONFIG.copy() 
 
 
 #%%
@@ -2034,16 +2037,15 @@ if __name__ == '__main__':
                 bm_out_batch = torch.from_numpy(all_bm_outputs_s2_np_cond_normalized[i:i+pred_bs_s3_from_s2]).to(CONFIG["device"])
                 s2_new_feat_grid_batch = torch.from_numpy(all_s2_new_feat_grids_for_s3_input_np[i:i+pred_bs_s3_from_s2]).to(CONFIG["device"])
                 
+                condition_args_for_s2_output_gen = {
+                    "basemodel_output_grid_batch": bm_out_batch,
+                    "stage2_new_condition_feature_grid_batch": s2_new_feat_grid_batch
+                }
                 s2_pred_norm_b = final_s2_model_to_eval.sample(
                     batch_size=len(bm_out_batch),
-                    basemodel_output_grid_batch=bm_out_batch,
-                    stage2_new_condition_feature_grid_batch=s2_new_feat_grid_batch
+                    mode=ConditionMode.STAGE2, 
+                    condition_args=condition_args_for_s2_output_gen
                 )
-                # Stage2 模型的輸出已經是正規化的 (相對於 Stage2 的目標)
-                # 這裡假設 Stage2 的目標與 Stage3 的目標使用相同的正規化尺度 (或 Stage2 輸出直接作為正規化條件)
-                # 如果 Stage2 的目標正規化與 Basemodel 的原始流量正規化不同，這裡需要注意
-                # 目前假設 final_s2_model_to_eval.sample() 返回的是相對於其自身訓練目標的正規化值
-                # 而這個值將直接作為 Stage3 的正規化條件輸入
                 s2_outputs_s3_list_cond.append(s2_pred_norm_b.cpu().numpy())
         
         all_s2_outputs_s3_np_cond_normalized = np.concatenate(s2_outputs_s3_list_cond, axis=0)
@@ -2172,10 +2174,11 @@ if __name__ == '__main__':
         else:
             logger.info(f"未找到 Stage3 檢查點或未設定恢復。將從 Stage2 模型 ({CONFIG['stage2_checkpoint_full_path']}) 初始化 Stage3 模型。")
             # CONFIG["stage2_checkpoint_full_path"] 實際上是 Stage2 的檢查點路徑
-            stage3_model = create_stage3_model_from_stage2_checkpoint(
-                stage2_checkpoint_path=CONFIG["stage2_checkpoint_full_path"],
-                config_for_stage3_model=CONFIG, # 傳遞全局 CONFIG，其中包含 Stage3 特定參數
-                device=CONFIG["device"]
+            stage3_model = create_next_stage_model_from_previous_checkpoint(
+                config_for_current_stage=CONFIG, 
+                global_config=CONFIG,
+                device=CONFIG["device"],
+                current_stage_mode=ConditionMode.STAGE3
             )
             logger.info(f"Stage3 模型已從 Stage2 檢查點初始化。")
 
@@ -2253,11 +2256,15 @@ if __name__ == '__main__':
                 s3_new_feat_grid_b = s3_new_feat_grid_b.to(CONFIG["device"]) # Cond2 for S3
 
                 t_s3_b = torch.randint(0, stage3_model.timesteps, (target_s3_b.shape[0],), device=CONFIG["device"]).long()
+                condition_arguments_for_s3_loss = {
+                    "stage2_output_grid_batch_for_s3": s2_out_grid_b,
+                    "stage3_new_condition_feature_grid_batch": s3_new_feat_grid_b
+                }
                 loss_s3_batch = stage3_model.p_losses(
                     x_start_target_flow=target_s3_b,
                     t=t_s3_b,
-                    stage2_output_grid_batch_for_s3=s2_out_grid_b,
-                    stage3_new_condition_feature_grid_batch=s3_new_feat_grid_b
+                    mode=ConditionMode.STAGE3,
+                    condition_args=condition_arguments_for_s3_loss
                 )
                 loss_s3_batch.backward()
                 optimizer_s3.step()
@@ -2300,10 +2307,14 @@ if __name__ == '__main__':
                         s2_out_val_cond = s2_out_val_cond.to(CONFIG["device"])
                         s3_new_feat_val_cond = s3_new_feat_val_cond.to(CONFIG["device"])
 
+                        condition_args_for_s3_validation = {
+                            "stage2_output_grid_batch_for_s3": s2_out_val_cond,
+                            "stage3_new_condition_feature_grid_batch": s3_new_feat_val_cond
+                        }
                         s3_generated_val_norm = stage3_model.sample(
                             batch_size=target_s3_val_norm.shape[0],
-                            stage2_output_grid_batch_for_s3=s2_out_val_cond,
-                            stage3_new_condition_feature_grid_batch=s3_new_feat_val_cond
+                            mode=ConditionMode.STAGE3, 
+                            condition_args=condition_args_for_s3_validation
                         )
                         
                         # 使用 train_dataset_s3 的 norm_stats_stage3_target 進行反正規化

@@ -1,4 +1,3 @@
-#%%
 import os
 import pandas as pd
 import numpy as np
@@ -21,7 +20,7 @@ df = pd.read_csv(data_path)
 result_dir = r"C:\thesis\code\result_lgb"
 os.makedirs(result_dir, exist_ok=True)
 # 建立子目錄
-sub_dirs = ["learning_curve", "tree", "shap_summary", "shap_bar", "model", "group_tree"]
+sub_dirs = ["learning_curve", "tree", "shap_summary", "shap_bar", "model", "group_tree", "individual_target_models"]
 for sub in sub_dirs:
     os.makedirs(os.path.join(result_dir, sub), exist_ok=True)
 
@@ -65,12 +64,75 @@ target_columns = [col for col in df.columns if '(' in col and ')' in col]
 target_columns = sorted(list(set(target_columns)))
 print("所有座標點：", target_columns)
 
+# 解析座標字串函式 (如果尚未在全域定義，則移至此處或確保可訪問)
+def parse_coord_string(coord_str):
+    coord_str = coord_str.strip("() ")
+    lon_str, lat_str = coord_str.split(",")
+    return float(lon_str), float(lat_str)
+
+# --- 新增：篩選最中心的400個座標點 ---
+if target_columns:
+    parsed_coords = []
+    for tc_str in target_columns:
+        try:
+            lon, lat = parse_coord_string(tc_str)
+            parsed_coords.append({'name': tc_str, 'lon': lon, 'lat': lat})
+        except ValueError:
+            print(f"警告：無法解析座標字串 '{tc_str}'，將跳過此座標。")
+            continue
+    
+    if parsed_coords:
+        coords_df = pd.DataFrame(parsed_coords)
+        
+        # 計算中心點
+        center_lon = coords_df['lon'].mean()
+        center_lat = coords_df['lat'].mean()
+        print(f"計算出的地理中心點: (經度: {center_lon:.4f}, 緯度: {center_lat:.4f})")
+
+        # 計算每個點到中心點的距離 (歐幾里得距離的平方，避免開根號，排序結果一致)
+        coords_df['distance_sq'] = (coords_df['lon'] - center_lon)**2 + (coords_df['lat'] - center_lat)**2
+        
+        # 排序並選取最近的N個點
+        num_points_to_select = 400
+        if len(coords_df) > num_points_to_select:
+            selected_coords_df = coords_df.nsmallest(num_points_to_select, 'distance_sq')
+            print(f"已篩選出最靠近中心的 {num_points_to_select} 個座標點。")
+        else:
+            selected_coords_df = coords_df.copy()
+            print(f"座標點總數 ({len(coords_df)}) 少於或等於 {num_points_to_select}，已選取所有座標點。")
+
+        # 更新 target_columns
+        original_target_count = len(target_columns)
+        target_columns = sorted(list(selected_coords_df['name']))
+        print(f"座標點數量從 {original_target_count} 更新為 {len(target_columns)}。")
+
+        # 繪製篩選後的400個點
+        plt.figure(figsize=(10, 8))
+        plt.scatter(selected_coords_df['lon'], selected_coords_df['lat'], s=10, alpha=0.7, label=f"篩選出的 {len(target_columns)} 個中心點")
+        plt.scatter(center_lon, center_lat, color='red', marker='x', s=100, label="地理中心")
+        plt.xlabel("經度 (Longitude)")
+        plt.ylabel("緯度 (Latitude)")
+        plt.title(f"篩選出的 {len(target_columns)} 個中心座標點地理分佈")
+        plt.legend()
+        plt.grid(True)
+        plt.ticklabel_format(useOffset=False, style='plain', axis='both')
+        selected_points_map_path = os.path.join(result_dir, "selected_central_400_points_map.png")
+        plt.savefig(selected_points_map_path, dpi=300, bbox_inches="tight")
+        plt.close()
+        print(f"篩選後的中心座標點地圖已儲存至: {selected_points_map_path}")
+    else:
+        print("警告：沒有可用的有效座標點進行篩選。")
+else:
+    print("警告：target_columns 為空，無法進行座標篩選。")
+# --- 篩選結束 ---
+
+
 # 替換 DataFrame 欄位名稱為英文供 LightGBM 使用
 df_tree = df.rename(columns=feature_mapping)
 
-# 定義 X 與 y
+# 定義 X 與 y (y 現在會使用篩選後的 target_columns)
 X = df_original[list(feature_mapping.keys())]
-y = df_original[target_columns]
+y = df_original[target_columns] # 確保 y 只包含篩選後的目標
 
 # 切分訓練集與測試集
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
@@ -153,9 +215,7 @@ def get_decision_path(tree_structure, max_depth=3):
 # 主循環：對每個 target 訓練模型、提取規則
 predictions = {}
 grid_ids = []
-# tree_vectors = [] # 似乎未使用，可以考慮移除
 geo_coords = []
-#root_rules = {}    # 舊的根規則儲存，不再直接使用於分群
 rule_paths = {}    # 舊的規則路徑儲存，新方法直接從樹結構提取特定規則
 
 # 新增：記錄每個 target 的最佳 MAE、模型物件及最佳樹索引
@@ -163,123 +223,150 @@ target_mae = {}
 target_mse = {}
 target_models = {}
 target_best_tree_index = {}
-#%%
 print(f"訓練單獨模型...")
-for target in target_columns:
-    train_data = lgb.Dataset(X_train_tree, label=y_train[target], categorical_feature=cat_features)
-    test_data = lgb.Dataset(X_test_tree, label=y_test[target], reference=train_data, categorical_feature=cat_features)
-    # metric同時計算 "l2" (MSE) 與 "l1" (MAE)
-    params = {
-        'objective': 'regression',
-        'metric': ['l2', 'l1'],
-        'boosting_type': 'gbdt',
-        'num_leaves': 63,
-        'learning_rate': 0.005,
-        'feature_fraction': 0.9,
-        'seed': 42
-    }
-    evals_result = {}
-    lgb_model = lgb.train(
-        params,
-        train_data,
-        num_boost_round=10000,
-        valid_sets=[test_data],
-        valid_names=["valid_0"],
-        callbacks=[lgb.early_stopping(stopping_rounds=10, verbose=True),
-                   lgb.record_evaluation(evals_result),
-                   lgb.log_evaluation(100)]
-    )
-    y_pred = lgb_model.predict(X_test_tree, num_iteration=lgb_model.best_iteration)
-    predictions[target] = y_pred
-    if "valid_0" in evals_result and "l2" in evals_result["valid_0"]:
-        plt.figure(figsize=(8, 5))
-        # 繪製 MSE 學習曲線
-        plt.plot(evals_result['valid_0']['l2'], label="Validation MSE", color="blue")
-        plt.xlabel("Iterations")
-        plt.ylabel("Error")
-        plt.title(f"Learning Curve ({target})")
-        plt.legend()
-        learning_curve_path = os.path.join(result_dir, "learning_curve", f"{target.replace(',', '_').replace(' ', '')}.png")
-        plt.savefig(learning_curve_path, dpi=300, bbox_inches="tight")
-        plt.close()
-    else:
-        print(f"無法繪製 {target} 的學習曲線。")
+individual_models_dir = os.path.join(result_dir, "individual_target_models") 
 
-    model_dict = lgb_model.dump_model()
-    tree_info = model_dict["tree_info"]
-    # 取每棵樹根節點的 split_gain，若不存在則設為 0
-    split_gains = [tree_info[i]["tree_structure"].get("split_gain", 0) for i in range(len(tree_info))]
-    best_tree_index = np.argmax(split_gains)
-    # 使用 MAE 計算模型表現
-    target_mae[target] = mean_absolute_error(y_test[target], y_pred)
-    target_mse[target] = mean_squared_error(y_test[target], y_pred)
-    target_models[target] = lgb_model
-    target_best_tree_index[target] = best_tree_index
+for target in target_columns: # 此迴圈現在只會遍歷篩選後的 target_columns
+    print(f"\n處理目標網格: {target}")
+    # 產生模型檔案路徑 (確保檔案名稱合法)
+    safe_target_filename = "".join(c if c.isalnum() else "_" for c in target)
+    model_path = os.path.join(individual_models_dir, f"model_{safe_target_filename}.txt")
+
+    if os.path.exists(model_path):
+        print(f"  載入已存在的模型: {model_path}")
+        lgb_model = lgb.Booster(model_file=model_path)
+        # 載入模型後，重新預測以計算評估指標
+        y_pred = lgb_model.predict(X_test_tree, num_iteration=lgb_model.current_iteration()) # 使用 current_iteration() 或 best_iteration (如果可用)
+        
+        # 更新相關字典
+        target_models[target] = lgb_model
+        target_mae[target] = mean_absolute_error(y_test[target], y_pred)
+        target_mse[target] = mean_squared_error(y_test[target], y_pred)
+        
+        model_dict_loaded = lgb_model.dump_model()
+        tree_info_loaded = model_dict_loaded["tree_info"]
+        # 假設最佳樹是基於 split_gain 最高的 (通常 LightGBM 會儲存所有樹)
+        # 如果只存了 best_iteration 對應的樹，則 tree_info 可能只有一個元素
+        # 這裡我們假設需要從多棵樹中選 split_gain 最高的
+        split_gains_loaded = [tree_info_loaded[i]["tree_structure"].get("split_gain", 0) for i in range(len(tree_info_loaded))]
+        if not split_gains_loaded: # 以防萬一 tree_info 為空或沒有 split_gain
+            print(f"警告: 載入的模型 {target} 沒有有效的 split_gain。將使用索引 0。")
+            target_best_tree_index[target] = 0
+        else:
+            target_best_tree_index[target] = np.argmax(split_gains_loaded)
+        
+        print(f"  模型 {target} MAE: {target_mae[target]:.4f}, MSE: {target_mse[target]:.4f}")
+        # 不需要繪製學習曲線，因為模型已訓練
+        # SHAP 和 tree plot 仍可基於載入模型生成
+
+    else:
+        print(f"  為 {target} 訓練新模型...")
+        train_data = lgb.Dataset(X_train_tree, label=y_train[target], categorical_feature=cat_features)
+        test_data = lgb.Dataset(X_test_tree, label=y_test[target], reference=train_data, categorical_feature=cat_features)
+        params = {
+            'objective': 'regression',
+            'metric': ['l2', 'l1'],
+            'boosting_type': 'gbdt',
+            'num_leaves': 63,
+            'learning_rate': 0.005,
+            'feature_fraction': 0.9,
+            'seed': 42
+        }
+        evals_result = {}
+        lgb_model = lgb.train(
+            params,
+            train_data,
+            num_boost_round=10000,
+            valid_sets=[test_data],
+            valid_names=["valid_0"],
+            callbacks=[lgb.early_stopping(stopping_rounds=10, verbose=100), # 調整 verbose
+                       lgb.record_evaluation(evals_result),
+                       lgb.log_evaluation(100)]
+        )
+        y_pred = lgb_model.predict(X_test_tree, num_iteration=lgb_model.best_iteration)
+        
+        # 儲存模型
+        lgb_model.save_model(model_path)
+        print(f"  模型已儲存至: {model_path}")
+
+        predictions[target] = y_pred # predictions 字典似乎沒有在後續使用，但保留以防萬一
+        target_models[target] = lgb_model
+        target_mae[target] = mean_absolute_error(y_test[target], y_pred)
+        target_mse[target] = mean_squared_error(y_test[target], y_pred)
+
+        model_dict_trained = lgb_model.dump_model()
+        tree_info_trained = model_dict_trained["tree_info"]
+        split_gains_trained = [tree_info_trained[i]["tree_structure"].get("split_gain", 0) for i in range(len(tree_info_trained))]
+        if not split_gains_trained:
+             print(f"警告: 新訓練的模型 {target} 沒有有效的 split_gain。將使用索引 0。")
+             target_best_tree_index[target] = 0
+        else:
+            target_best_tree_index[target] = np.argmax(split_gains_trained)
+
+        if "valid_0" in evals_result and "l2" in evals_result["valid_0"]:
+            plt.figure(figsize=(8, 5))
+            plt.plot(evals_result['valid_0']['l2'], label="Validation MSE", color="blue")
+            plt.xlabel("Iterations")
+            plt.ylabel("Error")
+            plt.title(f"Learning Curve ({target})")
+            plt.legend()
+            learning_curve_path = os.path.join(result_dir, "learning_curve", f"{safe_target_filename}.png")
+            plt.savefig(learning_curve_path, dpi=300, bbox_inches="tight")
+            plt.close()
+        else:
+            print(f"無法繪製 {target} 的學習曲線。")
+
+    # 以下部分對載入或新訓練的模型都執行
+    # 檢查 target_models 是否包含當前 target，以防在篩選後某些 target 沒有模型被載入或訓練
+    if target not in target_models:
+        print(f"警告: 目標 {target} 未在 target_models 中找到，可能在之前的步驟中被跳過。跳過此目標的後續處理。")
+        # 確保 geo_coords 和 grid_ids 即使在跳過時也可能需要更新，取決於它們的用途
+        # 如果它們嚴格對應已處理的模型，則此處不應添加
+        # all_target_rules_info 的填充邏輯在後續會處理這種情況
+        continue # 跳到下一個 target
+
+    current_model_dict = target_models[target].dump_model()
+    current_tree_info = current_model_dict["tree_info"]
+    current_best_tree_idx = target_best_tree_index[target]
+
+    # 確保 current_best_tree_idx 在 current_tree_info 的有效範圍內
+    if current_best_tree_idx >= len(current_tree_info):
+        print(f"警告: 目標 {target} 的 best_tree_index ({current_best_tree_idx}) 超出 tree_info 範圍 ({len(current_tree_info)})。將使用索引 0。")
+        current_best_tree_idx = 0
+        target_best_tree_index[target] = 0 # 更新儲存的索引
+        if not current_tree_info: # 如果 tree_info 為空，則無法繼續繪圖或分析
+            print(f"錯誤: 目標 {target} 的 tree_info 為空，跳過此目標的後續處理。")
+            geo_coords.append(target) 
+            grid_ids.append(target)
+            # 為 all_target_rules_info 設置預設值 -> 這部分由後續的 all_target_rules_info 填充邏輯處理
+            continue
+
 
     plt.figure(figsize=(30, 18))
-    lgb.plot_tree(lgb_model, tree_index=best_tree_index, show_info=['split_gain', 'data_count'])
+    lgb.plot_tree(target_models[target], tree_index=current_best_tree_idx, show_info=['split_gain', 'data_count'])
     plt.title(f"Best Decision Tree for {target} (Highest split_gain)")
-    tree_plot_path = os.path.join(result_dir, "tree", f"{target.replace(',', '_').replace(' ', '')}.png")
+    tree_plot_path = os.path.join(result_dir, "tree", f"{safe_target_filename}.png")
     plt.savefig(tree_plot_path, dpi=900, bbox_inches="tight")
     plt.close()
 
-    explainer = shap.TreeExplainer(lgb_model)
-    shap_values = explainer.shap_values(X_test)
-    shap_summary_path = os.path.join(result_dir, "shap_summary", f"{target.replace(',', '_').replace(' ', '')}.png")
+    explainer = shap.TreeExplainer(target_models[target])
+    shap_values = explainer.shap_values(X_test_tree) # 注意：SHAP 值應基於 X_test_tree (英文特徵名)
+    shap_summary_path = os.path.join(result_dir, "shap_summary", f"{safe_target_filename}.png")
     plt.figure(figsize=(10, 6))
-    shap.summary_plot(shap_values, X_test, show=False)
+    shap.summary_plot(shap_values, X_test_tree, show=False) # X_test_tree
     plt.savefig(shap_summary_path, dpi=300, bbox_inches="tight")
     plt.close()
 
-    shap_bar_path = os.path.join(result_dir, "shap_bar", f"{target.replace(',', '_').replace(' ', '')}.png")
+    shap_bar_path = os.path.join(result_dir, "shap_bar", f"{safe_target_filename}.png")
     plt.figure(figsize=(10, 6))
-    shap.summary_plot(shap_values, X_test, plot_type="bar", show=False)
+    shap.summary_plot(shap_values, X_test_tree, plot_type="bar", show=False) # X_test_tree
     plt.savefig(shap_bar_path, dpi=300, bbox_inches="tight")
     plt.close()
 
-    # 提取最佳決策樹的根部規則（僅取根節點）
-    best_tree = tree_info[best_tree_index]["tree_structure"]
-    root_rule = (best_tree.get("split_feature"), best_tree.get("threshold"))
-    #root_rules[target] = root_rule
-    # 提取廣度優先規則路徑（整棵樹，廣度順序）
-    # path = get_breadth_first_path(best_tree) # 舊的 get_breadth_first_path 不再直接用於分群
-    # rule_paths[target] = path # 不再使用 rule_paths
-    geo_coords.append(target) # geo_coords 應與 target_columns 一致
-    grid_ids.append(target) # grid_ids 應與 target_columns 一致
+    # 提取規則的部分依賴於 target_models 和 target_best_tree_index，這些已經被正確設定
+    geo_coords.append(target) 
+    grid_ids.append(target)
     
-    # TODO:
-    # 統計每個決策規則:
-    # 出現在根結點的規則，每出現一次+3分
-    # 出現在第二層的規則，每出現一次+2分
-    # 出現在第三層的規則，每出現一次+1分
-    feature_names_from_model = list(X_train_tree.columns) # 這些是英文特徵名稱
-    # cat_features 已經定義為英文名稱，例如 ['Holiday']
-    #collect_rules_with_scores(best_tree, 1, 3, feature_names_from_model, cat_features, rule_statistics, reverse_mapping)
-    #time.sleep(1)
-
-# print("\n開始匯出決策規則統計...")
-# excel_data_for_rules = []
-# for rule_desc, score in rule_statistics.items():
-#     excel_data_for_rules.append({
-#         "決策規則 (中文)": rule_desc,
-#         "總分數": score
-#     })
-
-# df_rule_stats = pd.DataFrame(excel_data_for_rules)
-# # 按分數降序排序
-# df_rule_stats = df_rule_stats.sort_values(by="總分數", ascending=False)
-
-# rule_stats_excel_path = os.path.join(result_dir, "decision_rule_statistics.xlsx")
-# try:
-#     df_rule_stats.to_excel(rule_stats_excel_path, index=False, engine='openpyxl')
-#     print(f"決策規則統計已儲存至: {rule_stats_excel_path}")
-# except ImportError:
-#     print("請安裝 'openpyxl' 套件以支援 Excel (.xlsx) 檔案匯出：pip install openpyxl")
-    
-#     rule_stats_csv_path = os.path.join(result_dir, "decision_rule_statistics.csv")
-#     df_rule_stats.to_csv(rule_stats_csv_path, index=False, encoding='utf-8-sig')
-#     print(f"決策規則統計已儲存為 CSV 格式至: {rule_stats_csv_path}")
-#%%
 # 定義結果儲存目錄
 result_dir = r"C:\\thesis\\code\\result_lgb"  # 請根據實際路徑調整
 shared_result_dir = os.path.join(result_dir, "shared_model")
@@ -302,13 +389,14 @@ def parse_coord_string(coord_str):
     return float(lon_str), float(lat_str)
 
 # 提取所有網格的經度和緯度
-coords = [parse_coord_string(coord) for coord in target_columns]
-lons = np.array([coord[0] for coord in coords])
-lats = np.array([coord[1] for coord in coords])
+# coords = [parse_coord_string(coord) for coord in target_columns] # target_columns 已更新
+# lons = np.array([coord[0] for coord in coords])
+# lats = np.array([coord[1] for coord in coords])
+# 上述提取 lons, lats 的部分如果僅用於共享模型數據準備，則應在共享模型部分重新計算或傳遞篩選後的 lons, lats
 
 # 重塑訓練數據
 n_samples_train = X_train.shape[0]
-n_targets = len(target_columns)
+n_targets = len(target_columns) # n_targets 現在會是 400 (或實際篩選數量)
 X_train_expanded = []
 y_train_expanded = []
 
@@ -351,12 +439,7 @@ shared_params = {
 # 模型文件路徑
 model_file_path = os.path.join(shared_result_dir, 'model', 'shared_model.txt')
 
-# 檢查是否已有模型
-# if os.path.exists(model_file_path):
-#     print(f"載入已存在的模型: {model_file_path}")
-#     shared_model = lgb.Booster(model_file=model_file_path)
-# else:
-# 獲取特徵名稱並轉換為英文
+
 feature_names = X_train.columns.tolist()
 english_feature_names = [feature_mapping.get(name, name) for name in feature_names]
 
@@ -366,7 +449,6 @@ train_data_shared = lgb.Dataset(X_train_expanded, label=y_train_expanded,
 valid_data_shared = lgb.Dataset(X_test_expanded, label=y_test_expanded, 
                                 reference=train_data_shared, 
                                 feature_name=english_feature_names)
-#%%
 # 訓練共享模型
 print("開始訓練共享模型以預測所有網格...")
 evals_result = {}
@@ -395,30 +477,35 @@ plt.close()
 
 # --- SHAP 分析 ---
 explainer = shap.TreeExplainer(shared_model)
-shap_values = explainer.shap_values(X_test_expanded)
+shap_values = explainer.shap_values(X_test_expanded) # X_test_expanded 的特徵名應為英文
 
 # 為每個網格生成 SHAP 圖
-for i, target in enumerate(target_columns):
+for i, target in enumerate(target_columns): # target_columns 已更新
     safe_target = target.replace("(", "").replace(")", "").replace(",", "_").replace(" ", "")
-    idx = slice(i * n_samples_test, (i + 1) * n_samples_test)
+    # idx 的計算需要基於更新後的 n_targets (即 len(target_columns))
+    # n_samples_test 保持不變
+    idx_start = i * n_samples_test
+    idx_end = (i + 1) * n_samples_test
     
     # SHAP 摘要圖（點圖）
     plt.figure(figsize=(10, 8))
-    shap.summary_plot(shap_values[idx], X_test_expanded.iloc[idx], plot_type='dot', show=False)
+    # 使用 X_test_expanded.iloc[idx_start:idx_end] 確保特徵名一致
+    shap.summary_plot(shap_values[idx_start:idx_end], X_test_expanded.iloc[idx_start:idx_end], plot_type='dot', show=False)
     plt.title(f'共享模型 SHAP 摘要圖 ({target})')
     plt.savefig(os.path.join(shared_result_dir, 'shap_summary', f'shared_model_{safe_target}.png'), dpi=300)
     plt.close()
     
     # SHAP 特徵重要性圖（條形圖）
     plt.figure(figsize=(10, 8))
-    shap.summary_plot(shap_values[idx], X_test_expanded.iloc[idx], plot_type='bar', show=False)
+    shap.summary_plot(shap_values[idx_start:idx_end], X_test_expanded.iloc[idx_start:idx_end], plot_type='bar', show=False)
     plt.title(f'共享模型 SHAP 特徵重要性 ({target})')
     plt.savefig(os.path.join(shared_result_dir, 'shap_bar', f'shared_model_{safe_target}.png'), dpi=300)
     plt.close()
 
 # 生成平均 SHAP 圖
+# mean_shap_values 的 reshape 也需要使用更新後的 n_targets
 mean_shap_values = np.mean(shap_values.reshape(n_targets, n_samples_test, -1), axis=0)
-X_test_for_shap = X_test_expanded.iloc[:n_samples_test]
+X_test_for_shap = X_test_expanded.iloc[:n_samples_test] # 保持不變，取第一批樣本的特徵
 
 plt.figure(figsize=(10, 8))
 shap.summary_plot(mean_shap_values, X_test_for_shap, plot_type='dot', show=False)
@@ -435,7 +522,7 @@ plt.close()
 # --- 評估指標 ---
 shared_mse = {}
 shared_mae = {}
-for i, target in enumerate(target_columns):
+for i, target in enumerate(target_columns): # target_columns 已更新
     shared_mse[target] = mean_squared_error(y_combined_test[:, i], y_pred_shared[:, i])
     shared_mae[target] = mean_absolute_error(y_combined_test[:, i], y_pred_shared[:, i])
 
@@ -508,37 +595,122 @@ with open(rules_file_path, 'w', encoding='utf-8') as f:
         feature_name = X_train_expanded.columns[feature_idx]
         f.write(f"Feature: {feature_name}, Threshold: {threshold}\n")
 print(f"最佳決策樹規則已儲存至: {rules_file_path}")
-#%%
 # ------------------------
 # 新分群邏輯開始
 
-# 輔助函數：從節點字典中提取規則 (特徵索引, 閾值)
-def get_node_rule(node_dict):
-    """從LGBM樹模型節點字典中提取分裂規則。"""
+# 輔助函數：從節點字典中提取規則 (特徵索引, 閾值), 增益及節點本身
+def get_rule_and_gain_node(node_dict):
+    """從LGBM樹模型節點字典中提取分裂規則、增益及節點本身。"""
     if node_dict and "split_feature" in node_dict and node_dict.get("split_gain", 0) > 0: # 確保是有效分裂
-        return (node_dict["split_feature"], node_dict["threshold"])
-    return None
+        rule = (node_dict["split_feature"], node_dict["threshold"])
+        gain = node_dict["split_gain"]
+        return rule, gain, node_dict # Return node_dict as well
+    return None, -float('inf'), None # Consistent return for invalid/leaf nodes
 
-# 輔助函數：為單一目標提取 R1, R2_left, R3_right 規則
-all_target_rules_info = {} # 儲存 {target: {'r1': rule, 'r2_left': rule, 'r3_right': rule}}
-print("提取各目標點的 R1, R2_left, R3_right 規則...")
-for target in target_columns:
-    if target not in target_models: # 如果某目標沒有成功訓練模型
-        all_target_rules_info[target] = {'r1': None, 'r2_left': None, 'r3_right': None}
+# 新增輔助函數：獲取指定深度按增益排序的節點資訊
+def get_nodes_info_at_depth_sorted_by_gain(tree_structure, target_depth):
+    """
+    遍歷樹到目標深度，收集該深度的分裂節點信息 (規則、增益、節點本身)，
+    並按 split_gain 降序排序返回。
+    深度為 1-indexed (根節點為深度 1)。
+    返回列表，每個元素為 {'rule': rule_tuple, 'gain': gain, 'node_dict': node_dict}
+    """
+    nodes_info_list = [] 
+    
+    queue = deque()
+    if tree_structure: # 確保根節點存在
+        queue.append({'node_dict': tree_structure, 'current_depth': 1})
+
+    while queue:
+        item = queue.popleft()
+        node_dict_current = item['node_dict']
+        current_depth = item['current_depth']
+
+        if node_dict_current is None:
+            continue
+
+        if current_depth == target_depth:
+            rule, gain, node_obj = get_rule_and_gain_node(node_dict_current) 
+            if rule: # 如果是有效的帶增益的分裂規則
+                nodes_info_list.append({'rule': rule, 'gain': gain, 'node_dict': node_obj})
+        
+        elif current_depth < target_depth:
+            left_child = node_dict_current.get("left_child")
+            if left_child:
+                queue.append({'node_dict': left_child, 'current_depth': current_depth + 1})
+            
+            right_child = node_dict_current.get("right_child")
+            if right_child:
+                queue.append({'node_dict': right_child, 'current_depth': current_depth + 1})
+                
+    nodes_info_list.sort(key=lambda x: x['gain'], reverse=True)
+    
+    return nodes_info_list
+
+# 新增輔助函數：獲取父節點的子節點資訊，按增益排序
+def get_children_info_sorted_by_gain(parent_node_dict):
+    """
+    獲取父節點的子節點中，有效的子節點資訊 (規則、增益、節點字典)，按增益降序排序。
+    返回列表: [{'rule': ..., 'gain': ..., 'node_dict': ...}, ...]
+    """
+    children_info = []
+    if not parent_node_dict:
+        return children_info
+
+    left_child_node = parent_node_dict.get("left_child")
+    if left_child_node:
+        rule, gain, node = get_rule_and_gain_node(left_child_node)
+        if rule: # Only add if it's a valid split node
+            children_info.append({'rule': rule, 'gain': gain, 'node_dict': node})
+
+    right_child_node = parent_node_dict.get("right_child")
+    if right_child_node:
+        rule, gain, node = get_rule_and_gain_node(right_child_node)
+        if rule: # Only add if it's a valid split node
+            children_info.append({'rule': rule, 'gain': gain, 'node_dict': node})
+    
+    children_info.sort(key=lambda x: x['gain'], reverse=True)
+    return children_info
+
+
+# 輔助函數：為單一目標提取 R1, R2, R3 規則及其節點資訊 (新定義)
+all_target_rules_info = {} 
+print("提取各目標點的 R1, R2, R3 規則及節點資訊...")
+
+empty_node_info = {'rule': None, 'gain': -float('inf'), 'node_dict': None}
+
+for target in target_columns: 
+    current_target_info = {
+        'r1_root': empty_node_info.copy(),
+        'r2_d2top': empty_node_info.copy(),
+        'r3_d2second': empty_node_info.copy()
+    }
+
+    if target not in target_models: 
+        all_target_rules_info[target] = current_target_info
         continue
     model_dump = target_models[target].dump_model()
-    # 確保 tree_info 非空且 best_tree_index 有效
+
     if not model_dump["tree_info"] or target_best_tree_index[target] >= len(model_dump["tree_info"]):
-        # print(f"警告: 目標 {target} 的 tree_info 為空或 best_tree_index 無效。")
-        all_target_rules_info[target] = {'r1': None, 'r2_left': None, 'r3_right': None}
+        all_target_rules_info[target] = current_target_info
         continue
     
     best_tree_structure = model_dump["tree_info"][target_best_tree_index[target]]["tree_structure"]
 
-    r1 = get_node_rule(best_tree_structure)
-    r2_left = get_node_rule(best_tree_structure.get("left_child"))
-    r3_right = get_node_rule(best_tree_structure.get("right_child"))
-    all_target_rules_info[target] = {'r1': r1, 'r2_left': r2_left, 'r3_right': r3_right}
+    r1_rule, r1_gain, r1_node = get_rule_and_gain_node(best_tree_structure)
+    if r1_rule:
+        current_target_info['r1_root'] = {'rule': r1_rule, 'gain': r1_gain, 'node_dict': r1_node}
+    # else it remains empty_node_info
+        
+    depth2_nodes_info_sorted = get_nodes_info_at_depth_sorted_by_gain(best_tree_structure, 2)
+    
+    if len(depth2_nodes_info_sorted) > 0:
+        current_target_info['r2_d2top'] = depth2_nodes_info_sorted[0]
+    
+    if len(depth2_nodes_info_sorted) > 1:
+        current_target_info['r3_d2second'] = depth2_nodes_info_sorted[1]
+    
+    all_target_rules_info[target] = current_target_info
 
 # 輔助函數：合併相似規則並計數
 def merge_individual_rules_and_count(target_to_rule_dict, cat_features_eng, threshold_dist, feature_names_eng_list):
@@ -619,29 +791,29 @@ def find_most_frequent_rule(merged_rule_to_count):
 
 
 # 分層分群主邏輯
-initial_targets = list(target_columns)
+initial_targets = list(target_columns) # target_columns 已更新
 # 每個元素是 (targets_list, defining_rules_dict)
-# defining_rules_dict 結構: {'r1': rule_tuple, 'r2_left': rule_tuple, 'r3_right': rule_tuple}
+# defining_rules_dict 結構: {'r1_root': rule_tuple, 'r2_depth2_top_gain': rule_tuple, 'r3_depth2_second_gain': rule_tuple}
 processing_groups = [(initial_targets, {})] 
 final_eight_groups_details = []
 
-rule_keys_for_splitting = ['r1', 'r2_left', 'r3_right']
+rule_keys_for_splitting = ['r1_root', 'r2_d2top', 'r3_d2second'] # Updated keys
 feature_names_english = list(X_train_tree.columns) # 用於 merge_individual_rules_and_count
-#%%
 print("開始分層分群...")
-for i, rule_key in enumerate(rule_keys_for_splitting):
-    print(f"  處理分群層級: {rule_key} (第 {i+1} 層)")
+for i, rule_key_base in enumerate(rule_keys_for_splitting): # Use rule_key_base
+    print(f"  處理分群層級: {rule_key_base} (第 {i+1} 層)")
     next_level_processing_groups = []
     for current_group_targets, path_rules_so_far in processing_groups:
         if not current_group_targets: # 如果當前群組已空，直接帶入下一層
             # 確保即使群組為空，也為其分配一個定義規則（例如 None）以保持結構
-            next_level_processing_groups.append(([], {**path_rules_so_far, rule_key: None}))
-            next_level_processing_groups.append(([], {**path_rules_so_far, rule_key: None}))
+            next_level_processing_groups.append(([], {**path_rules_so_far, rule_key_base: None}))
+            next_level_processing_groups.append(([], {**path_rules_so_far, rule_key_base: None}))
             continue
 
-        # 1. 提取當前群組中所有目標在此分裂層級的規則
+        # 1. 提取當前群組中所有目標在此分裂層級的規則 (rule tuple)
         rules_at_this_level_for_group = {
-            t: all_target_rules_info[t][rule_key] for t in current_group_targets
+            t: all_target_rules_info[t][rule_key_base]['rule'] 
+            for t in current_group_targets if t in all_target_rules_info and all_target_rules_info[t][rule_key_base]['rule'] is not None
         }
         
         # 2. 合併這些規則並計數
@@ -668,32 +840,24 @@ for i, rule_key in enumerate(rule_keys_for_splitting):
         defining_rule_B = None
         if group_B_targets_candidates:
             rules_for_group_B_candidates = {
-                t: all_target_rules_info[t][rule_key] for t in group_B_targets_candidates
+                t: all_target_rules_info[t][rule_key_base]['rule'] # Ensure 'rule' is extracted
+                for t in group_B_targets_candidates 
+                if t in all_target_rules_info and all_target_rules_info[t][rule_key_base]['rule'] is not None
             }
-            merged_counts_B, _ = merge_individual_rules_and_count( # target_to_merged_map_B 不直接使用
+            merged_counts_B, _ = merge_individual_rules_and_count( 
                 rules_for_group_B_candidates, cat_features, 1.5, feature_names_english
             )
             defining_rule_B = find_most_frequent_rule(merged_counts_B)
-            # 如果 defining_rule_B 與 defining_rule_A 相同（可能發生在 B 組很小或規則單一時），
-            # 且 defining_rule_A 不是 None，則嘗試選擇 B 組中次常見的，或保持 B 組為空，所有點歸入 A。
-            # 簡化處理：如果 B 組的 "最常見" 與 A 組的 "最常見" 相同，則 B 組的定義規則就是這個。
-            # 如果 B 組沒有有效規則，defining_rule_B 會是 None。
-        
-        # 如果 defining_rule_A 是 None，所有非 None 規則的目標點都應進入 B 組
-        if defining_rule_A is None and group_B_targets_candidates:
-             # 此時 A 組是那些規則為 None 的，B 組是那些規則不為 None 的
-             # B 組的定義規則應基於 group_B_targets_candidates 中的最常見規則
-             pass # defining_rule_B 已經計算過了
+
 
         # 添加到下一層處理列表
-        next_level_processing_groups.append((group_A_targets, {**path_rules_so_far, rule_key: defining_rule_A}))
-        next_level_processing_groups.append((group_B_targets_candidates, {**path_rules_so_far, rule_key: defining_rule_B}))
+        next_level_processing_groups.append((group_A_targets, {**path_rules_so_far, rule_key_base: defining_rule_A}))
+        next_level_processing_groups.append((group_B_targets_candidates, {**path_rules_so_far, rule_key_base: defining_rule_B}))
 
     processing_groups = next_level_processing_groups
 
 final_eight_groups_details = processing_groups
 print(f"分群完成，共形成 {len(final_eight_groups_details)} 個最終群組。")
-#%%
 # 輔助函數：將規則元組轉換為人類可讀的字串
 def format_rule_to_string(rule_tuple, feature_names_eng_list, reverse_mapping_dict, cat_features_eng_list):
     if rule_tuple is None:
@@ -728,15 +892,70 @@ def format_rule_to_string(rule_tuple, feature_names_eng_list, reverse_mapping_di
 output_data = []
 for i, (targets_in_group, group_rules_dict) in enumerate(final_eight_groups_details):
     # 確保所有規則鍵都存在
-    r1_str = format_rule_to_string(group_rules_dict.get('r1'), feature_names_english, reverse_mapping, cat_features)
-    r2_str = format_rule_to_string(group_rules_dict.get('r2_left'), feature_names_english, reverse_mapping, cat_features)
-    r3_str = format_rule_to_string(group_rules_dict.get('r3_right'), feature_names_english, reverse_mapping, cat_features)
+    r1_str = format_rule_to_string(group_rules_dict.get('r1_root'), feature_names_english, reverse_mapping, cat_features)
+    r2_str = format_rule_to_string(group_rules_dict.get('r2_d2top'), feature_names_english, reverse_mapping, cat_features)
+    r3_str = format_rule_to_string(group_rules_dict.get('r3_d2second'), feature_names_english, reverse_mapping, cat_features)
+    
+    # --- 新增欄位提取邏輯 ---
+    # R2 子節點規則
+    r2_child1_rules_for_group_list = []
+    r2_child2_rules_for_group_list = []
+    for t_idx, t in enumerate(targets_in_group): 
+        if t in all_target_rules_info:
+            r2_node_dict_for_target = all_target_rules_info[t]['r2_d2top']['node_dict']
+            if r2_node_dict_for_target:
+                children_of_r2 = get_children_info_sorted_by_gain(r2_node_dict_for_target)
+                if len(children_of_r2) > 0 and children_of_r2[0]['rule']:
+                    r2_child1_rules_for_group_list.append(children_of_r2[0]['rule'])
+                if len(children_of_r2) > 1 and children_of_r2[1]['rule']:
+                    r2_child2_rules_for_group_list.append(children_of_r2[1]['rule'])
+    
+    merged_r2_child1_counts, _ = merge_individual_rules_and_count(
+        {idx: r for idx, r in enumerate(r2_child1_rules_for_group_list)}, cat_features, 1.5, feature_names_english
+    )
+    dominant_r2_child1_rule = find_most_frequent_rule(merged_r2_child1_counts)
+    r2_child1_str = format_rule_to_string(dominant_r2_child1_rule, feature_names_english, reverse_mapping, cat_features)
+
+    merged_r2_child2_counts, _ = merge_individual_rules_and_count(
+        {idx: r for idx, r in enumerate(r2_child2_rules_for_group_list)}, cat_features, 1.5, feature_names_english
+    )
+    dominant_r2_child2_rule = find_most_frequent_rule(merged_r2_child2_counts)
+    r2_child2_str = format_rule_to_string(dominant_r2_child2_rule, feature_names_english, reverse_mapping, cat_features)
+
+    # R3 子節點規則
+    r3_child1_rules_for_group_list = []
+    r3_child2_rules_for_group_list = []
+    for t_idx, t in enumerate(targets_in_group): 
+        if t in all_target_rules_info:
+            r3_node_dict_for_target = all_target_rules_info[t]['r3_d2second']['node_dict']
+            if r3_node_dict_for_target:
+                children_of_r3 = get_children_info_sorted_by_gain(r3_node_dict_for_target)
+                if len(children_of_r3) > 0 and children_of_r3[0]['rule']:
+                    r3_child1_rules_for_group_list.append(children_of_r3[0]['rule'])
+                if len(children_of_r3) > 1 and children_of_r3[1]['rule']:
+                    r3_child2_rules_for_group_list.append(children_of_r3[1]['rule'])
+
+    merged_r3_child1_counts, _ = merge_individual_rules_and_count(
+        {idx: r for idx, r in enumerate(r3_child1_rules_for_group_list)}, cat_features, 1.5, feature_names_english
+    )
+    dominant_r3_child1_rule = find_most_frequent_rule(merged_r3_child1_counts)
+    r3_child1_str = format_rule_to_string(dominant_r3_child1_rule, feature_names_english, reverse_mapping, cat_features)
+
+    merged_r3_child2_counts, _ = merge_individual_rules_and_count(
+        {idx: r for idx, r in enumerate(r3_child2_rules_for_group_list)}, cat_features, 1.5, feature_names_english
+    )
+    dominant_r3_child2_rule = find_most_frequent_rule(merged_r3_child2_counts)
+    r3_child2_str = format_rule_to_string(dominant_r3_child2_rule, feature_names_english, reverse_mapping, cat_features)
     
     output_data.append({
         "組別ID": i + 1,
-        "規則1 (R1)": r1_str,
-        "規則2 (R2_left)": r2_str,
-        "規則3 (R3_right)": r3_str,
+        "規則1 (根節點)": r1_str,
+        "規則2 (第二層最高增益)": r2_str,
+        "規則3 (第二層次高增益)": r3_str,
+        "R2節點子節點-最高增益規則": r2_child1_str,
+        "R2節點子節點-次高增益規則": r2_child2_str,
+        "R3節點子節點-最高增益規則": r3_child1_str,
+        "R3節點子節點-次高增益規則": r3_child2_str,
         "組內座標數量": len(targets_in_group),
         "組內所有座標": ", ".join(sorted(targets_in_group)) if targets_in_group else ""
     })
@@ -766,7 +985,8 @@ plot_lons = []
 plot_lats = []
 plot_group_labels = []
 
-# target_columns 已經是排序且唯一的列表
+
+# target_columns 已經是排序且唯一的列表 (並且是篩選後的)
 for target_coord_str in target_columns:
     lon, lat = parse_coord_string(target_coord_str) # 假設 parse_coord_string 已定義
     plot_lons.append(lon)
@@ -829,14 +1049,5 @@ plt.savefig(grouping_plot_path, dpi=300, bbox_inches="tight")
 plt.close()
 print(f"階層式分群地理分佈圖已儲存至: {grouping_plot_path}")
 
-
-# 移除舊的 group_tree 繪圖部分，因為現在是8個固定群組，其定義規則已在CSV中
-# 如果需要為每個群組的代表（例如，MAE最低的點）繪製其原始樹，可以另行添加
-# 但題目要求是將8個群組繪製在地圖上，這已完成。
-
-# 清理不再使用的舊分群相關變數和函數的定義（如果它們僅用於舊分群）
-# 例如 assign_group_by_feature_prefix, merge_similar_groups, assign_group_by_decision_rules
-# 以及它們的相關呼叫。由於這是替換，這裡不顯式刪除，假設它們在原始碼中被新邏輯取代。
-
 print("所有處理完成。")
-# %%
+

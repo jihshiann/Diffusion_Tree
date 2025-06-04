@@ -397,3 +397,4 @@ FodyWeavers.xsd
 /results_ddpm_stage3/model_outputs_cache
 /results_ddpm_stage3/Stage3_DewPointLe235
 /results_ddpm_stage3/Stage3_HourLe20
+/results_ddpm_stage3/Stage3_WeekdayLe3

@@ -671,28 +671,38 @@ def parse_lat_lon(column_name: str) -> tuple[float, float]:
         return float(match.group(1)), float(match.group(2))
     raise ValueError(f"欄位名稱格式無效：{column_name}")
 
-class Stage3Dataset(Dataset):
+class MultiStageDataset(Dataset):
     def __init__(self,
-                 df_for_stage3_processing: pd.DataFrame,
-                 basemodel_outputs_for_s2_eval_np: np.ndarray, # BM 正規化輸出 (N,1,D,H,W) - 用於S2模型評估
-                 stage2_model_outputs_for_s3_cond_np: np.ndarray, # S2 正規化輸出 (N,1,D,H,W) - 作為S3模型條件1
+                 df_for_processing: pd.DataFrame,
                  config: Dict[str, Any],
-                 original_sorted_flow_columns: List[str],
-                 mode: str = 'train',
-                 # 從 Stage2 訓練集傳遞的統計數據 (用於S2新特徵)
-                 s2_new_cond_feature_norm_stats_from_s2_train: Optional[Dict[str, float]] = None,
-                 # 從 Stage3 訓練集傳遞給驗證/測試集的統計數據
-                 s3_new_cond_feature_norm_stats_from_train: Optional[Dict[str, float]] = None,
-                 stage3_avg_flow_map_dict_from_train: Optional[Dict[Tuple[int, int, int, int], np.ndarray]] = None,
-                 stage3_target_norm_stats_from_train: Optional[Dict[str, float]] = None
+                 original_sorted_flow_columns: List[str], # 通常來自 Basemodel 或首次 Dataset 實例化
+                 current_stage_mode: ConditionMode,
+                 mode: str = 'train', # 'train', 'val', 'test'
+                 
+                 # --- 前續階段的正規化輸出 (作為條件) ---
+                 # 這些是在主流程中由前一階段模型 sample() 生成的，並已正規化
+                 basemodel_outputs_np: Optional[np.ndarray] = None, # (N,1,D,H,W) - 用於 S2條件1, 或評估BM/S2/S3/S4時的BM部分
+                 s2_model_outputs_np: Optional[np.ndarray] = None,    # (N,1,D,H,W) - 用於 S3條件1, 或評估S2/S3/S4時的S2部分
+                 s3_model_outputs_np: Optional[np.ndarray] = None,    # (N,1,D,H,W) - 用於 S4條件1, 或評估S3/S4時的S3部分
+                 # (如果將來有 S4 輸出給 S5，以此類推)
+
+                 # --- 各階段新條件特徵的正規化統計量 (從對應階段的檢查點/訓練實例獲取) ---
+                 s2_new_cond_feature_norm_stats_from_chkpt: Optional[Dict[str, float]] = None, # Stage2新特徵的統計量
+                 s3_new_cond_feature_norm_stats_from_chkpt: Optional[Dict[str, float]] = None, # Stage3新特徵的統計量
+                 # (如果將來有 S4，則 s4_new_cond_feature_norm_stats_from_chkpt)
+
+                 # --- 當前階段在 val/test 模式下，從其訓練實例傳入的數據 ---
+                 current_stage_new_cond_feature_norm_stats_from_train: Optional[Dict[str, float]] = None, # 當前階段新特徵的統計量
+                 current_stage_avg_flow_map_dict_from_train: Optional[Dict[Tuple, np.ndarray]] = None,     # 當前階段的目標平均流量圖
+                 current_stage_target_norm_stats_from_train: Optional[Dict[str, float]] = None          # 當前階段目標的專用正規化統計量
                  ):
         super().__init__()
-        self.df_s3 = df_for_stage3_processing.reset_index(drop=True)
-        self.basemodel_outputs_np = basemodel_outputs_for_s2_eval_np # (N,1,D,H,W) - 正規化, 用於S2模型評估
-        self.s2_model_outputs_np = stage2_model_outputs_for_s3_cond_np # (N,1,D,H,W) - 正規化, S3模型條件1
+        self.df_processed = df_for_processing.reset_index(drop=True)
         self.config = config
+        self.current_stage_mode_enum = current_stage_mode
+        self.current_stage_name = self.current_stage_mode_enum.name # e.g., "STAGE3", "STAGE4"
         self.mode = mode
-        self.logger = logging.getLogger(f"{__name__}.Stage3Dataset")
+        self.logger = logging.getLogger(f"{__name__}.MultiStageDataset[{self.current_stage_name}][{self.mode}]")
 
         self.H = config["H"]
         self.W = config["W"]
@@ -700,142 +710,168 @@ class Stage3Dataset(Dataset):
         self.image_channels_target = config.get("image_channels", 1)
         self.sorted_flow_columns = original_sorted_flow_columns
 
-        # --- 處理 Basemodel 的原始條件 (小時, 假日) ---
-        # 修改後的程式碼 (以 Stage3Dataset 為例)
-        if '時' not in self.df_s3.columns:
-            raise KeyError("DataFrame 中找不到 '時' 欄位 (for Stage3Dataset BM conditions)。")
-        self.hours_for_target_np_s3 = self.df_s3['時'].values.astype(int) # 直接獲取數值並確保是整數
-        if not ((self.hours_for_target_np_s3 >= 0) & (self.hours_for_target_np_s3 <= 23)).all():
-            self.logger.warning(f"Stage3Dataset (mode={self.mode}): '時' 欄位包含不在 0-23 範圍內的值。請檢查數據。")
-        self.hour_category_for_target_grouping_np_s3 = (self.hours_for_target_np_s3 > 8).astype(int)
+        # 儲存傳入的前序階段模型輸出 (這些應該是已經正規化好的)
+        self.basemodel_outputs_np = basemodel_outputs_np
+        self.s2_model_outputs_np_for_s3_cond = s2_model_outputs_np # 用於 S3 條件1 或 S2 評估
+        self.s3_model_outputs_np_for_s4_cond = s3_model_outputs_np # 用於 S4 條件1 或 S3 評估
+        
+        # --- 1. 處理所有階段都需要的 Basemodel 原始條件 (小時, 假日) ---
+        self._process_basemodel_conditions()
 
-        if 'holiday' not in self.df_s3.columns and 'hoilday' in self.df_s3.columns: self.df_s3.rename(columns={"hoilday": "holiday"}, inplace=True)
-        if 'holiday' not in self.df_s3.columns: raise KeyError("DataFrame 中找不到 'holiday' 或 'hoilday' 欄位 (for Stage3Dataset BM conditions)。")
-        self.is_holiday_for_target_np_s3 = self.df_s3['holiday'].astype(bool).astype(int).values
-        self.logger.info(f"Stage3Dataset (mode={self.mode}): BM 條件 (小時, 假日) 處理完畢。")
-
-        # --- 處理 Stage2 的新條件 (例如 '月') ---
+        # --- 2. 處理 Stage2 新條件的分類向量和正規化統計量 ---
+        # Stage2 的新條件分類向量 (s2_new_cond_category_for_target_np) 和
+        # 其原始值的正規化統計量 (norm_stats_s2_new_cond_feature) 對於後續所有階段的目標定義和評估都可能用到。
+        # Stage2 新特徵的正規化統計量總是從其檢查點載入。
+        if s2_new_cond_feature_norm_stats_from_chkpt is None:
+            raise ValueError(f"MultiStageDataset: 必須提供 Stage2 新條件的正規化統計量 (s2_new_cond_feature_norm_stats_from_chkpt)。")
+        self.norm_stats_s2_new_cond_feature = s2_new_cond_feature_norm_stats_from_chkpt
         self.s2_new_cond_col_name = config["stage2_new_condition_feature_column"]
-        self.s2_new_cond_op = config["stage2_new_conditional_operator"]
-        self.s2_new_cond_val = config["stage2_new_conditional_value"]
-        if self.s2_new_cond_col_name not in self.df_s3.columns: raise ValueError(f"Stage3Dataset: Stage2 的條件欄位 '{self.s2_new_cond_col_name}' 不在 DataFrame 中。")
-        self.s2_new_cond_original_values_np = pd.to_numeric(self.df_s3[self.s2_new_cond_col_name], errors='coerce').values
+        self.s2_new_cond_original_values_np = self._get_original_cond_values(self.s2_new_cond_col_name)
         self.s2_new_cond_category_for_target_np = self._calculate_category_vector(
-            self.s2_new_cond_original_values_np, self.s2_new_cond_op, self.s2_new_cond_val, self.s2_new_cond_col_name, "Stage2Cond_in_S3"
+            self.s2_new_cond_original_values_np, config["stage2_new_conditional_operator"],
+            config["stage2_new_conditional_value"], self.s2_new_cond_col_name, "Stage2Cond"
         )
-        # Stage2 新條件的正規化統計量 (必須從 Stage2 訓練中獲取並傳入)
-        if s2_new_cond_feature_norm_stats_from_s2_train is None:
-            raise ValueError(f"Stage3Dataset (mode={self.mode}): 必須提供 's2_new_cond_feature_norm_stats_from_s2_train'。")
-        self.norm_stats_s2_new_cond_feature = s2_new_cond_feature_norm_stats_from_s2_train
-        self.logger.info(f"Stage3Dataset (mode={self.mode}): Stage2 條件 ('{self.s2_new_cond_col_name}') 分類處理完畢，並已載入其正規化統計量。")
+        self.logger.info(f"Stage2 條件 ('{self.s2_new_cond_col_name}') 分類向量已生成。已載入其正規化統計量: "
+                         f"mean={self.norm_stats_s2_new_cond_feature.get('mean', float('nan')):.4f}, "
+                         f"std={self.norm_stats_s2_new_cond_feature.get('std', float('nan')):.4f}")
+        self._log_normalized_scalar_stats(self.s2_new_cond_original_values_np, self.norm_stats_s2_new_cond_feature,
+                                          self.s2_new_cond_col_name, "Stage2 新條件 (使用S2檢查點統計量)")
 
-        s2_new_cond_mean = self.norm_stats_s2_new_cond_feature.get('mean')
-        s2_new_cond_std = self.norm_stats_s2_new_cond_feature.get('std')
+        # --- 3. 處理 Stage3 新條件的分類向量和正規化統計量 (如果當前階段 >= Stage3) ---
+        if self.current_stage_mode_enum.value >= ConditionMode.STAGE3.value:
+            self.s3_new_cond_col_name = config["stage3_new_condition_feature_column"]
+            self.s3_new_cond_original_values_np = self._get_original_cond_values(self.s3_new_cond_col_name)
+            self.s3_new_cond_category_for_target_np = self._calculate_category_vector(
+                self.s3_new_cond_original_values_np, config["stage3_new_conditional_operator"],
+                config["stage3_new_conditional_value"], self.s3_new_cond_col_name, "Stage3Cond"
+            )
+            if self.current_stage_mode_enum == ConditionMode.STAGE3 and self.mode == 'train':
+                self.norm_stats_s3_new_cond_feature = self._calculate_norm_stats(
+                    self.s3_new_cond_original_values_np, self.s3_new_cond_col_name, "S3 new cond (Train)"
+                )
+            elif self.current_stage_mode_enum == ConditionMode.STAGE3 and self.mode != 'train':
+                if current_stage_new_cond_feature_norm_stats_from_train is None: # S3的val/test, 它的新特徵統計來自S3的train
+                    raise ValueError("Stage3 val/test mode 需要 current_stage_new_cond_feature_norm_stats_from_train (for S3 new feature)。")
+                self.norm_stats_s3_new_cond_feature = current_stage_new_cond_feature_norm_stats_from_train
+            elif self.current_stage_mode_enum.value > ConditionMode.STAGE3.value: # 例如當前是S4, 需要S3的統計量
+                if s3_new_cond_feature_norm_stats_from_chkpt is None:
+                    raise ValueError(f"當前階段為 {self.current_stage_name} 時，必須提供 Stage3 新條件的正規化統計量 (s3_new_cond_feature_norm_stats_from_s3_chkpt)。")
+                self.norm_stats_s3_new_cond_feature = s3_new_cond_feature_norm_stats_from_chkpt
+            else: # 不應該發生
+                 self.norm_stats_s3_new_cond_feature = {'mean':0.0, 'std':1.0} # 安全回退
+                 self.logger.error("Stage3 新條件統計量設定邏輯異常。")
 
-        if s2_new_cond_mean is not None and s2_new_cond_std is not None:
-            if s2_new_cond_std < 1e-6: s2_new_cond_std = 1.0 # 避免除以零
+            self.logger.info(f"Stage3 條件 ('{self.s3_new_cond_col_name}') 分類向量已生成。正規化統計量已設定/載入: "
+                             f"mean={self.norm_stats_s3_new_cond_feature.get('mean', float('nan')):.4f}, "
+                             f"std={self.norm_stats_s3_new_cond_feature.get('std', float('nan')):.4f}")
+            self._log_normalized_scalar_stats(self.s3_new_cond_original_values_np, self.norm_stats_s3_new_cond_feature,
+                                              self.s3_new_cond_col_name, "Stage3 新條件")
+        
+        # --- 4. 處理 Stage4 新條件的分類向量和正規化統計量 (如果當前階段 == Stage4) ---
+        if self.current_stage_mode_enum == ConditionMode.STAGE4:
+            self.s4_new_cond_col_name = config["stage4_new_condition_feature_column"]
+            self.s4_new_cond_original_values_np = self._get_original_cond_values(self.s4_new_cond_col_name)
+            self.s4_new_cond_category_for_target_np = self._calculate_category_vector(
+                self.s4_new_cond_original_values_np, config["stage4_new_conditional_operator"],
+                config["stage4_new_conditional_value"], self.s4_new_cond_col_name, "Stage4Cond"
+            )
+            if self.mode == 'train':
+                self.norm_stats_s4_new_cond_feature = self._calculate_norm_stats(
+                    self.s4_new_cond_original_values_np, self.s4_new_cond_col_name, "S4 new cond (Train)"
+                )
+            elif self.mode != 'train': # Stage4 的 val/test
+                if current_stage_new_cond_feature_norm_stats_from_train is None:
+                    raise ValueError("Stage4 val/test mode 需要 current_stage_new_cond_feature_norm_stats_from_train (for S4 new feature)。")
+                self.norm_stats_s4_new_cond_feature = current_stage_new_cond_feature_norm_stats_from_train
             
-            normalized_s2_cond_values_for_stats = np.array([
-                (val - s2_new_cond_mean) / s2_new_cond_std if not np.isnan(val) else 0.0
-                for val in self.s2_new_cond_original_values_np # self.s2_new_cond_original_values_np 是當前數據子集的S2條件原始值
-            ])
-            if normalized_s2_cond_values_for_stats.size > 0:
-                self.logger.info(f"Stage3Dataset (mode={self.mode}): Stage2 新條件 ('{self.s2_new_cond_col_name}') 使用其自身訓練統計量正規化後純量值統計: "
-                                f"MIN: {np.min(normalized_s2_cond_values_for_stats):.4f}, MAX: {np.max(normalized_s2_cond_values_for_stats):.4f}, "
-                                f"MEAN: {np.mean(normalized_s2_cond_values_for_stats):.4f}, STD: {np.std(normalized_s2_cond_values_for_stats):.4f}")
-            else:
-                self.logger.warning(f"Stage3Dataset (mode={self.mode}): Stage2 新條件 ('{self.s2_new_cond_col_name}') 數據為空，無法計算正規化後純量值統計。")
-        else:
-            self.logger.warning(f"Stage3Dataset (mode={self.mode}): Stage2 新條件 ('{self.s2_new_cond_col_name}') 的正規化統計量缺失 mean 或 std。")
+            self.logger.info(f"Stage4 條件 ('{self.s4_new_cond_col_name}') 分類向量已生成。正規化統計量已設定/載入: "
+                             f"mean={self.norm_stats_s4_new_cond_feature.get('mean', float('nan')):.4f}, "
+                             f"std={self.norm_stats_s4_new_cond_feature.get('std', float('nan')):.4f}")
+            self._log_normalized_scalar_stats(self.s4_new_cond_original_values_np, self.norm_stats_s4_new_cond_feature,
+                                              self.s4_new_cond_col_name, "Stage4 新條件")
 
-        # --- 處理 Stage3 的新條件 (例如 '日') ---
-        self.s3_new_cond_col_name = config["stage3_new_condition_feature_column"]
-        self.s3_new_cond_op = config["stage3_new_conditional_operator"]
-        self.s3_new_cond_val = config["stage3_new_conditional_value"]
-        if self.s3_new_cond_col_name not in self.df_s3.columns: raise ValueError(f"Stage3Dataset: Stage3 的條件欄位 '{self.s3_new_cond_col_name}' 不在 DataFrame 中。")
-        self.s3_new_cond_original_values_np = pd.to_numeric(self.df_s3[self.s3_new_cond_col_name], errors='coerce').values
-        self.s3_new_cond_category_for_target_np = self._calculate_category_vector(
-            self.s3_new_cond_original_values_np, self.s3_new_cond_op, self.s3_new_cond_val, self.s3_new_cond_col_name, "Stage3Cond"
-        )
-        self.logger.info(f"Stage3Dataset (mode={self.mode}): Stage3 條件 ('{self.s3_new_cond_col_name}') 分類處理完畢。")
-
-        # --- 根據模式處理正規化統計量和平均流量圖 ---
+        # --- 5. 根據模式處理當前階段的目標流量圖和其正規化統計量 ---
         if self.mode == 'train':
-            # S3 新條件特徵的正規化統計
-            self.norm_stats_s3_new_cond_feature = self._calculate_norm_stats(self.s3_new_cond_original_values_np, self.s3_new_cond_col_name, "S3 new cond")
-            self.logger.info(f"Stage3Dataset (train): 計算得到 Stage3 新條件 ({self.s3_new_cond_col_name}) 的正規化統計量: mean={self.norm_stats_s3_new_cond_feature['mean']:.4f}, std={self.norm_stats_s3_new_cond_feature['std']:.4f}")
-
-            s3_new_cond_mean_train = self.norm_stats_s3_new_cond_feature['mean']
-            s3_new_cond_std_train = self.norm_stats_s3_new_cond_feature['std']
-            if s3_new_cond_std_train < 1e-6: s3_new_cond_std_train = 1.0 # 避免除以零
-            
-            # 對 self.s3_new_cond_original_values_np 進行正規化以獲取統計值
-            # 需要處理 NaN 值，與 __getitem__ 中的邏輯保持一致
-            normalized_s3_cond_values_for_stats = np.array([
-                (val - s3_new_cond_mean_train) / s3_new_cond_std_train if not np.isnan(val) else 0.0
-                for val in self.s3_new_cond_original_values_np
-            ])
-            if normalized_s3_cond_values_for_stats.size > 0:
-                self.logger.info(f"Stage3Dataset (train): Stage3 新條件 ('{self.s3_new_cond_col_name}') 正規化後純量值統計: "
-                                f"MIN: {np.min(normalized_s3_cond_values_for_stats):.4f}, MAX: {np.max(normalized_s3_cond_values_for_stats):.4f}, "
-                                f"MEAN: {np.mean(normalized_s3_cond_values_for_stats):.4f}, STD: {np.std(normalized_s3_cond_values_for_stats):.4f}")
+            self.average_flow_map_dict_current_stage = self._calculate_target_flows_for_current_stage()
+            if not self.average_flow_map_dict_current_stage:
+                self.logger.warning(f"_calculate_target_flows_for_current_stage() for {self.current_stage_name} 返回了一個空字典。")
+                self.norm_stats_current_stage_target = {'mean': 0.0, 'std': 1.0} # 提供預設值
             else:
-                self.logger.warning(f"Stage3Dataset (train): Stage3 新條件 ('{self.s3_new_cond_col_name}') 數據為空，無法計算正規化後純量值統計。")
-
-            # S3 目標流量圖 (基於四個條件)
-            self.average_flow_map_dict_s3 = self._calculate_stage3_target_flows()
-            if not self.average_flow_map_dict_s3: self.logger.warning("Stage3Dataset (train): _calculate_stage3_target_flows() 返回一個空字典。")
-            
-            # S3 目標流量的專用正規化統計
-            if self.average_flow_map_dict_s3:
-                all_s3_target_maps = np.array(list(self.average_flow_map_dict_s3.values()))
-                if all_s3_target_maps.size > 0:
-                    self.norm_stats_stage3_target = self._calculate_norm_stats(all_s3_target_maps.flatten(), "S3 Target", "S3 Target")
-                    self.logger.info(f"Stage3Dataset (train): 計算得到 Stage3 目標流量的專用正規化統計量: mean={self.norm_stats_stage3_target['mean']:.4f}, std={self.norm_stats_stage3_target['std']:.4f}")
+                all_current_stage_target_maps = np.array(list(self.average_flow_map_dict_current_stage.values()))
+                if all_current_stage_target_maps.size > 0:
+                    self.norm_stats_current_stage_target = self._calculate_norm_stats(
+                        all_current_stage_target_maps.flatten(), f"{self.current_stage_name} Target", f"{self.current_stage_name} Target"
+                    )
                 else:
-                    self.logger.warning("Stage3Dataset (train): average_flow_map_dict_s3 中的值為空數組，無法計算 Stage3 目標專用統計量。使用預設值。")
-                    self.norm_stats_stage3_target = {'mean': 0.0, 'std': 1.0}
-            else:
-                self.logger.warning("Stage3Dataset (train): average_flow_map_dict_s3 為空，無法計算 Stage3 目標專用統計量。使用預設值。")
-                self.norm_stats_stage3_target = {'mean': 0.0, 'std': 1.0}
-
+                    self.logger.warning(f"average_flow_map_dict_current_stage for {self.current_stage_name} 中的值為空數組。使用預設目標統計量。")
+                    self.norm_stats_current_stage_target = {'mean': 0.0, 'std': 1.0}
+            self.logger.info(f"計算得到 {self.current_stage_name} 目標流量的專用正規化統計量: mean={self.norm_stats_current_stage_target['mean']:.4f}, std={self.norm_stats_current_stage_target['std']:.4f}")
+        
         elif self.mode == 'val' or self.mode == 'test':
-            # 載入 S3 新條件的統計數據
-            if s3_new_cond_feature_norm_stats_from_train is None: raise ValueError(f"Stage3 {self.mode} mode 需要從訓練集傳入 s3_new_cond_feature_norm_stats。")
-            self.norm_stats_s3_new_cond_feature = s3_new_cond_feature_norm_stats_from_train
-            self.logger.info(f"Stage3Dataset ({self.mode}): 已載入 Stage3 新條件 ({self.s3_new_cond_col_name}) 的正規化統計量: mean={self.norm_stats_s3_new_cond_feature['mean']:.4f}, std={self.norm_stats_s3_new_cond_feature['std']:.4f}")
-
-            s3_new_cond_mean_valtest = self.norm_stats_s3_new_cond_feature['mean']
-            s3_new_cond_std_valtest = self.norm_stats_s3_new_cond_feature['std']
-            if s3_new_cond_std_valtest < 1e-6: s3_new_cond_std_valtest = 1.0
-
-            normalized_s3_cond_values_for_stats_valtest = np.array([
-                (val - s3_new_cond_mean_valtest) / s3_new_cond_std_valtest if not np.isnan(val) else 0.0
-                for val in self.s3_new_cond_original_values_np # self.s3_new_cond_original_values_np 是當前 val/test 子集的原始值
-            ])
-            if normalized_s3_cond_values_for_stats_valtest.size > 0:
-                self.logger.info(f"Stage3Dataset ({self.mode}): Stage3 新條件 ('{self.s3_new_cond_col_name}') 使用訓練集統計量正規化後純量值統計: "
-                                f"MIN: {np.min(normalized_s3_cond_values_for_stats_valtest):.4f}, MAX: {np.max(normalized_s3_cond_values_for_stats_valtest):.4f}, "
-                                f"MEAN: {np.mean(normalized_s3_cond_values_for_stats_valtest):.4f}, STD: {np.std(normalized_s3_cond_values_for_stats_valtest):.4f}")
-            else:
-                self.logger.warning(f"Stage3Dataset ({self.mode}): Stage3 新條件 ('{self.s3_new_cond_col_name}') 數據為空，無法計算正規化後純量值統計。")
-
-            # 載入 S3 目標流量圖
-            if stage3_avg_flow_map_dict_from_train is None: raise ValueError(f"Stage3 {self.mode} mode 需要從訓練集傳入 stage3_avg_flow_map_dict。")
-            self.average_flow_map_dict_s3 = stage3_avg_flow_map_dict_from_train
-
-            # 載入 S3 目標流量的專用正規化統計
-            if stage3_target_norm_stats_from_train is None: raise ValueError(f"Stage3 {self.mode} mode 需要從訓練集傳入 stage3_target_norm_stats。")
-            self.norm_stats_stage3_target = stage3_target_norm_stats_from_train
+            if current_stage_avg_flow_map_dict_from_train is None or \
+               current_stage_target_norm_stats_from_train is None:
+                raise ValueError(f"{self.current_stage_name} {self.mode} mode 需要從訓練集傳入 avg_flow_map 和 target_norm_stats。")
+            self.average_flow_map_dict_current_stage = current_stage_avg_flow_map_dict_from_train
+            self.norm_stats_current_stage_target = current_stage_target_norm_stats_from_train
+            self.logger.info(f"已載入 {self.current_stage_name} 目標流量的預計算平均圖和專用正規化統計量。")
         else:
-            raise ValueError(f"未知的 Stage3Dataset mode: {self.mode}")
+            raise ValueError(f"未知的 Dataset mode: {self.mode}")
 
-        # Final checks for critical attributes
-        for attr_name in ['norm_stats_s2_new_cond_feature', 'norm_stats_s3_new_cond_feature', 'average_flow_map_dict_s3', 'norm_stats_stage3_target']:
-            if not hasattr(self, attr_name) or getattr(self, attr_name) is None:
-                self.logger.error(f"CRITICAL ERROR FINAL CHECK (mode={self.mode}): 屬性 '{attr_name}' 在 Stage3Dataset __init__ 結束時缺失或為 None!")
-        self.logger.info(f"Stage3Dataset __init__ (mode={self.mode}) COMPLETED.")
+        self.logger.info(f"{self.__class__.__name__}[{self.current_stage_name}][{self.mode}] __init__ COMPLETED.")
 
+    def _get_original_cond_values(self, col_name: str) -> np.ndarray:
+        """輔助函數：從 DataFrame 獲取並轉換指定欄位的原始數值。"""
+        if col_name not in self.df_processed.columns:
+            raise ValueError(f"Dataset: 條件欄位 '{col_name}' 不在 DataFrame '{list(self.df_processed.columns)}' 中。")
+        return pd.to_numeric(self.df_processed[col_name], errors='coerce').values
+
+    def _process_basemodel_conditions(self):
+        """處理所有階段都需要的 Basemodel 原始條件。"""
+        if '時' not in self.df_processed.columns:
+            raise KeyError(f"DataFrame 中找不到 '時' 欄位 (for {self.current_stage_name} BM conditions)。")
+        self.hours_for_target_np = self.df_processed['時'].values.astype(int)
+        if not ((self.hours_for_target_np >= 0) & (self.hours_for_target_np <= 23)).all():
+            self.logger.warning(f"'時' 欄位包含不在 0-23 範圍內的值。請檢查數據。")
+        self.hour_category_for_target_grouping_np = (self.hours_for_target_np > 8).astype(int)
+
+        if 'holiday' not in self.df_processed.columns and 'hoilday' in self.df_processed.columns:
+            self.df_processed.rename(columns={"hoilday": "holiday"}, inplace=True)
+        if 'holiday' not in self.df_processed.columns:
+            raise KeyError(f"DataFrame 中找不到 'holiday' 或 'hoilday' 欄位 (for {self.current_stage_name} BM conditions)。")
+        self.is_holiday_for_target_np = self.df_processed['holiday'].astype(bool).astype(int).values
+        self.logger.info(f"BM 條件 (小時, 假日) 處理完畢。")
+
+    def _log_normalized_scalar_stats(self, original_values_np: np.ndarray, norm_stats: Optional[Dict[str, float]], 
+                                     col_name: str, log_prefix: str):
+        """輔助函數，用於記錄正規化後純量值的統計。"""
+        if norm_stats is None:
+            self.logger.warning(f"{log_prefix} ('{col_name}') 的正規化統計量為 None，無法打印詳細統計。")
+            return
+            
+        mean_stat = norm_stats.get('mean')
+        std_stat = norm_stats.get('std')
+
+        if mean_stat is not None and std_stat is not None:
+            current_std_stat = std_stat if std_stat > 1e-6 else 1.0
+            
+            # 確保 self.sX_new_cond_original_values_np / self.current_stage_new_cond_original_values_np 已被賦值
+            if original_values_np is None : # 這裡的 original_values_np 應為參數傳入
+                 self.logger.warning(f"{log_prefix} ('{col_name}') 的原始值數組為 None，無法計算正規化統計。")
+                 return
+
+            normalized_values = np.array([
+                (val - mean_stat) / current_std_stat if not np.isnan(val) else 0.0
+                for val in original_values_np 
+            ])
+            if normalized_values.size > 0:
+                self.logger.info(f"{log_prefix} ('{col_name}') 使用其訓練統計量正規化後純量值統計: "
+                                 f"MIN: {np.min(normalized_values):.4f}, MAX: {np.max(normalized_values):.4f}, "
+                                 f"MEAN: {np.mean(normalized_values):.4f}, STD: {np.std(normalized_values):.4f}")
+            else:
+                self.logger.warning(f"{log_prefix} ('{col_name}') 數據為空，無法計算正規化後純量值統計。")
+        else:
+            self.logger.warning(f"{log_prefix} ('{col_name}') 的正規化統計量缺失 mean 或 std。")
+            
     def _calculate_category_vector(self, values_np: np.ndarray, op: str, threshold: Any, col_name_for_log: str, cond_stage_log_prefix: str) -> np.ndarray:
         num_nan = np.isnan(values_np).sum()
         if num_nan > 0: self.logger.warning(f"{self.__class__.__name__} ({cond_stage_log_prefix}, mode={self.mode}): 欄位 '{col_name_for_log}' 包含 {num_nan} 個 NaN。比較時 NaN 通常結果為 False。")
@@ -859,125 +895,190 @@ class Stage3Dataset(Dataset):
             return category_vector
         except ValueError:
             self.logger.error(f"{self.__class__.__name__} ({cond_stage_log_prefix}, mode={self.mode}): 閾值 '{threshold}' for '{col_name_for_log}' 無法轉換為浮點數。所有樣本類別將設為0。")
-            return np.zeros(len(self.df_s3), dtype=int)
+            return np.zeros(len(self.df_processed), dtype=int)
 
-
-    def _calculate_norm_stats(self, values_np: np.ndarray, col_name_for_log: str, cond_stage_log_prefix: str) -> Dict[str, float]:
+    def _calculate_norm_stats(self, values_np: np.ndarray, col_name_for_log: str, data_source_description: str) -> Dict[str, float]:
+        # data_source_description 用於日誌，例如 "S2 new cond", "S3 Target"
         valid_values = values_np[~np.isnan(values_np)]
         if len(valid_values) > 0:
             mean_val = np.mean(valid_values)
             std_val = np.std(valid_values)
         else:
-            self.logger.warning(f"{self.__class__.__name__} ({cond_stage_log_prefix}, {self.mode}): 欄位 '{col_name_for_log}' 中沒有有效的數值用於計算正規化統計量。將使用 mean=0, std=1。")
+            self.logger.warning(f"{self.__class__.__name__} ({data_source_description}, {self.mode}): 欄位 '{col_name_for_log}' 中沒有有效的數值用於計算正規化統計量。將使用 mean=0, std=1。")
             return {'mean': 0.0, 'std': 1.0}
         if std_val < 1e-6:
-            self.logger.warning(f"{self.__class__.__name__} ({cond_stage_log_prefix}, {self.mode}): 計算得到欄位 '{col_name_for_log}' 標準差 ({std_val:.4f}) 過小，將其設為 1.0。")
+            self.logger.warning(f"{self.__class__.__name__} ({data_source_description}, {self.mode}): 計算得到欄位 '{col_name_for_log}' 標準差 ({std_val:.4f}) 過小，將其設為 1.0。")
             std_val = 1.0
         return {'mean': mean_val, 'std': std_val}
 
     def __len__(self) -> int:
-        return len(self.df_s3)
+        return len(self.df_processed)
 
-    def _calculate_stage3_target_flows(self) -> Dict[Tuple[int, int, int, int], np.ndarray]: # Key: (hr_cat, hol, s2_cat, s3_cat)
-        self.logger.info(f"Stage3Dataset (mode={self.mode}): 計算複合條件 (小時類別, 假日, S2條件類別, S3條件類別) 的目標平均流量...")
-        avg_flows_s3: Dict[Tuple[int, int, int, int], np.ndarray] = {}
-
-        if not hasattr(self, 'sorted_flow_columns') or not self.sorted_flow_columns: return {}
-        flow_data_for_calc_s3 = self.df_s3[self.sorted_flow_columns].values.astype(np.float32)
+    def _calculate_target_flows_for_current_stage(self) -> Dict[Tuple, np.ndarray]:
+        self.logger.info(f"計算 {self.current_stage_name} 目標流量...")
+        avg_flows_current_stage: Dict[Tuple, np.ndarray] = {}
+        flow_data = self.df_processed[self.sorted_flow_columns].values.astype(np.float32)
         
-        grouping_df_s3 = pd.DataFrame({
-            'hour_category': self.hour_category_for_target_grouping_np_s3,
-            'is_holiday': self.is_holiday_for_target_np_s3,
-            's2_cond_category': self.s2_new_cond_category_for_target_np, # From S2 condition processing
-            's3_cond_category': self.s3_new_cond_category_for_target_np  # From S3 condition processing
-        })
-        if grouping_df_s3.empty: return {}
-        grouped_s3 = grouping_df_s3.groupby(['hour_category', 'is_holiday', 's2_cond_category', 's3_cond_category'], observed=False)
-        if not grouped_s3.groups or all(idx.empty for idx in grouped_s3.groups.values()): return {}
+        group_by_cols = ['hour_category', 'is_holiday']
+        grouping_data = {
+            'hour_category': self.hour_category_for_target_grouping_np,
+            'is_holiday': self.is_holiday_for_target_np
+        }
 
-        for group_key_s3, group_indices_s3 in grouped_s3.indices.items():
-            count = len(group_indices_s3)
-            if len(group_indices_s3) == 0: continue
-            self.logger.info(f"  - 組合 {group_key_s3}: {count} 筆資料")
-            hr_cat, is_hol, s2_cat, s3_cat = group_key_s3
-            group_flows = flow_data_for_calc_s3[group_indices_s3]
-            mean_flow_flat = np.nanmean(group_flows, axis=0)
+        if hasattr(self, 's2_new_cond_category_for_target_np'): # S2 條件總是存在
+            group_by_cols.append('s2_cond_category')
+            grouping_data['s2_cond_category'] = self.s2_new_cond_category_for_target_np
+        
+        if self.current_stage_mode_enum.value >= ConditionMode.STAGE3.value and hasattr(self, 's3_new_cond_category_for_target_np'):
+            group_by_cols.append('s3_cond_category')
+            grouping_data['s3_cond_category'] = self.s3_new_cond_category_for_target_np
+        
+        if self.current_stage_mode_enum.value >= ConditionMode.STAGE4.value and hasattr(self, 's4_new_cond_category_for_target_np'):
+            group_by_cols.append('s4_cond_category')
+            grouping_data['s4_cond_category'] = self.s4_new_cond_category_for_target_np
+        
+        grouping_df = pd.DataFrame(grouping_data)
+        if grouping_df.empty:
+            self.logger.warning(f"{self.current_stage_name} 目標: Grouping DataFrame 為空。")
+            return {}
+            
+        grouped = grouping_df.groupby(group_by_cols, observed=False)
+        if not grouped.groups or all(idx.empty for idx in grouped.groups.values()):
+            self.logger.warning(f"{self.current_stage_name} 目標: 分組後 grouped.groups 為空或所有組都為空。")
+            return {}
+
+        self.logger.info(f"{self.current_stage_name} 目標: 各條件組合的資料筆數分佈如下 {tuple(group_by_cols)}: count")
+        for group_key, group_indices in grouped.indices.items():
+            count = len(group_indices)
+            if count == 0: continue
+            self.logger.info(f"  - 組合 {group_key}: {count} 筆資料")
+            mean_flow_flat = np.nanmean(flow_data[group_indices], axis=0)
             mean_flow_flat[np.isnan(mean_flow_flat)] = 0
-            avg_flows_s3[(hr_cat, int(is_hol), int(s2_cat), int(s3_cat))] = mean_flow_flat.reshape(self.H, self.W)
+            avg_flows_current_stage[group_key] = mean_flow_flat.reshape(self.H, self.W)
         
-        self.logger.info(f"Stage3Dataset (mode={self.mode}): 計算完成 {len(avg_flows_s3)} 個 Stage3 條件的目標平均流量圖。")
-        return avg_flows_s3
+        self.logger.info(f"計算完成 {len(avg_flows_current_stage)} 個 {self.current_stage_name} 條件的目標平均流量圖。")
+        return avg_flows_current_stage
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Condition 1 for S3 model: Stage2 model output (正規化)
-        s2_model_output_grid_sample_norm = self.s2_model_outputs_np[idx] # (1, D, H, W)
-        if s2_model_output_grid_sample_norm.shape[0] != 1: # 確保通道數為1
-            s2_model_output_grid_sample_norm = s2_model_output_grid_sample_norm[0:1, ...]
-        condition1_s3_tensor_norm = torch.from_numpy(s2_model_output_grid_sample_norm.astype(np.float32))
-
-        # Condition 2 for S3 model: Stage3 new feature grid (正規化)
-        original_s3_cond_value = self.s3_new_cond_original_values_np[idx]
-        current_s3_cond_std = self.norm_stats_s3_new_cond_feature['std']
-        if current_s3_cond_std < 1e-6: current_s3_cond_std = 1.0
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, ...]: # 返回元組的確切內容和長度將根據評估需求調整
+        # --- 1. 當前階段模型的目標 (正規化) ---
+        target_key_current_stage: Tuple
+        grouping_values_for_key = [
+            self.hour_category_for_target_grouping_np[idx],
+            self.is_holiday_for_target_np[idx]
+        ]
+        if hasattr(self, 's2_new_cond_category_for_target_np'):
+            grouping_values_for_key.append(self.s2_new_cond_category_for_target_np[idx])
+        if self.current_stage_mode_enum.value >= ConditionMode.STAGE3.value and hasattr(self, 's3_new_cond_category_for_target_np'):
+            grouping_values_for_key.append(self.s3_new_cond_category_for_target_np[idx])
+        if self.current_stage_mode_enum.value >= ConditionMode.STAGE4.value and hasattr(self, 's4_new_cond_category_for_target_np'):
+            grouping_values_for_key.append(self.s4_new_cond_category_for_target_np[idx])
         
-        normalized_s3_cond_value = (original_s3_cond_value - self.norm_stats_s3_new_cond_feature['mean']) / current_s3_cond_std \
-            if not np.isnan(original_s3_cond_value) else 0.0 # Handle NaN
+        target_key_current_stage = tuple(grouping_values_for_key)
         
-        condition2_s3_tensor_norm = torch.full(
-            (1, self.D, self.H, self.W), float(normalized_s3_cond_value), dtype=torch.float32
-        )
-
-        # Target for S3 model (正規化)
-        hr_cat_s3 = self.hour_category_for_target_grouping_np_s3[idx]
-        is_hol_s3 = self.is_holiday_for_target_np_s3[idx]
-        s2_cond_cat_s3 = self.s2_new_cond_category_for_target_np[idx] 
-        s3_cond_cat_s3 = self.s3_new_cond_category_for_target_np[idx] 
-        target_key_s3 = (hr_cat_s3, is_hol_s3, s2_cond_cat_s3, s3_cond_cat_s3)
-        
-        target_avg_flow_s3_np = self.average_flow_map_dict_s3.get(target_key_s3, np.zeros((self.H, self.W), dtype=np.float32))
-        
-        target_mean_to_use_for_norm = self.norm_stats_stage3_target['mean']
-        target_std_to_use_for_norm = self.norm_stats_stage3_target['std']
-        if target_std_to_use_for_norm < 1e-6: target_std_to_use_for_norm =  1.0
-        norm_target_s3_np = (target_avg_flow_s3_np - target_mean_to_use_for_norm) / target_std_to_use_for_norm
-        target_s3_tensor_norm = torch.from_numpy(norm_target_s3_np).float().reshape(
+        target_avg_flow_np = self.average_flow_map_dict_current_stage.get(target_key_current_stage, 
+                                                                          np.zeros((self.H, self.W), dtype=np.float32))
+        target_mean_norm = self.norm_stats_current_stage_target['mean']
+        target_std_norm = self.norm_stats_current_stage_target['std']
+        if target_std_norm < 1e-6: target_std_norm = 1.0
+        norm_target_current_stage_np = (target_avg_flow_np - target_mean_norm) / target_std_norm
+        target_current_stage_tensor_norm = torch.from_numpy(norm_target_current_stage_np).float().reshape(
             self.image_channels_target, self.D, self.H, self.W
         )
 
-        # --- 額外資訊，用於評估 Basemodel 和 Stage2 模型 ---
-        original_hour_scalar_tensor = torch.tensor(self.hours_for_target_np_s3[idx], dtype=torch.long)
-        original_is_holiday_scalar_tensor = torch.tensor(is_hol_s3, dtype=torch.long) # is_hol_s3 is already int
-
-        # Basemodel output grid (正規化) - Cond1 for Stage2 model (when evaluating S2 on S3 targets)
-        bm_output_grid_sample_norm = self.basemodel_outputs_np[idx] # (1,D,H,W)
-        if bm_output_grid_sample_norm.shape[0] != 1:
-             bm_output_grid_sample_norm = bm_output_grid_sample_norm[0:1, ...]
-        bm_output_grid_for_s2eval_tensor_norm = torch.from_numpy(bm_output_grid_sample_norm.astype(np.float32))
+        # --- 2. 當前階段模型的條件1 (前一階段輸出, 正規化) ---
+        condition1_current_stage_tensor_norm: torch.Tensor
+        if self.current_stage_mode_enum == ConditionMode.STAGE2:
+            if self.basemodel_outputs_np is None: raise ValueError("Dataset in STAGE2 mode requires basemodel_outputs_np.")
+            prev_out_sample = self.basemodel_outputs_np[idx]
+        elif self.current_stage_mode_enum == ConditionMode.STAGE3:
+            if self.s2_model_outputs_np_for_s3_cond is None: raise ValueError("Dataset in STAGE3 mode requires s2_model_outputs_np_for_s3_cond.")
+            prev_out_sample = self.s2_model_outputs_np_for_s3_cond[idx]
+        elif self.current_stage_mode_enum == ConditionMode.STAGE4:
+            if self.s3_model_outputs_np_for_s4_cond is None: raise ValueError("Dataset in STAGE4 mode requires s3_model_outputs_np_for_s4_cond.")
+            prev_out_sample = self.s3_model_outputs_np_for_s4_cond[idx]
+        else: # Should not happen if called for STAGE2+
+            raise ValueError(f"Invalid current_stage_mode ({self.current_stage_name}) for determining condition1.")
         
-        # Stage2 new feature grid (正規化) - Cond2 for Stage2 model (when evaluating S2 on S3 targets)
-        original_s2_cond_value = self.s2_new_cond_original_values_np[idx] 
-        current_s2_cond_std_for_s2eval = self.norm_stats_s2_new_cond_feature['std']
-        if current_s2_cond_std_for_s2eval < 1e-6: current_s2_cond_std_for_s2eval = 1.0
-        normalized_s2_cond_value_for_s2eval = (original_s2_cond_value - self.norm_stats_s2_new_cond_feature['mean']) / current_s2_cond_std_for_s2eval \
-            if not np.isnan(original_s2_cond_value) else 0.0
-        s2_new_feature_grid_for_s2eval_tensor_norm = torch.full(
-            (1, self.D, self.H, self.W), float(normalized_s2_cond_value_for_s2eval), dtype=torch.float32
+        if prev_out_sample.shape[0] != 1: prev_out_sample = prev_out_sample[0:1, ...] # Ensure C=1
+        condition1_current_stage_tensor_norm = torch.from_numpy(prev_out_sample.astype(np.float32))
+
+        # --- 3. 當前階段模型的條件2 (當前階段新特徵, 正規化) ---
+        original_current_stage_cond_value = self.current_stage_new_cond_original_values_np[idx]
+        current_stage_cond_mean = self.norm_stats_current_stage_new_cond_feature['mean']
+        current_stage_cond_std = self.norm_stats_current_stage_new_cond_feature['std']
+        if current_stage_cond_std < 1e-6: current_stage_cond_std = 1.0
+        normalized_current_stage_cond_value = (original_current_stage_cond_value - current_stage_cond_mean) / current_stage_cond_std \
+            if not np.isnan(original_current_stage_cond_value) else 0.0
+        condition2_current_stage_tensor_norm = torch.full(
+            (1, self.D, self.H, self.W), float(normalized_current_stage_cond_value), dtype=torch.float32
         )
+
+        # --- 4. 輔助數據，用於評估 Basemodel ---
+        original_hour_scalar = torch.tensor(self.hours_for_target_np[idx], dtype=torch.long)
+        original_is_holiday_scalar = torch.tensor(self.is_holiday_for_target_np[idx], dtype=torch.long)
+
+        # --- 5. 輔助數據，用於評估 Stage2 模型 (BM輸出 + S2新特徵) ---
+        bm_output_grid_for_s2eval = torch.empty(0) # Placeholder
+        if self.basemodel_outputs_np is not None:
+            bm_out_s = self.basemodel_outputs_np[idx]
+            if bm_out_s.shape[0] != 1: bm_out_s = bm_out_s[0:1, ...]
+            bm_output_grid_for_s2eval = torch.from_numpy(bm_out_s.astype(np.float32))
         
-        s2_original_feature_scalar_tensor = torch.tensor(original_s2_cond_value if not np.isnan(original_s2_cond_value) else 0.0, dtype=torch.float32)
-        s3_original_feature_scalar_tensor = torch.tensor(original_s3_cond_value if not np.isnan(original_s3_cond_value) else 0.0, dtype=torch.float32)
+        s2_new_feat_grid_for_s2eval = torch.empty(0)
+        s2_original_feature_scalar = torch.empty(0)
+        if hasattr(self, 's2_new_cond_original_values_np') and hasattr(self, 'norm_stats_s2_new_cond_feature'):
+            orig_s2_val_eval = self.s2_new_cond_original_values_np[idx]
+            s2_original_feature_scalar = torch.tensor(orig_s2_val_eval if not np.isnan(orig_s2_val_eval) else 0.0, dtype=torch.float32)
+            s2_mean = self.norm_stats_s2_new_cond_feature['mean']
+            s2_std = self.norm_stats_s2_new_cond_feature['std']
+            if s2_std < 1e-6: s2_std = 1.0
+            norm_s2_val_eval = (orig_s2_val_eval - s2_mean) / s2_std if not np.isnan(orig_s2_val_eval) else 0.0
+            s2_new_feat_grid_for_s2eval = torch.full((1, self.D, self.H, self.W), float(norm_s2_val_eval), dtype=torch.float32)
 
-        return (target_s3_tensor_norm,                      # 0: S3 目標 (正規化)
-                condition1_s3_tensor_norm,                # 1: S2 輸出網格 (正規化) - S3 條件1
-                condition2_s3_tensor_norm,                # 2: S3 新特徵網格 (正規化) - S3 條件2
-                original_hour_scalar_tensor,              # 3: 原始小時純量 (BM 條件)
-                original_is_holiday_scalar_tensor,        # 4: 原始假日純量 (BM 條件)
-                bm_output_grid_for_s2eval_tensor_norm,    # 5: BM 輸出網格 (正規化) - S2 條件1 (用於評估S2)
-                s2_new_feature_grid_for_s2eval_tensor_norm, # 6: S2 新特徵網格 (正規化) - S2 條件2 (用於評估S2)
-                s2_original_feature_scalar_tensor,        # 7: S2 原始特徵純量
-                s3_original_feature_scalar_tensor         # 8: S3 原始特徵純量
-               )
+        # --- 6. 輔助數據，用於評估 Stage3 模型 (S2輸出 + S3新特徵) ---
+        s2_output_grid_for_s3eval = torch.empty(0)
+        if self.s2_model_outputs_np_for_s3_cond is not None: # This is prev_stage_output if current_stage=S3
+            s2_out_s = self.s2_model_outputs_np_for_s3_cond[idx]
+            if s2_out_s.shape[0] != 1: s2_out_s = s2_out_s[0:1, ...]
+            s2_output_grid_for_s3eval = torch.from_numpy(s2_out_s.astype(np.float32))
 
+        s3_new_feat_grid_for_s3eval = torch.empty(0)
+        s3_original_feature_scalar = torch.empty(0)
+        if hasattr(self, 's3_new_cond_original_values_np') and hasattr(self, 'norm_stats_s3_new_cond_feature'):
+            orig_s3_val_eval = self.s3_new_cond_original_values_np[idx]
+            s3_original_feature_scalar = torch.tensor(orig_s3_val_eval if not np.isnan(orig_s3_val_eval) else 0.0, dtype=torch.float32)
+            s3_mean = self.norm_stats_s3_new_cond_feature['mean']
+            s3_std = self.norm_stats_s3_new_cond_feature['std']
+            if s3_std < 1e-6: s3_std = 1.0
+            norm_s3_val_eval = (orig_s3_val_eval - s3_mean) / s3_std if not np.isnan(orig_s3_val_eval) else 0.0
+            s3_new_feat_grid_for_s3eval = torch.full((1, self.D, self.H, self.W), float(norm_s3_val_eval), dtype=torch.float32)
+
+        # --- 7. 輔助數據，用於評估 Stage4 模型 (S3輸出 + S4新特徵) ---
+        # 這些只有在 current_stage_mode == STAGE4 時才有意義，且 S4 的條件已經是 condition1/2_current_stage
+        s4_original_feature_scalar = torch.empty(0)
+        if hasattr(self, 's4_new_cond_original_values_np'): # 檢查是否存在，避免在S2/S3時報錯
+             orig_s4_val_eval = self.s4_new_cond_original_values_np[idx]
+             s4_original_feature_scalar = torch.tensor(orig_s4_val_eval if not np.isnan(orig_s4_val_eval) else 0.0, dtype=torch.float32)
+
+
+        return (
+            target_current_stage_tensor_norm,           # 0: 當前階段目標 (正規化)
+            condition1_current_stage_tensor_norm,       # 1: 當前階段條件1 (前一階段輸出, 正規化)
+            condition2_current_stage_tensor_norm,       # 2: 當前階段條件2 (當前階段新特徵, 正規化)
+            
+            original_hour_scalar,                       # 3: 原始小時 (BM條件)
+            original_is_holiday_scalar,                 # 4: 原始假日 (BM條件)
+            
+            bm_output_grid_for_s2eval,                  # 5: BM輸出網格 (S2條件1, 用於評估S2)
+            s2_new_feat_grid_for_s2eval,                # 6: S2新特徵網格 (S2條件2, 用於評估S2)
+            
+            s2_output_grid_for_s3eval,                  # 7: S2輸出網格 (S3條件1, 用於評估S3)
+            s3_new_feat_grid_for_s3eval,                # 8: S3新特徵網格 (S3條件2, 用於評估S3)
+
+            s2_original_feature_scalar,                 # 9: S2 原始特徵純量
+            s3_original_feature_scalar,                 # 10: S3 原始特徵純量
+            s4_original_feature_scalar                  # 11: S4 原始特徵純量 (如果適用)
+        )
 # FID 函數 (get_activations, calculate_frechet_distance, calculate_fid)
 def get_activations(images: torch.Tensor, model: nn.Module, device: str, batch_size_fid: int = 32) -> np.ndarray:
     """使用 Inception 模型提取影像特徵。"""
@@ -2089,47 +2190,68 @@ if __name__ == '__main__':
         logger.info(f"Stage3 訓練數據子集基於直接讀取的 '時' 轉換後的小時類別分佈 (0 代表 <=8點, 1 代表 >8點): \n{pd.Series(s3_train_hour_categories_check).value_counts().sort_index()}")
     else:
         logger.error("Stage3 訓練數據子集中找不到 '時' 欄位!")
-        
-    train_dataset_s3 = Stage3Dataset(
-        df_for_stage3_processing=df_for_stage3_processing.iloc[s3_train_indices],
-        basemodel_outputs_for_s2_eval_np=all_bm_outputs_s2_np_cond_normalized[s3_train_indices],
-        stage2_model_outputs_for_s3_cond_np=all_s2_outputs_s3_np_cond_normalized[s3_train_indices],
+    logger.info("創建 Stage3 測試數據集 (MultiStageDataset)...")   
+    train_dataset_s3 = MultiStageDataset(
+        df_for_processing=df_for_stage3_processing.iloc[s3_train_indices],
         config=CONFIG,
         original_sorted_flow_columns=basemodel_sorted_flow_cols_source,
+        current_stage_mode=ConditionMode.STAGE3, 
         mode='train',
-        s2_new_cond_feature_norm_stats_from_s2_train=s2_new_cond_stats_for_s3_dataset
+        # 前續階段的輸出:
+        basemodel_outputs_np=all_bm_outputs_s2_np_cond_normalized[s3_train_indices], # Basemodel 的輸出 (用於評估S2和BM)
+        s2_model_outputs_np=all_s2_outputs_s3_np_cond_normalized[s3_train_indices],  # Stage2 的輸出 (用於S3的條件1)
+        # 前續階段新特徵的正規化統計量 (從檢查點來):
+        s2_new_cond_feature_norm_stats_from_chkpt=s2_new_cond_stats_for_s3_dataset, # Stage2新特徵的統計量
     )
     train_loader_s3_final = DataLoader(train_dataset_s3, batch_size=CONFIG["batch_size"], shuffle=True, num_workers=CONFIG["num_workers"], pin_memory=True)
     logger.info(f"Stage3 訓練數據集創建，含 {len(train_dataset_s3)} 樣本。")
 
     if len(s3_val_indices) > 0:
-        val_dataset_s3 = Stage3Dataset(
-            df_for_stage3_processing=df_for_stage3_processing.iloc[s3_val_indices],
-            basemodel_outputs_for_s2_eval_np=all_bm_outputs_s2_np_cond_normalized[s3_val_indices],
-            stage2_model_outputs_for_s3_cond_np=all_s2_outputs_s3_np_cond_normalized[s3_val_indices],
+        logger.info("創建 Stage3 驗證數據集 (MultiStageDataset)...")
+        val_dataset_s3 = MultiStageDataset(
+            df_for_processing=df_for_stage3_processing.iloc[s3_val_indices],
             config=CONFIG,
             original_sorted_flow_columns=basemodel_sorted_flow_cols_source,
+            current_stage_mode=ConditionMode.STAGE3, # << 指定當前是為 Stage3 準備數據
             mode='val',
-            s2_new_cond_feature_norm_stats_from_s2_train=s2_new_cond_stats_for_s3_dataset,
-            s3_new_cond_feature_norm_stats_from_train=train_dataset_s3.norm_stats_s3_new_cond_feature,
-            stage3_avg_flow_map_dict_from_train=train_dataset_s3.average_flow_map_dict_s3,
-            stage3_target_norm_stats_from_train=train_dataset_s3.norm_stats_stage3_target
+
+            # 前續階段的輸出:
+            basemodel_outputs_np=all_bm_outputs_s2_np_cond_normalized[s3_val_indices],
+            s2_model_outputs_np=all_s2_outputs_s3_np_cond_normalized[s3_val_indices],
+            s3_model_outputs_np=None, # Stage3是當前階段，還沒有其輸出用於更高階
+
+            # 前續階段新特徵的正規化統計量 (從檢查點來):
+            s2_new_cond_feature_norm_stats_from_chkpt=s2_new_cond_stats_for_s3_dataset, # Stage2新特徵的統計量
+            s3_new_cond_feature_norm_stats_from_s3_chkpt=None, # Stage3是當前階段，其統計量從 train_dataset_s3 獲取
+
+            # 當前階段 (Stage3) 在 mode='val' 時，從 train_dataset_s3 獲取其訓練時計算的統計數據
+            current_stage_new_cond_feature_norm_stats_from_train=train_dataset_s3.norm_stats_s3_new_cond_feature, # 應為 train_dataset_s3 計算的 S3 新特徵統計
+            current_stage_avg_flow_map_dict_from_train=train_dataset_s3.average_flow_map_dict_s3,         # 應為 train_dataset_s3 計算的 S3 目標平均圖
+            current_stage_target_norm_stats_from_train=train_dataset_s3.norm_stats_stage3_target             # 應為 train_dataset_s3 計算的 S3 目標統計
         )
         val_loader_s3_final = DataLoader(val_dataset_s3, batch_size=CONFIG["eval_batch_size"], shuffle=False, num_workers=CONFIG["num_workers"], pin_memory=True)
         logger.info(f"Stage3 驗證數據集創建，含 {len(val_dataset_s3)} 樣本。")
 
     if len(s3_test_indices) > 0:
-        test_dataset_s3 = Stage3Dataset(
-            df_for_stage3_processing=df_for_stage3_processing.iloc[s3_test_indices],
-            basemodel_outputs_for_s2_eval_np=all_bm_outputs_s2_np_cond_normalized[s3_test_indices],
-            stage2_model_outputs_for_s3_cond_np=all_s2_outputs_s3_np_cond_normalized[s3_test_indices],
+        logger.info("創建 Stage3 測試數據集 (MultiStageDataset)...")
+        test_dataset_s3 = MultiStageDataset(
+            df_for_processing=df_for_stage3_processing.iloc[s3_test_indices],
             config=CONFIG,
             original_sorted_flow_columns=basemodel_sorted_flow_cols_source,
+            current_stage_mode=ConditionMode.STAGE3, # << 指定當前是為 Stage3 準備數據
             mode='test',
-            s2_new_cond_feature_norm_stats_from_s2_train=s2_new_cond_stats_for_s3_dataset,
-            s3_new_cond_feature_norm_stats_from_train=train_dataset_s3.norm_stats_s3_new_cond_feature,
-            stage3_avg_flow_map_dict_from_train=train_dataset_s3.average_flow_map_dict_s3,
-            stage3_target_norm_stats_from_train=train_dataset_s3.norm_stats_stage3_target
+
+            basemodel_outputs_np=all_bm_outputs_s2_np_cond_normalized[s3_test_indices],
+            s2_model_outputs_np=all_s2_outputs_s3_np_cond_normalized[s3_test_indices],
+            s3_model_outputs_np=None,
+
+            s2_new_cond_feature_norm_stats_from_chkpt=s2_new_cond_stats_for_s3_dataset,
+            s3_new_cond_feature_norm_stats_from_s3_chkpt=None,
+            
+            # 從 train_dataset_s3 (即 MultiStageDataset 的訓練實例) 獲取當前階段 (Stage3) 的統計數據
+            current_stage_new_cond_feature_norm_stats_from_train=train_dataset_s3.norm_stats_s3_new_cond_feature, 
+            current_stage_avg_flow_map_dict_from_train=train_dataset_s3.average_flow_map_dict_s3,
+            current_stage_target_norm_stats_from_train=train_dataset_s3.norm_stats_stage3_target
         )
         test_loader_s3_final = DataLoader(test_dataset_s3, batch_size=CONFIG["eval_batch_size"], shuffle=False, num_workers=CONFIG["num_workers"], pin_memory=True)
         logger.info(f"Stage3 測試數據集創建，含 {len(test_dataset_s3)} 樣本。")

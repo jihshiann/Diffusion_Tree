@@ -140,6 +140,8 @@ X_train_tree = X_train.rename(columns=feature_mapping)
 X_test_tree = X_test.rename(columns=feature_mapping)
 
 cat_features = ['Holiday']
+# 將 feature_names_english 的定義移到此處，確保在後續的規則統計和分群邏輯中可用
+feature_names_english = list(X_train_tree.columns) 
 
 # 解析座標字串函式
 def parse_coord_string(coord_str):
@@ -210,6 +212,37 @@ def get_decision_path(tree_structure, max_depth=3):
     traverse(tree_structure, [], 1)
     # 返回第一條路徑（或可根據需求選擇其他路徑）
     return paths[0] if paths else []
+
+# 將 format_rule_to_string 函數定義移到此處
+# 輔助函數：將規則元組轉換為人類可讀的字串
+def format_rule_to_string(rule_tuple, feature_names_eng_list, reverse_mapping_dict, cat_features_eng_list):
+    if rule_tuple is None:
+        return "N/A"
+    try:
+        feat_idx, threshold_val = rule_tuple
+        if feat_idx >= len(feature_names_eng_list):
+            return f"錯誤索引({feat_idx})"
+        
+        feature_name_eng = feature_names_eng_list[feat_idx]
+        feature_name_chi = reverse_mapping_dict.get(feature_name_eng, feature_name_eng)
+
+        operator_str = ""
+        processed_threshold_str = ""
+
+        if feature_name_eng in cat_features_eng_list:
+            operator_str = "=="
+            # LightGBM dump_model 對於類別特徵的閾值可能是 'valueA||valueB' 格式
+            processed_threshold_str = str(threshold_val)
+        else: # 數值特徵
+            operator_str = "<="
+            try:
+                processed_threshold_str = f"{float(threshold_val):.1f}"
+            except (ValueError, TypeError):
+                processed_threshold_str = str(threshold_val) # 若轉換失敗，保留原始
+        return f"{feature_name_chi} {operator_str} {processed_threshold_str}"
+    except Exception as e:
+        # print(f"格式化規則時出錯: {rule_tuple}, 錯誤: {e}")
+        return "格式化錯誤"
 
 # ---------------------------
 # 主循環：對每個 target 訓練模型、提取規則
@@ -595,7 +628,193 @@ with open(rules_file_path, 'w', encoding='utf-8') as f:
         feature_name = X_train_expanded.columns[feature_idx]
         f.write(f"Feature: {feature_name}, Threshold: {threshold}\n")
 print(f"最佳決策樹規則已儲存至: {rules_file_path}")
+
 # ------------------------
+# 新增：規則得分統計邏輯開始
+
+# 輔助函數：從樹結構中提取所有分裂節點，按增益排序
+def extract_all_split_nodes_sorted(tree_structure, feature_names_eng_list_param, cat_features_eng_list_param): # 參數名稱已修改以區分
+    """
+    從樹結構中提取所有有效的分裂節點資訊，並按 split_gain 降序排序。
+    返回列表，每個元素為 {'rule': (特徵索引, 閾值), 'gain': gain}
+    """
+    nodes_info = []
+    q = deque()
+    if tree_structure:
+        q.append(tree_structure)
+
+    while q:
+        node = q.popleft()
+        if node and "split_feature" in node and node.get("split_gain", 0) > 0:
+            feat_idx = node["split_feature"]
+            threshold = node["threshold"]
+            gain = node["split_gain"]
+            
+            # 使用傳入的參數 feature_names_eng_list_param
+            if feat_idx >= len(feature_names_eng_list_param):
+                # print(f"警告: 特徵索引 {feat_idx} 在提取規則時超出範圍。")
+                continue
+            
+            nodes_info.append({
+                'rule': (feat_idx, threshold), 
+                'gain': gain
+            })
+
+            if "left_child" in node and node["left_child"]:
+                q.append(node["left_child"])
+            if "right_child" in node and node["right_child"]:
+                q.append(node["right_child"])
+                
+    nodes_info.sort(key=lambda x: x['gain'], reverse=True)
+    return nodes_info
+
+# 全域列表，用於收集所有目標點的原始評分規則
+all_scored_rules_raw = []
+# feature_names_english 已在前面定義 (全域)
+# cat_features 已在前面定義 (全域)
+
+print("開始為每個目標點的規則進行評分...")
+for target in target_columns:
+    if target not in target_models or target_best_tree_index.get(target) is None:
+        # print(f"目標 {target} 沒有模型或最佳樹索引，跳過規則評分。")
+        continue
+
+    model_dump = target_models[target].dump_model()
+    best_tree_idx = target_best_tree_index[target]
+
+    if not model_dump["tree_info"] or best_tree_idx >= len(model_dump["tree_info"]):
+        # print(f"目標 {target} 的樹信息不足，跳過規則評分。")
+        continue
+    
+    best_tree_structure = model_dump["tree_info"][best_tree_idx]["tree_structure"]
+    
+    # 提取該目標最佳樹的所有分裂節點，按增益排序
+    # 此處調用時傳遞全域的 feature_names_english 和 cat_features
+    sorted_split_nodes = extract_all_split_nodes_sorted(best_tree_structure, 
+                                                        feature_names_english, 
+                                                        cat_features) 
+    # 為前5條規則評分
+    for rank, node_info in enumerate(sorted_split_nodes[:5], start=1):
+        rule_tuple = node_info['rule']
+        gain_value = node_info['gain']
+        
+        feat_idx, thresh_val = rule_tuple
+        
+        # 使用傳入的參數 feature_names_eng_list_param
+        if feat_idx >= len(feature_names_english): 
+            continue
+        
+        feature_name = feature_names_english[feat_idx]
+        is_categorical = feature_name in cat_features
+        
+        # 建立規則字典
+        rule_dict = {
+            'target': target,
+            'rule_tuple': rule_tuple,
+            'score': gain_value,
+            'rank': rank,
+            'is_categorical': is_categorical
+        }
+        all_scored_rules_raw.append(rule_dict)
+
+# 檢查是否有有效的規則被提取
+if not all_scored_rules_raw:
+    print("警告: 沒有有效的規則被提取。請檢查模型和樹的結構。")
+else:
+    print(f"成功提取 {len(all_scored_rules_raw)} 條規則。")
+
+# 輔助函數：合併相似的評分規則並匯總統計
+def generate_merged_rule_score_statistics(scored_rules_raw_list, 
+                                          feature_names_eng_list_param, # 參數名稱已修改以區分
+                                          cat_features_eng_list_param,  # 參數名稱已修改以區分
+                                          threshold_similarity_dist):
+    merged_stats = {}  # Key: representative_rule_tuple, Value: {'score': sum_score, 'targets': set_of_targets}
+    representative_rules_tuples_list = [] 
+
+    for scored_item in scored_rules_raw_list:
+        current_rule_tuple = scored_item['rule_tuple']
+        current_score = scored_item['score']
+        current_target = scored_item['target']
+        
+        feat_idx, thresh_val = current_rule_tuple
+        
+        # 使用傳入的參數 feature_names_eng_list_param
+        if feat_idx >= len(feature_names_eng_list_param):
+            # print(f"警告: 無效的特徵索引 {feat_idx} (規則: {current_rule_tuple}, 目標: {current_target})。跳過此規則的合併統計。")
+            continue
+            
+        current_feature_name = feature_names_eng_list_param[feat_idx]
+        is_current_categorical = current_feature_name in cat_features_eng_list_param # 使用傳入的參數
+
+        matched_representative_tuple = None
+        for rep_rule_tuple in representative_rules_tuples_list:
+            rep_feat_idx, rep_thresh_val = rep_rule_tuple
+            
+            # 使用傳入的參數 feature_names_eng_list_param
+            if rep_feat_idx >= len(feature_names_eng_list_param): 
+                continue
+            rep_feature_name = feature_names_eng_list_param[rep_feat_idx]
+            is_rep_categorical = rep_feature_name in cat_features_eng_list_param # 使用傳入的參數
+
+            if feat_idx == rep_feat_idx: 
+                if is_current_categorical and is_rep_categorical:
+                    # 類別特徵，直接比較字串
+                    if str(thresh_val) == str(rep_thresh_val):
+                        matched_representative_tuple = rep_rule_tuple
+                        break
+                else:
+                    # 數值特徵，比較距離
+                    if abs(thresh_val - rep_thresh_val) <= threshold_similarity_dist:
+                        matched_representative_tuple = rep_rule_tuple
+                        break
+        
+        if matched_representative_tuple is not None:
+            # 如果找到匹配的代表規則，則更新統計
+            if matched_representative_tuple in merged_stats:
+                merged_stats[matched_representative_tuple]['score'] += current_score
+                merged_stats[matched_representative_tuple]['targets'].add(current_target)
+            else:
+                merged_stats[matched_representative_tuple] = {'score': current_score, 'targets': {current_target}}
+        else:
+            # 否則，將當前規則作為新的代表規則
+            representative_rules_tuples_list.append(current_rule_tuple)
+            merged_stats[current_rule_tuple] = {'score': current_score, 'targets': {current_target}}
+
+    return merged_stats
+
+# 執行合併與統計
+# threshold_dist_for_scoring = 1.5 # 與分群邏輯中的閾值保持一致或獨立設定
+# 此處調用時傳遞全域的 feature_names_english 和 cat_features
+merged_rule_scores = generate_merged_rule_score_statistics(all_scored_rules_raw,
+                                                           feature_names_english,
+                                                           cat_features, 
+                                                           1.5)
+
+# 準備輸出到 Excel
+output_scored_rules_data = []
+for rule_tuple, stats in merged_rule_scores.items():
+    # 此處調用 format_rule_to_string 時傳遞全域的 feature_names_english 和 cat_features
+    rule_str = format_rule_to_string(rule_tuple, feature_names_english, reverse_mapping, cat_features)
+    targets_str = ", ".join(sorted(list(stats['targets'])))
+    output_scored_rules_data.append({
+        '規則': rule_str,
+        '總分': stats['score'],
+        '目標數量': len(stats['targets']),
+        '目標清單': targets_str
+    })
+
+output_scored_rules_df = pd.DataFrame(output_scored_rules_data)
+scored_rules_csv_path = os.path.join(shared_result_dir, "merged_rule_scores.csv")
+scored_rules_excel_path = os.path.join(shared_result_dir, "merged_rule_scores.xlsx")
+
+output_scored_rules_df.to_csv(scored_rules_csv_path, index=False, encoding='utf-8-sig')
+print(f"規則得分統計結果已儲存至 CSV: {scored_rules_csv_path}")
+try:
+    output_scored_rules_df.to_excel(scored_rules_excel_path, index=False, engine='openpyxl')
+    print(f"規則得分統計結果已儲存至 Excel: {scored_rules_excel_path}")
+except ImportError:
+    print("警告: 未安裝 'openpyxl'。Excel 檔案未儲存。請執行 'pip install openpyxl'")
+
 # 新分群邏輯開始
 
 # 輔助函數：從節點字典中提取規則 (特徵索引, 閾值), 增益及節點本身
@@ -798,7 +1017,6 @@ processing_groups = [(initial_targets, {})]
 final_eight_groups_details = []
 
 rule_keys_for_splitting = ['r1_root', 'r2_d2top', 'r3_d2second'] # Updated keys
-feature_names_english = list(X_train_tree.columns) # 用於 merge_individual_rules_and_count
 print("開始分層分群...")
 for i, rule_key_base in enumerate(rule_keys_for_splitting): # Use rule_key_base
     print(f"  處理分群層級: {rule_key_base} (第 {i+1} 層)")
@@ -858,35 +1076,6 @@ for i, rule_key_base in enumerate(rule_keys_for_splitting): # Use rule_key_base
 
 final_eight_groups_details = processing_groups
 print(f"分群完成，共形成 {len(final_eight_groups_details)} 個最終群組。")
-# 輔助函數：將規則元組轉換為人類可讀的字串
-def format_rule_to_string(rule_tuple, feature_names_eng_list, reverse_mapping_dict, cat_features_eng_list):
-    if rule_tuple is None:
-        return "N/A"
-    try:
-        feat_idx, threshold_val = rule_tuple
-        if feat_idx >= len(feature_names_eng_list):
-            return f"錯誤索引({feat_idx})"
-        
-        feature_name_eng = feature_names_eng_list[feat_idx]
-        feature_name_chi = reverse_mapping_dict.get(feature_name_eng, feature_name_eng)
-        
-        operator_str = ""
-        processed_threshold_str = ""
-
-        if feature_name_eng in cat_features_eng_list:
-            operator_str = "=="
-            # LightGBM dump_model 對於類別特徵的閾值可能是 'valueA||valueB' 格式
-            processed_threshold_str = str(threshold_val)
-        else: # 數值特徵
-            operator_str = "<="
-            try:
-                processed_threshold_str = f"{float(threshold_val):.1f}"
-            except (ValueError, TypeError):
-                processed_threshold_str = str(threshold_val) # 若轉換失敗，保留原始
-        return f"{feature_name_chi} {operator_str} {processed_threshold_str}"
-    except Exception as e:
-        # print(f"格式化規則時出錯: {rule_tuple}, 錯誤: {e}")
-        return "格式化錯誤"
 
 # 整理並匯出分群結果
 output_data = []
@@ -1050,4 +1239,3 @@ plt.close()
 print(f"階層式分群地理分佈圖已儲存至: {grouping_plot_path}")
 
 print("所有處理完成。")
-

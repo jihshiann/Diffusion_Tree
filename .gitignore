@@ -399,3 +399,6 @@ FodyWeavers.xsd
 /results_ddpm_stage3/Stage3_HourLe20
 /results_ddpm_stage3/Stage3_WeekdayLe3
 /results_ddpm_stage4/stage4_HourLe20
+/results_ddpm_stage4/model_outputs_cache
+/results_ddpm_stage4/stage4_ArenaEventDays_CombinedDateCond
+/results_ddpm_stage4/stage4_Month4_DayLe7

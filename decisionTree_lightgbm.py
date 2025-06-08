@@ -673,6 +673,9 @@ all_scored_rules_raw = []
 # feature_names_english 已在前面定義 (全域)
 # cat_features 已在前面定義 (全域)
 
+MAX_RANK_SCORE_VALUE = 5 # 最高排名得分值 (例如5分給第一名)
+NUM_RULES_TO_SCORE = 5   # 為每個目標點評分的前N條規則
+
 print("開始為每個目標點的規則進行評分...")
 for target in target_columns:
     if target not in target_models or target_best_tree_index.get(target) is None:
@@ -687,33 +690,38 @@ for target in target_columns:
         continue
     
     best_tree_structure = model_dump["tree_info"][best_tree_idx]["tree_structure"]
-    
-    # 提取該目標最佳樹的所有分裂節點，按增益排序
-    # 此處調用時傳遞全域的 feature_names_english 和 cat_features
+    # sorted_split_nodes 包含此目標點最佳樹中所有分裂節點，按 split_gain 降序排序
+    # 每個元素是 {'rule': (特徵索引, 閾值), 'gain': gain}
     sorted_split_nodes = extract_all_split_nodes_sorted(best_tree_structure, 
                                                         feature_names_english, 
                                                         cat_features) 
-    # 為前5條規則評分
-    for rank, node_info in enumerate(sorted_split_nodes[:5], start=1):
+    
+    # 只考慮此目標點貢獻最大的前 NUM_RULES_TO_SCORE 條規則
+    for rank, node_info in enumerate(sorted_split_nodes[:NUM_RULES_TO_SCORE], start=1):
         rule_tuple = node_info['rule']
-        gain_value = node_info['gain']
+        original_gain_value = node_info['gain'] # 原始 split_gain
         
         feat_idx, thresh_val = rule_tuple
         
-        # 使用傳入的參數 feature_names_eng_list_param
         if feat_idx >= len(feature_names_english): 
+            # print(f"警告: 特徵索引 {feat_idx} 在評分時超出範圍 (目標: {target}, 規則: {rule_tuple})。")
             continue
         
         feature_name = feature_names_english[feat_idx]
         is_categorical = feature_name in cat_features
         
-        # 建立規則字典
+        # 步驟1: 初步評分 - 計算排名得分
+        # rank 1 (split_gain最高) -> MAX_RANK_SCORE_VALUE 分
+        # rank 2 -> MAX_RANK_SCORE_VALUE - 1 分, ..., rank N -> 1 分
+        rank_based_score = MAX_RANK_SCORE_VALUE - rank + 1
+        
         rule_dict = {
             'target': target,
             'rule_tuple': rule_tuple,
-            'score': gain_value,
+            'score': rank_based_score, # 此處的 'score' 是基於排名的初步分數
             'rank': rank,
-            'is_categorical': is_categorical
+            'is_categorical': is_categorical,
+            'original_gain': original_gain_value # 保留原始gain以供參考
         }
         all_scored_rules_raw.append(rule_dict)
 
@@ -728,24 +736,27 @@ def generate_merged_rule_score_statistics(scored_rules_raw_list,
                                           feature_names_eng_list_param, # 參數名稱已修改以區分
                                           cat_features_eng_list_param,  # 參數名稱已修改以區分
                                           threshold_similarity_dist):
+    # merged_stats 的結構:
+    # Key: 代表性規則元組 (feat_idx, thresh_val)
+    # Value: {'score': 累計總分數, 'targets': set(貢獻分數的目標點名稱)}
     merged_stats = {}  # Key: representative_rule_tuple, Value: {'score': sum_score, 'targets': set_of_targets}
-    representative_rules_tuples_list = [] 
+    representative_rules_tuples_list = [] # 用於存儲已經確立的代表性規則元組，方便快速查找
 
     for scored_item in scored_rules_raw_list:
         current_rule_tuple = scored_item['rule_tuple']
-        current_score = scored_item['score']
+        current_score = scored_item['score'] # 這是來自 all_scored_rules_raw 的 rank_based_score
         current_target = scored_item['target']
         
         feat_idx, thresh_val = current_rule_tuple
         
         # 使用傳入的參數 feature_names_eng_list_param
         if feat_idx >= len(feature_names_eng_list_param):
-            # print(f"警告: 無效的特徵索引 {feat_idx} (規則: {current_rule_tuple}, 目標: {current_target})。跳過此規則的合併統計。")
+            # print(f"警告: 特徵索引 {feat_idx} 在評分時超出範圍 (目標: {target}, 規則: {rule_tuple})。")
             continue
-            
-        current_feature_name = feature_names_eng_list_param[feat_idx]
-        is_current_categorical = current_feature_name in cat_features_eng_list_param # 使用傳入的參數
-
+        
+        feature_name = feature_names_eng_list_param[feat_idx]
+        is_categorical = feature_name in cat_features_eng_list_param
+        
         matched_representative_tuple = None
         for rep_rule_tuple in representative_rules_tuples_list:
             rep_feat_idx, rep_thresh_val = rep_rule_tuple
@@ -756,35 +767,37 @@ def generate_merged_rule_score_statistics(scored_rules_raw_list,
             rep_feature_name = feature_names_eng_list_param[rep_feat_idx]
             is_rep_categorical = rep_feature_name in cat_features_eng_list_param # 使用傳入的參數
 
-            if feat_idx == rep_feat_idx: 
-                if is_current_categorical and is_rep_categorical:
-                    # 類別特徵，直接比較字串
+            # 步驟2: 合併相似規則並匯總分數
+            if feat_idx == rep_feat_idx: # 特徵必須相同
+                if is_categorical and is_rep_categorical:
+                    # 類別特徵：閾值字串必須完全相同
                     if str(thresh_val) == str(rep_thresh_val):
                         matched_representative_tuple = rep_rule_tuple
                         break
                 else:
-                    # 數值特徵，比較距離
+                    # 數值特徵：閾值差異在允許範圍內
                     if abs(thresh_val - rep_thresh_val) <= threshold_similarity_dist:
                         matched_representative_tuple = rep_rule_tuple
                         break
         
         if matched_representative_tuple is not None:
-            # 如果找到匹配的代表規則，則更新統計
+            # 如果找到匹配的代表規則，則將當前規則的初步分數累加到代表規則的總分數上
             if matched_representative_tuple in merged_stats:
                 merged_stats[matched_representative_tuple]['score'] += current_score
                 merged_stats[matched_representative_tuple]['targets'].add(current_target)
             else:
+                # 理論上 matched_representative_tuple 應該已經在 merged_stats 中，除非列表管理有誤
+                # 為保險起見，如果不在，則初始化 (雖然正常情況下不應進入此分支)
                 merged_stats[matched_representative_tuple] = {'score': current_score, 'targets': {current_target}}
         else:
-            # 否則，將當前規則作為新的代表規則
+            # 否則，將當前規則作為新的代表規則，其初步分數作為初始總分數
             representative_rules_tuples_list.append(current_rule_tuple)
             merged_stats[current_rule_tuple] = {'score': current_score, 'targets': {current_target}}
 
     return merged_stats
 
 # 執行合併與統計
-# threshold_dist_for_scoring = 1.5 # 與分群邏輯中的閾值保持一致或獨立設定
-# 此處調用時傳遞全域的 feature_names_english 和 cat_features
+# merged_rule_scores 將包含每個代表性規則的最終累計分數
 merged_rule_scores = generate_merged_rule_score_statistics(all_scored_rules_raw,
                                                            feature_names_english,
                                                            cat_features, 
@@ -793,25 +806,29 @@ merged_rule_scores = generate_merged_rule_score_statistics(all_scored_rules_raw,
 # 準備輸出到 Excel
 output_scored_rules_data = []
 for rule_tuple, stats in merged_rule_scores.items():
-    # 此處調用 format_rule_to_string 時傳遞全域的 feature_names_english 和 cat_features
     rule_str = format_rule_to_string(rule_tuple, feature_names_english, reverse_mapping, cat_features)
     targets_str = ", ".join(sorted(list(stats['targets'])))
+    # 步驟3: 最終輸出 - stats['score'] 即為該規則的最終累計分數
     output_scored_rules_data.append({
         '規則': rule_str,
-        '總分': stats['score'],
-        '目標數量': len(stats['targets']),
-        '目標清單': targets_str
+        '分數': stats['score'], # 欄位名稱改為 "分數"
+        '目標數量': len(stats['targets']), # 此欄位可選，如果不需要可以移除
+        '貢獻分數的座標點列表': targets_str # 欄位名稱更新
     })
 
 output_scored_rules_df = pd.DataFrame(output_scored_rules_data)
-scored_rules_csv_path = os.path.join(shared_result_dir, "merged_rule_scores.csv")
-scored_rules_excel_path = os.path.join(shared_result_dir, "merged_rule_scores.xlsx")
+# 按分數降序排序
+output_scored_rules_df = output_scored_rules_df.sort_values(by="分數", ascending=False)
+
+# 更新檔名以反映計分方式和內容
+scored_rules_csv_path = os.path.join(shared_result_dir, "ranked_rule_score_statistics.csv")
+scored_rules_excel_path = os.path.join(shared_result_dir, "ranked_rule_score_statistics.xlsx")
 
 output_scored_rules_df.to_csv(scored_rules_csv_path, index=False, encoding='utf-8-sig')
-print(f"規則得分統計結果已儲存至 CSV: {scored_rules_csv_path}")
+print(f"排名式規則得分統計結果已儲存至 CSV: {scored_rules_csv_path}")
 try:
     output_scored_rules_df.to_excel(scored_rules_excel_path, index=False, engine='openpyxl')
-    print(f"規則得分統計結果已儲存至 Excel: {scored_rules_excel_path}")
+    print(f"排名式規則得分統計結果已儲存至 Excel: {scored_rules_excel_path}")
 except ImportError:
     print("警告: 未安裝 'openpyxl'。Excel 檔案未儲存。請執行 'pip install openpyxl'")
 

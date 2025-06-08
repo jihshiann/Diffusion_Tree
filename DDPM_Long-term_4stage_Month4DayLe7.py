@@ -60,15 +60,31 @@ CONFIG = {
     "stage3_new_condition_feature_column": "露點溫度", # Stage3 新條件的欄位名 
     "stage3_new_conditional_operator": "<=",         # Stage3 新條件的運算符
     "stage3_new_conditional_value": 23.5,             # Stage3 新條件的閾值
-    "stage3_model_name": "Stage3_DewPointLe23.5",    # 第三階段模型的名稱
+    "stage3_model_name": "Stage3_DewPointLe235",    # 第三階段模型的名稱
     "stage3_checkpoint_path": "best_stage3_model_DewPoint_le_23_5.pth", # Stage3 模型的檢查點檔名 (相對路徑)
 
     # === Stage4 特定配置 ===
-    "stage4_new_condition_feature_column": "時", # stage4 新條件的欄位名 
-    "stage4_new_conditional_operator": "<=",         # stage4 新條件的運算符
-    "stage4_new_conditional_value": 20,             # stage4 新條件的閾值
-    "stage4_model_name": "stage4_HourLe20",    # 第三階段模型的名稱
-    "stage4_checkpoint_path": "best_stage4_model_hour_le_20.pth", # stage4 模型的檢查點檔名 (相對路徑)
+    # "stage4_new_condition_feature_column": "時", # stage4 新條件的欄位名 
+    # "stage4_new_conditional_operator": "<=",         # stage4 新條件的運算符
+    # "stage4_new_conditional_value": 20,             # stage4 新條件的閾值
+    # "stage4_model_name": "stage4_HourLe20",    # 第三階段模型的名稱
+    # "stage4_checkpoint_path": "best_stage4_model_hour_le_20.pth", # stage4 模型的檢查點檔名 (相對路徑)
+    # === Stage4 特定配置 (使用組合特徵) ===
+    "stage4_config": {
+        # 根據您的要求，模型名稱直接反映複合條件
+        "model_name": "stage4_Month4_DayLe7", 
+        "checkpoint_path": "best_stage4_model_month4_day_le_7.pth",
+        
+        # 1. 定義用於【篩選數據】的複合條件
+        "filtering_conditions": [
+            {"column": "月", "operator": "==", "value": 4},
+            {"column": "日", "operator": "<=", "value": 7}
+        ],
+        
+        # 2. 指定用於【模型條件輸入】的組合特徵欄位名稱
+        # 這將是我們稍後在程式碼中創建的新欄位
+        "grid_feature_source_column": "month_day_combined" 
+    },
 
     # --- DDPM 擴散參數 ---
     "timesteps": 1000,          # 擴散時間步長
@@ -85,10 +101,10 @@ CONFIG = {
     "seed": 42,
     "weight_decay": 1e-5,
     "lr_scheduler_factor": 0.5,
-    "lr_scheduler_patience": 3,
+    "lr_scheduler_patience": 4,
     "lr_scheduler_min_lr": 1e-7,
-    "early_stopping_patience": 6,
-    "val_calculation_freq": 3,
+    "early_stopping_patience": 8,
+    "val_calculation_freq": 2,
 
     # --- 評估參數 ---
     "eval_batch_size": 256,
@@ -134,9 +150,9 @@ os.makedirs(CONFIG["stage3_model_save_dir"], exist_ok=True)
 CONFIG["stage3_checkpoint_full_path"] = os.path.join(CONFIG["stage3_model_save_dir"], CONFIG["stage3_checkpoint_path"])
 
 # 更新/生成 Stage4 相關路徑
-CONFIG["stage4_model_save_dir"] = os.path.join(CONFIG["save_dir"], CONFIG["stage4_model_name"])
+CONFIG["stage4_model_save_dir"] = os.path.join(CONFIG["save_dir"], CONFIG["stage4_config"]["model_name"])
 os.makedirs(CONFIG["stage4_model_save_dir"], exist_ok=True)
-CONFIG["stage4_checkpoint_full_path"] = os.path.join(CONFIG["stage4_model_save_dir"], CONFIG["stage4_checkpoint_path"])
+CONFIG["stage4_checkpoint_full_path"] = os.path.join(CONFIG["stage4_model_save_dir"], CONFIG["stage4_config"]["checkpoint_path"])
 
 # 建立快取目錄路徑
 CONFIG["cache_dir_full_path"] = os.path.join(CONFIG["save_dir"], CONFIG["cache_dir_name"])
@@ -678,6 +694,45 @@ def parse_lat_lon(column_name: str) -> tuple[float, float]:
         return float(match.group(1)), float(match.group(2))
     raise ValueError(f"欄位名稱格式無效：{column_name}")
 
+def create_condition_mask(df: pd.DataFrame, column: str, operator: str, value: Any) -> pd.Series:
+    """
+    根據指定的條件，為 DataFrame 創建一個布林遮罩。
+
+    Args:
+        df (pd.DataFrame): 要進行過濾的 DataFrame。
+        column (str): 要應用條件的欄位名稱。
+        operator (str): 比較運算符，例如 '<=', '>', '==', '!='。
+        value (Any): 用於比較的閾值。
+
+    Returns:
+        pd.Series: 一個布林 Series，可用於過濾 DataFrame。
+    """
+    if column not in df.columns:
+        raise ValueError(f"欄位 '{column}' 不存在於 DataFrame 中。")
+
+    # 確保進行比較的欄位是數值類型，無法轉換的會變成 NaN
+    series_vals = pd.to_numeric(df[column], errors='coerce')
+    
+    # 根據運算符創建遮罩
+    if operator == "<=":
+        mask = (series_vals <= float(value))
+    elif operator == ">":
+        mask = (series_vals > float(value))
+    elif operator == "<":
+        mask = (series_vals < float(value))
+    elif operator == ">=":
+        mask = (series_vals >= float(value))
+    elif operator == "==":
+        mask = (series_vals == float(value))
+    elif operator == "!=":
+        mask = (series_vals != float(value))
+    else:
+        raise ValueError(f"不支援的運算符: '{operator}'")
+
+    # 處理因 to_numeric 轉換失敗而產生的 NaN 值，將它們視為不滿足條件
+    mask = mask.fillna(False)
+    return mask
+
 class MultiStageDataset(Dataset):
     def __init__(self,
                  df_for_processing: pd.DataFrame,
@@ -799,24 +854,49 @@ class MultiStageDataset(Dataset):
                                               self.s3_new_cond_col_name, f"{self.current_stage_name}: Stage3 新條件")
 
         # Stage 4 New Condition
-        if self.current_stage_mode_enum.value >= ConditionMode.STAGE4.value: # Only relevant if current stage is S4 or higher
-            if self.current_stage_mode_enum == ConditionMode.STAGE4: # Current stage is S4
-                self.s4_new_cond_col_name = self.config["stage4_new_condition_feature_column"]
+        if self.current_stage_mode_enum.value >= ConditionMode.STAGE4.value: # 如果當前階段是 S4 或更高
+            if self.current_stage_mode_enum == ConditionMode.STAGE4: # 如果當前階段正好是 S4
+                
+                # --- 主要修改點 ---
+                # 從我們新設計的 CONFIG 結構中，讀取代表性特徵的欄位名稱
+                # 這將會得到我們在主流程中創建的 "month_day_combined"
+                self.s4_new_cond_col_name = self.config["stage4_config"]["grid_feature_source_column"]
+                
+                # 後續的程式碼邏輯幾乎不變，因為它們是基於 self.s4_new_cond_col_name 這個變數運作的
+                
+                # 根據新的欄位名稱，獲取組合特徵的原始數值 (例如 407, 408...)
                 self.s4_new_cond_original_values_np = self._get_original_cond_values(self.s4_new_cond_col_name)
-                self.s4_new_cond_category_for_target_np = self._calculate_category_vector(
-                    self.s4_new_cond_original_values_np, self.config["stage4_new_conditional_operator"],
-                    self.config["stage4_new_conditional_value"], self.s4_new_cond_col_name, "S4Cond"
-                )
+                
+                # 注意：_calculate_category_vector 主要是為了決定目標流量圖的分組
+                # 對於專家模型，所有數據的 category 都會是 0，這是預期行為。
+                # 我們從 filtering_conditions 取第一個條件來做範例分類，因為所有數據都滿足它。
+                first_s4_filter_cond = self.config["stage4_config"]["filtering_conditions"][0]
+                # self.s4_new_cond_category_for_target_np = self._calculate_category_vector(
+                #     self.s4_new_cond_original_values_np, # 這裡傳入的值僅用於日誌記錄，不影響分類結果
+                #     first_s4_filter_cond["operator"],
+                #     first_s4_filter_cond["value"],
+                #     f"Compound Condition ({self.s4_new_cond_col_name})", 
+                #     "S4Cond"
+                # )
+                # 因為是專家模型，所有數據都屬於同一個目標類別，直接設為 0 即可
+                self.s4_new_cond_category_for_target_np = np.zeros(len(self.df_processed), dtype=int)
+
                 if self.mode == 'train':
+                    # 在訓練集上，為我們的組合特徵計算正規化統計量 (mean 和 std)
                     self.norm_stats_s4_new_cond_feature = self._calculate_norm_stats(
                         self.s4_new_cond_original_values_np, self.s4_new_cond_col_name, "S4 new cond (Train)"
                     )
-                else: # S4 val/test
-                    if s4_stats_source is None: # s4_stats_source is current_stage_new_cond_feature_norm_stats_from_train for S4
-                        raise ValueError("Stage4 val/test mode 需要 Stage4 新條件的正規化統計量。")
+                else: # S4 的驗證集或測試集
+                    if s4_stats_source is None:
+                        raise ValueError("Stage4 val/test mode 需要從訓練集傳入 Stage4 新條件的正規化統計量。")
+                    # 使用從訓練集傳過來的統計量
                     self.norm_stats_s4_new_cond_feature = s4_stats_source
+                    
+                # 記錄日誌，顯示組合特徵在正規化後的統計分佈
                 self._log_normalized_scalar_stats(self.s4_new_cond_original_values_np, self.norm_stats_s4_new_cond_feature,
                                                   self.s4_new_cond_col_name, f"{self.current_stage_name}: Stage4 新條件")
+            
+            # 如果未來有 Stage5，這裡會處理從 Stage4 檢查點讀取統計量的邏輯
             # If current stage is S5+, S4 stats would come from s4_stats_from_chkpt, not handled here yet.
 
     def _calculate_or_load_current_stage_targets(self, avg_flow_map_from_train, target_norm_stats_from_train):
@@ -1920,6 +2000,12 @@ if __name__ == '__main__':
     # --- 載入完整數據 ---
     full_df = pd.read_csv(CONFIG["data_path"])
     logger.info(f"已載入資料: {CONFIG['data_path']}. 形狀: {full_df.shape}")
+    # === 新增步驟：創建「組合特徵」欄位 ===
+    if '月' in full_df.columns and '日' in full_df.columns:
+        full_df['month_day_combined'] = full_df['月'] * 100 + full_df['日']
+        logger.info("已成功創建 'month_day_combined' 組合特徵欄位。")
+    else:
+        raise ValueError("DataFrame 中缺少 '月' 或 '日' 欄位，無法創建組合特徵。")
 
     # === 步驟 1: 載入預訓練的 Basemodel (用於生成後續階段的條件) ===
     BASEMODEL_CHECKPOINT_PATH = CONFIG["basemodel_checkpoint"]
@@ -2201,32 +2287,59 @@ if __name__ == '__main__':
         except Exception as e:
             logger.error(f"儲存 Stage3 ({CONFIG['stage3_model_name']}) 輸出到快取失敗: {e}")
         logger.info(f"  生成並正規化後的 Stage3 ({CONFIG['stage3_model_name']}) 模型輸出 (作為S4條件) - MIN: {np.min(all_s3_outputs_s4_np_cond_normalized):.4f}, MAX: {np.max(all_s3_outputs_s4_np_cond_normalized):.4f}, MEAN: {np.mean(all_s3_outputs_s4_np_cond_normalized):.4f}, STD: {np.std(all_s3_outputs_s4_np_cond_normalized):.4f}")
+
+    # === 新增步驟 6.5: 根據 Stage4 複合條件過濾數據 ===
+    logger.info(f"===== STAGE 4 Pre-processing: Filtering data based on Stage4 compound condition =====")
+    
+    s4_conditions = CONFIG["stage4_config"]["filtering_conditions"]
+    logger.info(f"Stage4 複合條件為: {s4_conditions}")
+
+    final_mask = pd.Series(True, index=full_df.index)
+    for condition in s4_conditions:
+        current_mask = create_condition_mask(
+            df=full_df,
+            column=condition["column"],
+            operator=condition["operator"],
+            value=condition["value"]
+        )
+        final_mask = final_mask & current_mask
+
+    df_for_s4_specialist = full_df[final_mask].copy()
+    num_total = len(full_df)
+    num_filtered = len(df_for_s4_specialist)
+    logger.info(f"數據過濾完成。總共 {num_total} 筆資料，滿足 Stage4 條件的有 {num_filtered} 筆 ({num_filtered/num_total:.2%})。")
+
+    # 過濾之前階段生成的 NumPy 輸出陣列
+    bm_outputs_for_s4_processing = all_bm_outputs_s2_np_cond_normalized[final_mask]
+    s2_outputs_for_s4_processing = all_s2_outputs_s3_np_cond_normalized[final_mask]
+    s3_outputs_for_s4_processing = all_s3_outputs_s4_np_cond_normalized[final_mask]
+
 #%%
     # === 步驟 7: Stage4 數據準備與模型訓練 ===
-    logger.info(f"===== STAGE 4: 數據準備與模型訓練 ({CONFIG['stage4_model_name']}) =====")
+    model_name_for_log = CONFIG["stage4_config"]["model_name"]
+    logger.info(f"===== STAGE 4: 數據準備與模型訓練 ({model_name_for_log}) =====")
     df_for_s4_processing = full_df.copy()
 
-    s4_indices_all = np.arange(len(df_for_s4_processing))
+    s4_indices_all = np.arange(len(df_for_s4_specialist))
     np.random.shuffle(s4_indices_all)
     s4_train_len = int(CONFIG["train_split_ratio"] * len(s4_indices_all))
     s4_val_len = int(CONFIG["val_split_ratio"] * len(s4_indices_all))
     s4_train_indices = s4_indices_all[:s4_train_len]
     s4_val_indices = s4_indices_all[s4_train_len : s4_train_len + s4_val_len]
     s4_test_indices = s4_indices_all[s4_train_len + s4_val_len:]
-    logger.info(f"Stage4 資料分割: 訓練集={len(s4_train_indices)}, 驗證集={len(s4_val_indices)}, 測試集={len(s4_test_indices)}")
+    logger.info(f"過濾後的 Stage4 資料分割: 訓練集={len(s4_train_indices)}, 驗證集={len(s4_val_indices)}, 測試集={len(s4_test_indices)}")
 
     train_dataset_s4 = MultiStageDataset(
-        df_for_processing=df_for_s4_processing.iloc[s4_train_indices],
+        df_for_processing=df_for_s4_specialist.iloc[s4_train_indices], # <--- 修改點
         config=CONFIG,
         original_sorted_flow_columns=CONFIG["cached_basemodel_sorted_flow_columns"],
         current_stage_mode=ConditionMode.STAGE4,
         mode='train',
-        basemodel_outputs_np=all_bm_outputs_s2_np_cond_normalized[s4_train_indices],
-        s2_model_outputs_np=all_s2_outputs_s3_np_cond_normalized[s4_train_indices],
-        s3_model_outputs_np=all_s3_outputs_s4_np_cond_normalized[s4_train_indices],
-        s2_new_cond_feature_norm_stats=s2_new_cond_stats_for_subsequent_stages, # S2 新條件的統計量
-        s3_new_cond_feature_norm_stats=s3_new_cond_stats_for_s4_dataset,  # S3 新條件的統計量
-        # s4_new_cond_feature_norm_stats 在 mode='train' 時由 Dataset 內部計算
+        basemodel_outputs_np=bm_outputs_for_s4_processing[s4_train_indices], # <--- 修改點
+        s2_model_outputs_np=s2_outputs_for_s4_processing[s4_train_indices], # <--- 修改點
+        s3_model_outputs_np=s3_outputs_for_s4_processing[s4_train_indices], # <--- 修改點
+        s2_new_cond_feature_norm_stats=s2_new_cond_stats_for_subsequent_stages,
+        s3_new_cond_feature_norm_stats=s3_new_cond_stats_for_s4_dataset,
     )
     s4_batch_size = CONFIG.get("batch_size")
     train_loader_s4_final = DataLoader(train_dataset_s4, batch_size=s4_batch_size, shuffle=True, num_workers=CONFIG["num_workers"], pin_memory=True, drop_last=True if len(train_dataset_s4) >= s4_batch_size else False)
@@ -2235,34 +2348,43 @@ if __name__ == '__main__':
     val_loader_s4_final = None
     if len(s4_val_indices) > 0:
         val_dataset_s4 = MultiStageDataset(
-            df_for_processing=df_for_s4_processing.iloc[s4_val_indices],
+            df_for_processing=df_for_s4_specialist.iloc[s4_val_indices],
             config=CONFIG,
             original_sorted_flow_columns=CONFIG["cached_basemodel_sorted_flow_columns"],
             current_stage_mode=ConditionMode.STAGE4,
             mode='val',
-            basemodel_outputs_np=all_bm_outputs_s2_np_cond_normalized[s4_val_indices],
-            s2_model_outputs_np=all_s2_outputs_s3_np_cond_normalized[s4_val_indices],
-            s3_model_outputs_np=all_s3_outputs_s4_np_cond_normalized[s4_val_indices],
+            basemodel_outputs_np=bm_outputs_for_s4_processing[s4_val_indices], # 使用過濾後的陣列
+            s2_model_outputs_np=s2_outputs_for_s4_processing[s4_val_indices], # 使用過濾後的陣列
+            s3_model_outputs_np=s3_outputs_for_s4_processing[s4_val_indices], # 使用過濾後的陣列
             s2_new_cond_feature_norm_stats=s2_new_cond_stats_for_subsequent_stages,
             s3_new_cond_feature_norm_stats=s3_new_cond_stats_for_s4_dataset,
-            s4_new_cond_feature_norm_stats=train_dataset_s4.norm_stats_s4_new_cond_feature, # 從S4訓練實例獲取S4新特徵統計
+            s4_new_cond_feature_norm_stats=train_dataset_s4.norm_stats_s4_new_cond_feature,
             current_stage_avg_flow_map_dict_from_train=train_dataset_s4.average_flow_map_dict_current_stage,
             current_stage_target_norm_stats_from_train=train_dataset_s4.norm_stats_current_stage_target
         )
-        val_loader_s4_final = DataLoader(val_dataset_s4, batch_size=CONFIG["eval_batch_size"], shuffle=False, num_workers=CONFIG["num_workers"], pin_memory=True)
-        logger.info(f"Stage4 驗證數據集創建，含 {len(val_dataset_s4)} 樣本。")
+        
+        val_loader_s4_final = DataLoader(
+            val_dataset_s4, 
+            batch_size=CONFIG["eval_batch_size"], 
+            shuffle=False, 
+            num_workers=CONFIG["num_workers"], 
+            pin_memory=True
+        )
+        logger.info(f"Stage4 驗證數據集創建完成，含 {len(val_dataset_s4)} 筆樣本。")
 
     test_loader_s4_final = None
     if len(s4_test_indices) > 0:
-        test_dataset_s4 = MultiStageDataset( # 修正此處變數名稱 (原為 MultiStageDataset(...))
-            df_for_processing=df_for_s4_processing.iloc[s4_test_indices],
+        test_dataset_s4 = MultiStageDataset(
+            df_for_processing=df_for_s4_specialist.iloc[s4_test_indices], # 使用過濾後的 df
             config=CONFIG,
             original_sorted_flow_columns=CONFIG["cached_basemodel_sorted_flow_columns"],
             current_stage_mode=ConditionMode.STAGE4,
             mode='test',
-            basemodel_outputs_np=all_bm_outputs_s2_np_cond_normalized[s4_test_indices],
-            s2_model_outputs_np=all_s2_outputs_s3_np_cond_normalized[s4_test_indices],
-            s3_model_outputs_np=all_s3_outputs_s4_np_cond_normalized[s4_test_indices],
+            # --- 主要修改點：使用步驟 6.5 中過濾後的 NumPy 陣列 ---
+            basemodel_outputs_np=bm_outputs_for_s4_processing[s4_test_indices],
+            s2_model_outputs_np=s2_outputs_for_s4_processing[s4_test_indices],
+            s3_model_outputs_np=s3_outputs_for_s4_processing[s4_test_indices],
+            # ---
             s2_new_cond_feature_norm_stats=s2_new_cond_stats_for_subsequent_stages,
             s3_new_cond_feature_norm_stats=s3_new_cond_stats_for_s4_dataset,
             s4_new_cond_feature_norm_stats=train_dataset_s4.norm_stats_s4_new_cond_feature,
@@ -2277,7 +2399,7 @@ if __name__ == '__main__':
     stage4_model_save_checkpoint_path_full = CONFIG["stage4_checkpoint_full_path"]
     
     if train_loader_s4_final:
-        logger.info(f"===== STAGE 4: 模型訓練 ({CONFIG['stage4_model_name']}) =====")
+        logger.info(f"===== STAGE 4: 模型訓練 ({model_name_for_log}) =====")
         # 實例化 Stage4 模型 (從S3初始化或從S4檢查點恢復)
         if os.path.exists(stage4_model_save_checkpoint_path_full) and CONFIG.get("resume_stage4_training", True): # 假設有 resume_stage4_training
             logger.info(f"準備從 Stage4 檢查點載入模型結構和權重: {stage4_model_save_checkpoint_path_full}")
@@ -2342,8 +2464,8 @@ if __name__ == '__main__':
                 metrics_hist_s4 = chkpt_s4_resume.get('metrics_hist_s4', {'train_loss':[], 'val_loss':[], 'lr':[]})
                 logger.info(f"Stage4 訓練將從 epoch {start_epoch_s4} 開始。")
 
-            logger.info(f"開始訓練 Stage4 模型: {CONFIG['stage4_model_name']} for {epochs_to_run_s4} epochs...")
-            epoch_pbar_s4 = tqdm(range(start_epoch_s4, epochs_to_run_s4 + 1), desc=f"Stage4 Training ({CONFIG['stage4_model_name']})", leave=True, position=0, dynamic_ncols=True, unit="epoch")
+            logger.info(f"開始訓練 Stage4 模型: {model_name_for_log} for {epochs_to_run_s4} epochs...")
+            epoch_pbar_s4 = tqdm(range(start_epoch_s4, epochs_to_run_s4 + 1), desc=f"Stage4 Training ({model_name_for_log})", leave=True, position=0, dynamic_ncols=True, unit="epoch")
 
             for epoch_s4_current in epoch_pbar_s4:
                 stage4_model.train()
@@ -2442,7 +2564,7 @@ if __name__ == '__main__':
                     break
             
             if 'epoch_pbar_s4' in locals() and isinstance(epoch_pbar_s4, tqdm): epoch_pbar_s4.close()
-            logger.info(f"Stage4 模型 '{CONFIG['stage4_model_name']}' 訓練完成。")
+            logger.info(f"Stage4 模型 '{model_name_for_log}' 訓練完成。")
         else: # stage4_model is None (創建失敗)
             logger.error("Stage4 模型未能成功實例化，跳過訓練。")
     else: # train_loader_s4_final is None

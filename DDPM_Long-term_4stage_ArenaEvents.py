@@ -1193,7 +1193,79 @@ class MultiStageDataset(Dataset):
             s3_original_feature_scalar,                 # 12: S3 原始新特徵純量
             s4_original_feature_scalar                  # 13: S4 原始新特徵純量
         )
-    
+
+class BaselineDataset(Dataset):
+    """為單階段 Baseline 模型設計的數據集類別。"""
+    def __init__(self, df_for_processing, config, mode='train', 
+                 norm_stats_from_train=None, target_info_from_train=None):
+        super().__init__()
+        self.df_processed = df_for_processing.reset_index(drop=True)
+        self.config = config
+        self.mode = mode
+        self.logger = logging.getLogger(f"{__name__}.BaselineDataset[{self.mode}]")
+        self.H, self.W, self.D = config["H"], config["W"], config.get("D", 1)
+        self.image_channels_target = config["image_channels"]
+        self.sorted_flow_columns = config["cached_basemodel_sorted_flow_columns"]
+        self._process_conditions(norm_stats_from_train)
+        self._calculate_or_load_targets(target_info_from_train)
+        self.logger.info(f"BaselineDataset (mode={self.mode}) 初始化完成，含 {len(self.df_processed)} 筆樣本。")
+
+    def _get_original_cond_values(self, col_name):
+        return pd.to_numeric(self.df_processed[col_name], errors='coerce').values
+
+    def _calculate_norm_stats(self, values_np, col_name):
+        valid_values = values_np[~np.isnan(values_np)]
+        mean, std = (np.mean(valid_values), np.std(valid_values)) if len(valid_values) > 0 else (0.0, 1.0)
+        return {'mean': mean, 'std': std if std > 1e-6 else 1.0}
+
+    def _process_conditions(self, norm_stats_from_train):
+        self.feature_columns = self.config.get("baseline_feature_columns", [])
+        self.original_values_dict = {col: self._get_original_cond_values(col) for col in self.feature_columns}
+        if self.mode == 'train':
+            self.norm_stats_dict = {col: self._calculate_norm_stats(vals, col) for col, vals in self.original_values_dict.items()}
+        else:
+            self.norm_stats_dict = norm_stats_from_train
+
+    def _calculate_or_load_targets(self, target_info_from_train):
+        # 此處的目標分類邏輯應與 MultiStageDataset 中的邏輯完全一致，以確保公平比較
+        self.hour_category_for_target_grouping_np = (self.df_processed['時'].values > 8).astype(int)
+        self.is_holiday_for_target_np = self.df_processed['holiday'].astype(bool).astype(int).values
+        s2_vals = pd.to_numeric(self.df_processed[self.config["stage2_new_condition_feature_column"]], errors='coerce').values
+        self.s2_cond_category_for_target_np = (~(pd.Series(s2_vals) <= self.config["stage2_new_conditional_value"])).astype(int)
+        s3_vals = pd.to_numeric(self.df_processed[self.config["stage3_new_condition_feature_column"]], errors='coerce').values
+        self.s3_cond_category_for_target_np = (~(pd.Series(s3_vals) <= self.config["stage3_new_conditional_value"])).astype(int)
+        self.s4_cond_category_for_target_np = np.zeros(len(self.df_processed), dtype=int)
+        
+        if self.mode == 'train':
+            # ... (此處省略訓練模式的目標計算，因為我們只在測試模式使用)
+            raise NotImplementedError("BaselineDataset 在此腳本中僅用於測試模式")
+        else: # 'val' or 'test'
+            self.average_flow_map_dict = target_info_from_train["avg_flow_map"]
+            self.norm_stats_target = target_info_from_train["norm_stats"]
+
+    def __len__(self):
+        return len(self.df_processed)
+
+    def __getitem__(self, idx):
+        target_key = (
+            self.hour_category_for_target_grouping_np[idx], self.is_holiday_for_target_np[idx],
+            self.s2_cond_category_for_target_np[idx], self.s3_cond_category_for_target_np[idx],
+            self.s4_cond_category_for_target_np[idx]
+        )
+        target_avg_flow_np = self.average_flow_map_dict.get(target_key, np.zeros((self.H, self.W), dtype=np.float32))
+        norm_target_np = (target_avg_flow_np - self.norm_stats_target['mean']) / self.norm_stats_target['std']
+        target_tensor_norm = torch.from_numpy(norm_target_np).float().reshape(self.image_channels_target, self.D, self.H, self.W)
+
+        condition_grids = []
+        for col_name in self.feature_columns:
+            val = self.original_values_dict[col_name][idx]
+            stats = self.norm_stats_dict[col_name]
+            norm_val = (val - stats['mean']) / stats['std'] if not np.isnan(val) else 0.0
+            condition_grids.append(torch.full((1, self.D, self.H, self.W), float(norm_val)))
+        condition_tensor_norm = torch.cat(condition_grids, dim=1) # Baseline 使用 5 通道
+
+        return target_tensor_norm, condition_tensor_norm
+        
 # FID 函數 (get_activations, calculate_frechet_distance, calculate_fid)
 def get_activations(images: torch.Tensor, model: nn.Module, device: str, batch_size_fid: int = 32) -> np.ndarray:
     """使用 Inception 模型提取影像特徵。"""
@@ -1968,6 +2040,67 @@ def evaluate_model(
             logger.error(f"{current_stage_name} 評估 ({prefix}): 匯出 Excel 失敗: {e}")
             
     return results, error_grids_all_models
+
+@torch.no_grad()
+def evaluate_baseline_model_for_comparison(
+    model_trained: 'DDPM3D', dataloader: DataLoader, inception_model_fid: nn.Module,
+    config: Dict[str, Any], target_norm_stats: Dict[str, float],
+    prefix: str = "eval_baseline"
+) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
+    
+    # [注意] 此函式是 evaluate_baseline_model 的簡化版，專用於此處的比較
+    # 它返回與 evaluate_model 相同的指標結構
+    model_trained.eval()
+    target_mean, target_std = target_norm_stats['mean'], target_norm_stats['std']
+    all_generated_denorm, all_target_denorm = [], []
+    all_generated_norm, all_target_norm = [], []
+
+    for target_norm_b, cond_norm_b in dataloader:
+        target_norm, cond_norm = target_norm_b.to(config["device"]), cond_norm_b.to(config["device"])
+        generated_norm = model_trained.sample(target_norm.shape[0], cond_norm) # 直接呼叫 Baseline 的 sample
+        
+        generated_denorm = generated_norm * target_std + target_mean
+        target_denorm = target_norm * target_std + target_mean
+        all_generated_denorm.append(generated_denorm.cpu())
+        all_target_denorm.append(target_denorm.cpu())
+        all_generated_norm.append(generated_norm.cpu())
+        all_target_norm.append(target_norm.cpu())
+
+    pred_t = torch.cat(all_generated_denorm, dim=0)
+    target_t = torch.cat(all_target_denorm, dim=0)
+    
+    # 指標計算 (與 evaluate_model 內部的邏輯完全一致)
+    epsilon=1e-8
+    mse = F.mse_loss(pred_t, target_t).item()
+    mae = F.l1_loss(pred_t, target_t).item()
+    actual_vals = torch.abs(target_t); errors = torch.abs(target_t - pred_t)
+    valid_mape_mask = actual_vals > config.get("mape_threshold", 1.0)
+    mape_avg_grid = torch.mean((errors[valid_mape_mask] / actual_vals[valid_mape_mask]) * 100).item() if torch.any(valid_mape_mask) else float('inf')
+    smape_denom = (actual_vals + torch.abs(pred_t)) / 2.0 + epsilon
+    smape_avg_grid = torch.mean((errors / smape_denom) * 100).item()
+    mape_overall = (torch.sum(errors) / (torch.sum(actual_vals) + epsilon)).item() * 100
+    smape_overall = (200.0 * torch.sum(errors) / (torch.sum(actual_vals + torch.abs(pred_t)) + epsilon)).item()
+
+    # FID 計算
+    gen_fid_tensor = torch.cat(all_generated_norm, dim=0)
+    real_fid_tensor = torch.cat(all_target_norm, dim=0)
+    act_gen = get_activations(gen_fid_tensor, inception_model_fid, config["device"], config["fid_batch_size"])
+    act_real = get_activations(real_fid_tensor, inception_model_fid, config["device"], config["fid_batch_size"])
+    fid = calculate_fid(act_real, act_gen)
+
+    results = {"mse": mse, "mae": mae, "mape_avg_grid": mape_avg_grid, "smape_avg_grid": smape_avg_grid, "mape_overall": mape_overall, "smape_overall": smape_overall, "fid": fid}
+    
+    # 逐網格誤差
+    pred_s, target_s = pred_t.squeeze(1).squeeze(1), target_t.squeeze(1).squeeze(1)
+    mse_g = torch.mean((pred_s - target_s)**2, dim=0).cpu().numpy()
+    mae_g = torch.mean(torch.abs(pred_s - target_s), dim=0).cpu().numpy()
+    mape_g = torch.mean(torch.abs((target_s - pred_s) / (target_s + epsilon)) * 100, dim=0).cpu().numpy()
+    smape_g = torch.mean((torch.abs(pred_s-target_s) / ((torch.abs(target_s)+torch.abs(pred_s))/2 + epsilon)) * 100, dim=0).cpu().numpy()
+    error_grids = {'MSE': mse_g.flatten(), 'MAE': mae_g.flatten(), 'MAPE': mape_g.flatten(), 'SMAPE': smape_g.flatten()}
+    
+    return results, error_grids
+
+
 #%%
 if __name__ == '__main__':
     logger.info(f"===== DDPM Multi-Stage (Up to Stage4) - Training and Evaluation =====")
@@ -1990,7 +2123,7 @@ if __name__ == '__main__':
     logger.info(f"已載入資料: {CONFIG['data_path']}. 形狀: {full_df.shape}")
     # === 新增步驟：創建「組合特徵」欄位 ===
     if '月' in full_df.columns and '日' in full_df.columns:
-        full_df['month_day_combined'] = full_df['月'] * 30 + full_df['日']
+        full_df['month_day_combined'] = full_df['月'] * 31 + full_df['日']
         logger.info("已成功創建 'month_day_combined' 組合特徵欄位。")
     else:
         raise ValueError("DataFrame 中缺少 '月' 或 '日' 欄位，無法創建組合特徵。")
@@ -2587,42 +2720,31 @@ if __name__ == '__main__':
             logger.info(f"已載入預訓練的 Stage4 模型 (Epoch {chkpt_s4_load.get('epoch','未知')})。")
 
 #%%
-    # === 步驟 8: 最終評估 (Stage4 vs Stage3) ===
     logger.info(f"===== STAGE 4: 最終評估 =====")
-    s4_model_to_finally_evaluate = stage4_model # 使用剛訓練或載入的 Stage4 模型
-    # final_s3_model_to_eval 是之前已載入的 Stage3 模型
-    
-    if s4_model_to_finally_evaluate and final_s3_model_to_eval and test_loader_s4_final:
-        # 獲取 Stage4 目標的專用正規化統計量
-        stage4_target_norm_stats_for_eval: Optional[Dict[str, float]] = None
-        if 'train_dataset_s4' in locals() and train_dataset_s4 is not None and hasattr(train_dataset_s4, 'norm_stats_current_stage_target'):
-            stage4_target_norm_stats_for_eval = train_dataset_s4.norm_stats_current_stage_target
-        elif 'chkpt_s4_load' in locals() and chkpt_s4_load and 'norm_stats_stage4_target' in chkpt_s4_load:
-            stage4_target_norm_stats_for_eval = chkpt_s4_load.get('norm_stats_stage4_target')
-        
-        if stage4_target_norm_stats_for_eval is None: # 檢查點裡可能叫 norm_stats_current_stage_target
-             if 'chkpt_s4_load' in locals() and chkpt_s4_load and 'norm_stats_current_stage_target' in chkpt_s4_load:
-                 stage4_target_norm_stats_for_eval = chkpt_s4_load.get('norm_stats_current_stage_target')
-        
-        if stage4_target_norm_stats_for_eval is None:
-            raise ValueError("無法獲取 Stage4 目標的專用正規化統計量用於最終評估。")
+    s4_model_to_finally_evaluate = stage4_model
+    final_s3_model_to_eval_for_comp = final_s3_model_to_eval
 
-        # 獲取 Stage3 目標的專用正規化統計量 (用於反正規化 Stage3 模型的輸出)
-        # stage3_target_norm_stats_for_eval 已在主流程載入 S3 模型時獲取
-        if stage3_target_norm_stats_for_eval is None: 
-            raise ValueError("無法獲取 Stage3 目標的專用正規化統計量用於評估 Stage3 模型輸出。")
+    # 檢查所有必要的模型和資料都已準備就緒
+    if s4_model_to_finally_evaluate and final_s3_model_to_eval_for_comp and test_loader_s4_final:
+        # 獲取各階段目標的正規化統計量
+        stage4_target_norm_stats_for_eval = train_dataset_s4.norm_stats_current_stage_target
+        stage3_target_norm_stats_for_eval = chkpt_s3_eval.get('norm_stats_stage3_target')
+        
+        if not stage4_target_norm_stats_for_eval or not stage3_target_norm_stats_for_eval:
+            raise ValueError("無法獲取 Stage4 或 Stage3 目標的專用正規化統計量。")
 
-        logger.info(f"開始對 Stage4 模型進行最終評估...")
+        logger.info(f"開始對 Stage4 vs Stage3 模型進行評估...")
         inception_model_for_fid_final_eval = inception_v3(weights=Inception_V3_Weights.DEFAULT, aux_logits=True).to(CONFIG["device"])
         inception_model_for_fid_final_eval.fc = nn.Identity()
-        if hasattr(inception_model_for_fid_final_eval, 'AuxLogits') and inception_model_for_fid_final_eval.AuxLogits is not None:
-             inception_model_for_fid_final_eval.AuxLogits.fc = nn.Identity()
+        if hasattr(inception_model_for_fid_final_eval, 'AuxLogits'):
+            inception_model_for_fid_final_eval.AuxLogits.fc = nn.Identity()
         inception_model_for_fid_final_eval.eval()
 
-        final_s4_metrics, final_s4_error_grids = evaluate_model(
+        # 1. 執行 Stage4 vs Stage3 的評估
+        final_s4_s3_metrics, final_s4_s3_error_grids = evaluate_model(
             current_stage_model_trained=s4_model_to_finally_evaluate,
-            previous_stage_model_eval_instance=final_s3_model_to_eval,
-            basemodel_eval_instance_for_s2_cond_generation=None, # 在 evaluate_model 中不需要
+            previous_stage_model_eval_instance=final_s3_model_to_eval_for_comp,
+            basemodel_eval_instance_for_s2_cond_generation=None,
             current_stage_mode=ConditionMode.STAGE4,
             dataloader_current_stage=test_loader_s4_final,
             inception_model_fid=inception_model_for_fid_final_eval,
@@ -2630,17 +2752,141 @@ if __name__ == '__main__':
             current_stage_target_norm_stats=stage4_target_norm_stats_for_eval,
             previous_stage_target_norm_stats=stage3_target_norm_stats_for_eval,
             max_samples_for_fid=CONFIG.get("fid_num_samples"),
-            prefix=f"final_{ConditionMode.STAGE4.name.lower()}_evaluation"
+            prefix=f"final_S4_vs_S3_evaluation"
         )
-        logger.info(f"Stage4 最終評估指標: {json.dumps(final_s4_metrics, indent=2, ensure_ascii=False)}")
-        
-        s4_metrics_save_dir = CONFIG.get("stage4_model_save_dir", CONFIG.get("save_dir_stage3")) # 回退
-        metrics_save_path_s4 = os.path.join(s4_metrics_save_dir, f"final_stage4_evaluation_metrics.json")
-        with open(metrics_save_path_s4, 'w', encoding='utf-8') as f: #指定utf-8
-            json.dump(final_s4_metrics, f, indent=4, ensure_ascii=False)
-        logger.info(f"Stage4 最終評估指標已儲存到: {metrics_save_path_s4}")
+
+        # 2. --- [新增] 獨立評估 Baseline 模型 ---
+        logger.info(f"===== BASELINE: 獨立評估 =====")
+        baseline_model_path = "C:\\thesis\\code\\DIFFUSION_TREE\\results_ddpm_baseline\\Baseline_ArenaEvents\\best_baseline_model_arenaEvents.pth"
+        final_baseline_metrics, final_baseline_error_grids = {}, {}
+
+        if not os.path.exists(baseline_model_path):
+            logger.error(f"未找到 Baseline 模型檢查點: {baseline_model_path}，跳過比較。")
+        else:
+            chkpt_baseline = torch.load(baseline_model_path, map_location=CONFIG["device"])
+            cfg_baseline = chkpt_baseline['config_snapshot_at_save']
+            
+            unet_baseline = UNet3D(cfg_baseline["image_channels"], cfg_baseline["base_channels_unet"], cfg_baseline["time_emb_dim"], cfg_baseline["condition_encode_dim"], dropout_rate=cfg_baseline["unet_dropout_rate"]).to(CONFIG["device"])
+            final_baseline_model_to_eval = DDPM3D(
+                unet_model=unet_baseline, timesteps=cfg_baseline["timesteps"], 
+                image_size=(cfg_baseline["D"], cfg_baseline["H"], cfg_baseline["W"]),
+                image_channels=cfg_baseline["image_channels"], condition_input_channels=cfg_baseline["condition_input_channels"],
+                condition_encode_dim=cfg_baseline["condition_encode_dim"], device=CONFIG["device"]
+            )
+            final_baseline_model_to_eval.load_state_dict(chkpt_baseline['ddpm_state_dict'])
+            logger.info(f"Baseline 模型載入完成。")
+
+            baseline_test_dataset = BaselineDataset(
+                df_for_processing=df_for_s4_specialist.iloc[s4_test_indices], config=cfg_baseline, mode='test',
+                norm_stats_from_train=chkpt_baseline['cond_norm_stats'],
+                target_info_from_train={"avg_flow_map": chkpt_baseline['target_avg_flow_map'], "norm_stats": chkpt_baseline['target_norm_stats']}
+            )
+            baseline_test_loader = DataLoader(baseline_test_dataset, batch_size=CONFIG["eval_batch_size"], shuffle=False)
+            
+            baseline_metrics_raw, baseline_error_grids_raw = evaluate_baseline_model_for_comparison(
+                model_trained=final_baseline_model_to_eval, dataloader=baseline_test_loader, 
+                inception_model_fid=inception_model_for_fid_final_eval, config=CONFIG,
+                target_norm_stats=chkpt_baseline['target_norm_stats'],
+                prefix="final_baseline_evaluation"
+            )
+            final_baseline_metrics = {"baseline_model": baseline_metrics_raw}
+            final_baseline_error_grids = {"baseline_model": baseline_error_grids_raw}
+            logger.info(f"Baseline 最終評估指標: {json.dumps(final_baseline_metrics, indent=2)}")
+
+            # --- [新增] 為 Baseline 模型產生獨立的地理誤差圖 ---
+            plot_grid_with_error_long_term(
+                dataset_for_coords=baseline_test_dataset,
+                error_metrics_grids=baseline_error_grids_raw,
+                config=CONFIG,
+                prefix="final_baseline_evaluation_grid_errors"
+            )
+
+        # 3. --- [修改] 合併所有結果並處理誤差差異 ---
+        logger.info("合併 Stage4, Stage3, 和 Baseline 的評估結果...")
+        combined_metrics = {**final_s4_s3_metrics, **final_baseline_metrics}
+        combined_error_grids = {**final_s4_s3_error_grids, **final_baseline_error_grids}
+
+        # --- [新增] 計算並繪製 Stage4 vs Baseline 的誤差差異圖 ---
+        if 'stage4_model' in combined_error_grids and 'baseline_model' in combined_error_grids:
+            s4_err = combined_error_grids['stage4_model']
+            bl_err = combined_error_grids['baseline_model']
+            diff_s4_bl_grids = {}
+            for metric in ['MSE', 'MAE', 'MAPE', 'SMAPE']:
+                diff_s4_bl_grids[f"Diff_{metric}_(Stage4-Baseline)"] = s4_err.get(metric, 0) - bl_err.get(metric, 0)
+            
+            plot_grid_with_error_long_term(
+                dataset_for_coords=test_loader_s4_final.dataset,
+                error_metrics_grids=diff_s4_bl_grids,
+                config=CONFIG,
+                prefix="final_diff_S4_minus_Baseline"
+            )
+
+        # 4. --- [修改] 匯出包含所有比較的 Excel 報告 ---
+        excel_rows = []
+        model_keys_in_report = ['stage4_model', 'stage3_model_on_stage4_data', 'baseline_model']
+        num_grid_cells = CONFIG["H"] * CONFIG["W"]
+
+        # 逐模型寫入逐網格數據
+        for model_key in model_keys_in_report:
+            if model_key not in combined_error_grids: continue
+            excel_rows.append({'資料來源': f"--- {model_key} (vs Stage4 Target) 逐網格誤差 ---"})
+            error_grids = combined_error_grids[model_key]
+            for flat_idx in range(num_grid_cells):
+                row_data = {'資料來源': model_key, '網格座標_R': flat_idx // CONFIG["W"], '網格座標_C': flat_idx % CONFIG["W"]}
+                for metric in ['MSE', 'MAE', 'MAPE', 'SMAPE']:
+                    row_data[metric] = error_grids.get(metric, [np.nan] * num_grid_cells)[flat_idx]
+                excel_rows.append(row_data)
+
+        # 寫入逐網格誤差差異 (S4-S3)
+        s4_s3_diff_grids = {}
+        if 'stage4_model' in combined_error_grids and 'stage3_model_on_stage4_data' in combined_error_grids:
+            excel_rows.append({'資料來源': "--- Difference (Stage4 - Stage3) 逐網格誤差 ---"})
+            for metric in ['MSE', 'MAE', 'MAPE', 'SMAPE']:
+                s4_s3_diff_grids[metric] = combined_error_grids['stage4_model'][metric] - combined_error_grids['stage3_model_on_stage4_data'][metric]
+            for flat_idx in range(num_grid_cells):
+                row_data = {'資料來源': "Diff(S4-S3)", '網格座標_R': flat_idx // CONFIG["W"], '網格座標_C': flat_idx % CONFIG["W"]}
+                for metric in ['MSE', 'MAE', 'MAPE', 'SMAPE']:
+                    row_data[metric] = s4_s3_diff_grids.get(metric, [np.nan] * num_grid_cells)[flat_idx]
+                excel_rows.append(row_data)
+
+        # 寫入逐網格誤差差異 (S4-Baseline)
+        if 'stage4_model' in combined_error_grids and 'baseline_model' in combined_error_grids:
+            excel_rows.append({'資料來源': "--- Difference (Stage4 - Baseline) 逐網格誤差 ---"})
+            for flat_idx in range(num_grid_cells):
+                row_data = {'資料來源': "Diff(S4-Baseline)", '網格座標_R': flat_idx // CONFIG["W"], '網格座標_C': flat_idx % CONFIG["W"]}
+                for metric in ['MSE', 'MAE', 'MAPE', 'SMAPE']:
+                    row_data[metric] = diff_s4_bl_grids.get(f"Diff_{metric}_(Stage4-Baseline)", [np.nan] * num_grid_cells)[flat_idx]
+                excel_rows.append(row_data)
+
+        # 寫入總體平均指標
+        excel_rows.append({'資料來源': f"--- 整體指標比較 ---"})
+        for model_key in model_keys_in_report:
+            if model_key not in combined_metrics: continue
+            metrics = combined_metrics[model_key]
+            avg_row = {'資料來源': model_key, '網格座標_R': '整體平均'}
+            avg_row.update({k.upper().replace("AVG_GRID", "MAPE/SMAPE(AvgGrid)").replace("_OVERALL", "(Overall)"): v for k, v in metrics.items()})
+            excel_rows.append(avg_row)
+
+        # 寫入總體指標差異
+        if 'stage4_model' in combined_metrics and 'stage3_model_on_stage4_data' in combined_metrics:
+            diff_row = {'資料來源': "Diff(S4-S3)", '網格座標_R': '整體平均差異'}
+            for k in combined_metrics['stage4_model']:
+                diff_row[k.upper().replace("AVG_GRID", "MAPE/SMAPE(AvgGrid)").replace("_OVERALL", "(Overall)")] = combined_metrics['stage4_model'][k] - combined_metrics['stage3_model_on_stage4_data'][k]
+            excel_rows.append(diff_row)
+        if 'stage4_model' in combined_metrics and 'baseline_model' in combined_metrics:
+            diff_row = {'資料來源': "Diff(S4-Baseline)", '網格座標_R': '整體平均差異'}
+            for k in combined_metrics['stage4_model']:
+                diff_row[k.upper().replace("AVG_GRID", "MAPE/SMAPE(AvgGrid)").replace("_OVERALL", "(Overall)")] = combined_metrics['stage4_model'][k] - combined_metrics['baseline_model'][k]
+            excel_rows.append(diff_row)
+
+        # 匯出到 Excel
+        df_export = pd.DataFrame(excel_rows)
+        excel_path = os.path.join(CONFIG["stage4_model_save_dir"], "final_S4_vs_S3_vs_Baseline_comparison.xlsx")
+        df_export.to_excel(excel_path, index=False, sheet_name="Full_Comparison")
+        logger.info(f"所有模型的合併評估報告已匯出至 Excel: {excel_path}")
+
     else:
-        logger.warning("由於缺少必要的模型或數據加載器，跳過 Stage4 最終評估。")
+        logger.warning("由於缺少必要的模型或數據加載器，跳過最終評估。")
 
     logger.info(f"===== DDPM 多階段流程 (含Stage4) 結束 =====")
 # %%

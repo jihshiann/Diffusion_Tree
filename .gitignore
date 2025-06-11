@@ -402,3 +402,4 @@ FodyWeavers.xsd
 /results_ddpm_stage4/model_outputs_cache
 /results_ddpm_stage4/stage4_ArenaEventDays_CombinedDateCond
 /results_ddpm_stage4/stage4_Month4_DayLe7
+/results_ddpm_baseline/Baseline_ArenaEvents

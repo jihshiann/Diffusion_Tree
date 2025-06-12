@@ -56,11 +56,11 @@ CONFIG = {
     "stage2_checkpoint_path": "best_stage2_model_hour_le_20.pth", # Stage2 模型的檢查點檔名 (相對路徑)
 
     # === Stage3 特定配置 ===
-    "stage3_new_condition_feature_column": "露點溫度", # Stage3 新條件的欄位名 
+    "stage3_new_condition_feature_column": "weekday", # Stage3 新條件的欄位名 
     "stage3_new_conditional_operator": "<=",         # Stage3 新條件的運算符
-    "stage3_new_conditional_value":23.5,             # Stage3 新條件的閾值
-    "stage3_model_name": "Stage3_DewPointLe235",    # 第三階段模型的名稱
-    "stage3_checkpoint_path": "best_stage3_model_DewPoint_le_23_5.pth", # Stage3 模型的檢查點檔名 (相對路徑)
+    "stage3_new_conditional_value": 4,             # Stage3 新條件的閾值
+    "stage3_model_name": "Stage3_WeekdayLe4",    # 第三階段模型的名稱
+    "stage3_checkpoint_path": "best_stage3_model_Weekday_le_4.pth", # Stage3 模型的檢查點檔名 (相對路徑)
 
     # --- DDPM 擴散參數 ---
     "timesteps": 1000,          # 擴散時間步長

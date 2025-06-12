@@ -48,10 +48,10 @@ CONFIG = {
     # --- Baseline 模型要使用的 5 個條件特徵 ---
     "baseline_feature_columns": [
         "時", 
-        "月", 
-        "日", 
         "holiday", 
-        "month_day_combined"
+        "weekday", 
+        "date_combined", 
+        "時"
     ],
     # 模型的條件處理器現在需要接收 5 個通道
     "condition_input_channels": 5, 
@@ -67,28 +67,29 @@ CONFIG = {
     "stage2_model_name": "stage2_HourLe20",    # 第二階段模型的名稱
     "stage2_checkpoint_path": "best_stage2_model_hour_le_20.pth", # Stage2 模型的檢查點檔名 (相對路徑)
 
-    #hgt     === Stage3 特定配置 ===
-    "stage3_new_condition_feature_column": "露點溫度", # Stage3 新條件的欄位名 
+    # === Stage3 特定配置 ===
+    "stage3_new_condition_feature_column": "weekday", # Stage3 新條件的欄位名 
     "stage3_new_conditional_operator": "<=",         # Stage3 新條件的運算符
-    "stage3_new_conditional_value": 23.5,             # Stage3 新條件的閾值
-    "stage3_model_name": "Stage3_DewPointLe235",    # 第三階段模型的名稱
-    "stage3_checkpoint_path": "best_stage3_model_DewPoint_le_23_5.pth", # Stage3 模型的檢查點檔名 (相對路徑)
+    "stage3_new_conditional_value": 4,             # Stage3 新條件的閾值
+    "stage3_model_name": "Stage3_WeekdayLe4",    # 第三階段模型的名稱
+    "stage3_checkpoint_path": "best_stage3_model_Weekday_le_4.pth", # Stage3 模型的檢查點檔名 (相對路徑)
 
     # === 過濾規則：基於外部 Excel 檔案 ===
     "stage4_config": {
-        "model_name": "stage4_ArenaEventDays_CombinedDateCond",
-        "checkpoint_path": "best_stage4_model_arena_events_date_cond.pth",
+        "model_name": "stage4_ArenaEventDays",
+        "checkpoint_path": "best_stage4_model_arena_events.pth",
         
         # 1. 定義基於事件的過濾規則
         "event_filter": {
             "enabled": True,
             "file_path": r"C:\thesis\code\Taipei_CF\ArenaEvents.xlsx",
+            "year_col": "年",
             "month_col": "月",
             "day_col": "日"
         },
         
         # 2. 指定用於【模型條件輸入】的組合特徵欄位名稱
-        "grid_feature_source_column": "month_day_combined"
+        "grid_feature_source_column": "date_combined"
     },
     
     # --- DDPM 擴散參數 ---
@@ -419,7 +420,7 @@ class BaselineDataset(Dataset):
         
     def _process_conditions(self, norm_stats_from_train=None):
         """處理 CONFIG 中定義的所有 baseline_feature_columns。"""
-        self.feature_columns = self.config.get("baseline_feature_columns", [])
+        self.feature_columns = self.config.get("baseline_feature_columns")
         if not self.feature_columns or len(self.feature_columns) != self.config["condition_input_channels"]:
             raise ValueError("CONFIG 中的 'baseline_feature_columns' 未定義或長度與 'condition_input_channels' 不符。")
 
@@ -981,25 +982,14 @@ if __name__ == '__main__':
     logger.info(f"已載入資料: {CONFIG['data_path']}. 形狀: {full_df.shape}")
 
     # --- 創建組合特徵 ---
-    if '月' in full_df.columns and '日' in full_df.columns:
-        full_df['month_day_combined'] = full_df['月'] * 100 + full_df['日']
-        logger.info("已成功創建 'month_day_combined' 組合特徵欄位。")
-    if 'weekday' not in full_df.columns and '日期' in full_df.columns:
-        try:
-            full_df['日期'] = pd.to_datetime(full_df['日期'])
-            full_df['weekday'] = full_df['日期'].dt.dayofweek
-            logger.info("已成功創建 'weekday' 特徵欄位。")
-        except Exception as e:
-            logger.error(f"從 '日期' 創建 'weekday' 失敗: {e}")
-    
+    if '月' in full_df.columns and '日' in full_df.columns and '年' in full_df.columns:
+        full_df['date_combined'] = (full_df['年'] - 2018) * 365 + full_df['月'] * 31 + full_df['日']
+        logger.info("已成功創建 'date_combined' 組合特徵欄位。")
+
     # --- 讀取 Basemodel 以獲取網格資訊 ---
     # Baseline 模型雖然不使用 Basemodel 的輸出，但需要其網格欄位資訊來建構目標
     logger.info("從 Basemodel 檢查點載入網格資訊...")
     basemodel_chkpt_path = CONFIG.get("basemodel_checkpoint")
-
-
-
-
 
     if not basemodel_chkpt_path or not os.path.exists(basemodel_chkpt_path):
         raise FileNotFoundError(f"未找到 Basemodel 檢查點: {basemodel_chkpt_path}。需要它來獲取網格欄位資訊。")
@@ -1017,6 +1007,7 @@ if __name__ == '__main__':
     event_filter_config = CONFIG["stage4_config"]["event_filter"] # 從 stage4_config 獲取
     if event_filter_config["enabled"]:
         event_file_path = event_filter_config["file_path"]
+        year_col = event_filter_config["year_col"]
         month_col = event_filter_config["month_col"]
         day_col = event_filter_config["day_col"]
         
@@ -1026,13 +1017,16 @@ if __name__ == '__main__':
         logger.info(f"正在從 {event_file_path} 讀取活動日期...")
         events_df = pd.read_excel(event_file_path)
 
-        if not all(col in events_df.columns for col in [month_col, day_col]):
-            raise ValueError(f"Excel 檔案 '{event_file_path}' 中缺少必要的欄位:'{month_col}', 或 '{day_col}'")
+        required_cols = [year_col, month_col, day_col]
+        if not all(col in events_df.columns for col in required_cols):
+            raise ValueError(f"Excel 檔案 '{event_file_path}' 中缺少必要的欄位，需要: {required_cols}")
 
-        event_month_day_set = set(zip(events_df[month_col], events_df[day_col]))
-        logger.info(f"從檔案中提取了 {len(event_month_day_set)} 個不重複的活動日期 (月, 日)。")
+        #event_date_set = set(zip(events_df[year_col], events_df[month_col], events_df[day_col]))
+        event_date_set = set(zip(events_df[month_col], events_df[day_col]))
+        logger.info(f"從檔案中提取了 {len(event_date_set)} 個不重複的活動日期 (年, 月, 日)。")
 
-        final_mask = full_df.apply(lambda row: (row['月'], row['日']) in event_month_day_set, axis=1)
+        #final_mask = full_df.apply(lambda row: (row['年'], row['月'], row['日']) in event_date_set, axis=1)
+        final_mask = full_df.apply(lambda row: (row['月'], row['日']) in event_date_set, axis=1)
     else:
         final_mask = pd.Series(True, index=full_df.index)
 
@@ -1045,6 +1039,7 @@ if __name__ == '__main__':
     np.random.shuffle(indices_all)
     train_len = int(CONFIG["train_split_ratio"] * len(indices_all))
     val_len = int(CONFIG["val_split_ratio"] * len(indices_all))
+    logger.info(f"train_len = {train_len}, val_len = {val_len}, test_len = {len(indices_all) - train_len - val_len}")
     train_indices = indices_all[:train_len]
     val_indices = indices_all[train_len : train_len + val_len]
     test_indices = indices_all[train_len + val_len:]

@@ -57,11 +57,11 @@ CONFIG = {
     "stage2_checkpoint_path": "best_stage2_model_hour_le_20.pth", # Stage2 模型的檢查點檔名 (相對路徑)
 
     # === Stage3 特定配置 ===
-    "stage3_new_condition_feature_column": "露點溫度", # Stage3 新條件的欄位名 
+    "stage3_new_condition_feature_column": "weekday", # Stage3 新條件的欄位名 
     "stage3_new_conditional_operator": "<=",         # Stage3 新條件的運算符
-    "stage3_new_conditional_value": 23.5,             # Stage3 新條件的閾值
-    "stage3_model_name": "Stage3_DewPointLe235",    # 第三階段模型的名稱
-    "stage3_checkpoint_path": "best_stage3_model_DewPoint_le_23_5.pth", # Stage3 模型的檢查點檔名 (相對路徑)
+    "stage3_new_conditional_value": 4,             # Stage3 新條件的閾值
+    "stage3_model_name": "Stage3_WeekdayLe4",    # 第三階段模型的名稱
+    "stage3_checkpoint_path": "best_stage3_model_Weekday_le_4.pth", # Stage3 模型的檢查點檔名 (相對路徑)
 
     # === Stage4 特定配置 ===
     # "stage4_new_condition_feature_column": "時", # stage4 新條件的欄位名 
@@ -71,21 +71,30 @@ CONFIG = {
     # "stage4_checkpoint_path": "best_stage4_model_hour_le_20.pth", # stage4 模型的檢查點檔名 (相對路徑)
     # === Stage4 特定配置 (使用組合特徵) ===
     "stage4_config": {
-        "model_name": "stage4_ArenaEventDays_CombinedDateCond",
-        "checkpoint_path": "best_stage4_model_arena_events_date_cond.pth",
+        "model_name": "stage4_ArenaEventDays",
+        "checkpoint_path": "best_stage4_model_arena_events.pth",
         
         # 1. 定義基於事件的過濾規則
         "event_filter": {
             "enabled": True,
             "file_path": r"C:\thesis\code\Taipei_CF\ArenaEvents.xlsx",
             # --- 主要修改點：指定年、月、日分別是哪個欄位 ---
+            "year_col": "年",
             "month_col": "月",
             "day_col": "日"
         },
         
         # 2. 指定用於【模型條件輸入】的組合特徵欄位名稱
-        "grid_feature_source_column": "month_day_combined"
+        "grid_feature_source_column": "date_combined"
     },
+
+    "baseline_feature_columns": [
+        "時", 
+        "holiday", 
+        "weekday", 
+        "date_combined", 
+        "時"
+    ],
 
     # --- DDPM 擴散參數 ---
     "timesteps": 1000,          # 擴散時間步長
@@ -184,6 +193,7 @@ class ConditionMode(Enum):
     STAGE2 = 2
     STAGE3 = 3
     STAGE4 = 4
+    BASELINE_EVAL = 5
 
 #%%
 # ==============================================================================
@@ -516,8 +526,11 @@ class DDPM3D(nn.Module):
         stacked_cond_grids: Optional[torch.Tensor] = None
         
         self.logger.debug(f"sample called with mode: {mode}, condition_args keys: {list(condition_args.keys())}")
-
-        if mode == ConditionMode.BASEMODEL:
+        if mode == ConditionMode.BASELINE_EVAL:
+                stacked_cond_grids = condition_args.get("direct_condition")
+                if stacked_cond_grids is None:
+                    raise ValueError("sample (BASELINE_EVAL mode): 需要在 condition_args 中提供 'direct_condition'。")
+        elif mode == ConditionMode.BASEMODEL:
             hour_s = condition_args.get("hour_scalars_batch")
             is_hol_s = condition_args.get("is_holiday_scalars_batch")
             if hour_s is None or is_hol_s is None or hour_s.shape[0] != batch_size or is_hol_s.shape[0] != batch_size:
@@ -1211,6 +1224,9 @@ class BaselineDataset(Dataset):
         self.logger.info(f"BaselineDataset (mode={self.mode}) 初始化完成，含 {len(self.df_processed)} 筆樣本。")
 
     def _get_original_cond_values(self, col_name):
+        # 確保 'hoilday' 的拼寫錯誤被修正
+        if col_name == 'holiday' and 'holiday' not in self.df_processed.columns and 'hoilday' in self.df_processed.columns:
+            col_name = 'hoilday'
         return pd.to_numeric(self.df_processed[col_name], errors='coerce').values
 
     def _calculate_norm_stats(self, values_np, col_name):
@@ -1222,12 +1238,13 @@ class BaselineDataset(Dataset):
         self.feature_columns = self.config.get("baseline_feature_columns", [])
         self.original_values_dict = {col: self._get_original_cond_values(col) for col in self.feature_columns}
         if self.mode == 'train':
-            self.norm_stats_dict = {col: self._calculate_norm_stats(vals, col) for col, vals in self.original_values_dict.items()}
+            raise NotImplementedError("BaselineDataset 在此腳本中僅用於測試模式")
         else:
+            if norm_stats_from_train is None:
+                raise ValueError("測試模式需要從 Baseline 檢查點傳入 cond_norm_stats。")
             self.norm_stats_dict = norm_stats_from_train
 
     def _calculate_or_load_targets(self, target_info_from_train):
-        # 此處的目標分類邏輯應與 MultiStageDataset 中的邏輯完全一致，以確保公平比較
         self.hour_category_for_target_grouping_np = (self.df_processed['時'].values > 8).astype(int)
         self.is_holiday_for_target_np = self.df_processed['holiday'].astype(bool).astype(int).values
         s2_vals = pd.to_numeric(self.df_processed[self.config["stage2_new_condition_feature_column"]], errors='coerce').values
@@ -1236,12 +1253,11 @@ class BaselineDataset(Dataset):
         self.s3_cond_category_for_target_np = (~(pd.Series(s3_vals) <= self.config["stage3_new_conditional_value"])).astype(int)
         self.s4_cond_category_for_target_np = np.zeros(len(self.df_processed), dtype=int)
         
-        if self.mode == 'train':
-            # ... (此處省略訓練模式的目標計算，因為我們只在測試模式使用)
+        if self.mode != 'test':
             raise NotImplementedError("BaselineDataset 在此腳本中僅用於測試模式")
-        else: # 'val' or 'test'
-            self.average_flow_map_dict = target_info_from_train["avg_flow_map"]
-            self.norm_stats_target = target_info_from_train["norm_stats"]
+        
+        self.average_flow_map_dict = target_info_from_train["avg_flow_map"]
+        self.norm_stats_target = target_info_from_train["norm_stats"]
 
     def __len__(self):
         return len(self.df_processed)
@@ -1261,8 +1277,11 @@ class BaselineDataset(Dataset):
             val = self.original_values_dict[col_name][idx]
             stats = self.norm_stats_dict[col_name]
             norm_val = (val - stats['mean']) / stats['std'] if not np.isnan(val) else 0.0
-            condition_grids.append(torch.full((1, self.D, self.H, self.W), float(norm_val)))
-        condition_tensor_norm = torch.cat(condition_grids, dim=1) # Baseline 使用 5 通道
+            # 建立 (C=1, D=1, H, W) 的張量
+            condition_grids.append(torch.full((1, self.D, self.H, self.W), float(norm_val), dtype=torch.float32))
+        
+        # DataLoader 會自動在 dim=0 加上批次維度
+        condition_tensor_norm = torch.cat(condition_grids, dim=0) 
 
         return target_tensor_norm, condition_tensor_norm
         
@@ -1434,29 +1453,24 @@ def plot_grid_with_error_long_term(
                         prefix: str = "test_eval"
                        ):
     logger_func = logging.getLogger(__name__) # 確保 logger 在函數作用域內可用
-    save_dir = config.get("stage4_model_save_dir", config["save_dir"]) 
+    save_dir = config.get("stage4_model_save_dir", config.get("save_dir")) 
     os.makedirs(save_dir, exist_ok=True)
 
     H, W = config["H"], config["W"]
 
-    # 從 config 中獲取網格映射信息，這些資訊應在加載 Basemodel 檢查點時被緩存
+    # 從 config 中獲取網格映射信息
     sorted_flow_columns_map = config.get("cached_basemodel_sorted_flow_columns")
     grid_idx_to_rc_map_plot = config.get("cached_basemodel_grid_idx_to_rc_map")
     selected_sensor_info_plot = config.get("cached_basemodel_selected_sensor_info")
 
     if not all([sorted_flow_columns_map, grid_idx_to_rc_map_plot, selected_sensor_info_plot]):
-        logger_func.error("plot_grid_with_error_long_term: CONFIG 中缺少必要的網格映射資訊 "
-                          "(cached_basemodel_sorted_flow_columns, cached_basemodel_grid_idx_to_rc_map, "
-                          "cached_basemodel_selected_sensor_info)。請確保 Basemodel 檢查點已載入這些資訊到 CONFIG。")
+        logger_func.error("plot_grid_with_error_long_term: CONFIG 中缺少必要的網格映射資訊。")
         return
 
     selected_sensor_info_dict = {info['name']: (info['lon'], info['lat'])
                                  for info in selected_sensor_info_plot if isinstance(info, dict) and 'name' in info}
 
-    actual_sensor_lons = []
-    actual_sensor_lats = []
-    valid_grid_indices_flat = []
-
+    actual_sensor_lons, actual_sensor_lats, valid_grid_indices_flat = [], [], []
     for flat_grid_idx in range(H * W):
         if flat_grid_idx < len(sorted_flow_columns_map):
             col_name = sorted_flow_columns_map[flat_grid_idx]
@@ -1465,86 +1479,92 @@ def plot_grid_with_error_long_term(
                 actual_sensor_lons.append(lon)
                 actual_sensor_lats.append(lat)
                 valid_grid_indices_flat.append(flat_grid_idx)
-            else:
-                logger_func.debug(f"plot_grid_with_error: Column {col_name} (grid_idx {flat_grid_idx}) not in selected_sensor_info_dict.")
-        else:
-            logger_func.warning(f"plot_grid_with_error: flat_grid_idx {flat_grid_idx} out of bounds for sorted_flow_columns (len: {len(sorted_flow_columns_map)}).")
 
     if not actual_sensor_lons:
-        logger_func.error("plot_grid_with_error: Could not retrieve coordinates for any grid points.")
+        logger_func.error("plot_grid_with_error: 無法獲取任何網格點的座標。")
         return
 
-    cdict_red_to_black = {
-        'red':   ((0.0, 1.0, 1.0), (1.0, 0.0, 0.0)),
+    # --- 修改開始：定義兩種色票 ---
+
+    # 1. 原始的「黑到紅」色票，用於絕對誤差 (MSE, MAE...)
+    cdict_black_to_red = {
+        'red':   ((0.0, 0.0, 0.0), (1.0, 1.0, 1.0)),
         'green': ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0)),
         'blue':  ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0))
     }
-    red_to_black_cmap = mcolors.LinearSegmentedColormap('RedToBlack', cdict_red_to_black)
+    black_to_red_cmap = mcolors.LinearSegmentedColormap('BlackToRed', cdict_black_to_red)
+
+    # 2. 新的「紅-黑-綠」發散色票，用於差異圖 (Difference)
+    #    紅色代表負數，綠色代表正數，中心為黑色
+    cdict_div_RedBlackGreen = {
+        'red':   ((0.0, 1.0, 1.0), (0.5, 0.0, 0.0), (1.0, 0.0, 0.0)),
+        'green': ((0.0, 0.0, 0.0), (0.5, 0.0, 0.0), (1.0, 1.0, 1.0)),
+        'blue':  ((0.0, 0.0, 0.0), (0.5, 0.0, 0.0), (1.0, 0.0, 0.0))
+    }
+    RedBlackGreen_div_cmap = mcolors.LinearSegmentedColormap('RedBlackGreenDiv', cdict_div_RedBlackGreen)
+
+    # --- 修改結束 ---
+
 
     for metric_name, error_grid_flat in error_metrics_grids.items():
         if not isinstance(error_grid_flat, np.ndarray) or error_grid_flat.ndim == 0 or error_grid_flat.shape[0] != H*W :
-            logger_func.error(f"Dimension of error_grid for metric {metric_name} ({error_grid_flat.shape if isinstance(error_grid_flat, np.ndarray) else type(error_grid_flat)}) is incorrect. Expected ({H*W},). Skipping plot.")
+            logger_func.error(f"指標 {metric_name} 的誤差網格維度不正確。跳過繪圖。")
             continue
 
-        # 過濾掉 error_grid_flat 中對應 valid_grid_indices_flat 的值
-        # 確保只使用有效的網格點對應的誤差值進行繪圖
-        if len(valid_grid_indices_flat) != len(actual_sensor_lons):
-             logger_func.warning("Mismatch between valid_grid_indices_flat and actual_sensor_lons. Plot may be incorrect.")
-             # Fallback or error, for now, we proceed but this indicates an issue.
-
-        # 僅提取有效網格點的誤差值進行繪圖
         error_values_for_plot = error_grid_flat[valid_grid_indices_flat]
         
         if len(error_values_for_plot) == 0:
-            logger_func.warning(f"No valid error values to plot for metric {metric_name} after filtering. Skipping plot.")
+            logger_func.warning(f"沒有可用於繪圖的有效誤差值：{metric_name}。跳過繪圖。")
             continue
         
-        # 處理可能的 inf/nan 值，避免繪圖錯誤
-        error_values_for_plot_finite = error_values_for_plot[np.isfinite(error_values_for_plot)]
-        if len(error_values_for_plot_finite) == 0 and len(error_values_for_plot) > 0 : # 如果全是inf/nan
-             logger_func.warning(f"All error values for metric {metric_name} are non-finite. Setting to 0 for plotting.")
-             error_values_for_plot_display = np.full_like(error_values_for_plot, np.nan, dtype=float)
-             min_val, max_val = 0,1 # 給定預設範圍
-        elif len(error_values_for_plot_finite) == 0 and len(error_values_for_plot) == 0:
-            logger_func.warning(f"No error values to plot for metric {metric_name}.")
-            continue
+        error_values_for_plot_display = np.where(np.isfinite(error_values_for_plot), error_values_for_plot, np.nan)
+        
+        # --- 修改開始：根據指標名稱選擇色票和顏色範圍 ---
+        is_diff_plot = 'diff' in metric_name.lower()
+
+        if is_diff_plot:
+            # 這是差異圖，使用發散色票
+            cmap_to_use = RedBlackGreen_div_cmap
+            # 計算對稱的顏色範圍，讓 0 對應黑色
+            abs_max = np.nanmax(np.abs(error_values_for_plot_display))
+            if abs_max == 0 or np.isnan(abs_max): abs_max = 1.0 # 避免範圍為0
+            vmin, vmax = -abs_max, abs_max
+            title_to_display = f"Geographic Grid Error Difference - {metric_name} ({prefix})"
         else:
-            error_values_for_plot_display = np.where(np.isfinite(error_values_for_plot), error_values_for_plot, np.nan) # 非有限值設為nan
+            # 這是一般的絕對誤差圖，使用黑到紅色票
+            cmap_to_use = black_to_red_cmap
+            # 範圍是從最小值到最大值
             min_val = np.nanmin(error_values_for_plot_display)
             max_val = np.nanmax(error_values_for_plot_display)
+            if np.isnan(min_val) or np.isnan(max_val) or min_val == max_val:
+                min_val, max_val = 0.0, 1.0 # 提供預設範圍
+            vmin, vmax = min_val, max_val
+            title_to_display = f"Geographic Grid Error Heatmap - {metric_name.upper()} ({prefix})"
+        # --- 修改結束 ---
 
 
         plt.figure(figsize=(12, 12))
-        # 使用新的 red_to_black_cmap，並傳遞 vmin 和 vmax
-        if min_val == max_val: # 如果所有有限值都相同
-            if np.isnan(min_val): # 如果全是nan
-                 min_val, max_val = 0,1
-            else: # 如果是同一個數
-                 min_val = min_val - 0.5 if min_val != 0 else -0.5
-                 max_val = max_val + 0.5 if max_val != 0 else 0.5
-        
         scatter = plt.scatter(actual_sensor_lons, actual_sensor_lats, c=error_values_for_plot_display, 
-                                cmap=red_to_black_cmap, marker='s', s=100, vmin=min_val, vmax=max_val)
+                                cmap=cmap_to_use, marker='s', s=100, vmin=vmin, vmax=vmax)
         
         plt.colorbar(scatter, label=metric_name)
 
-        if metric_name.upper() != 'MSE': # 只有非 MSE 的指標圖才在網格上顯示數字
+        if metric_name.upper() != 'MSE':
             for i in range(len(actual_sensor_lons)):
                 val_to_text = error_values_for_plot_display[i]
-                if not np.isnan(val_to_text): # 只顯示有限的數值
+                if not np.isnan(val_to_text):
                     plt.text(actual_sensor_lons[i], actual_sensor_lats[i],
                              f'{val_to_text:.0f}',
                              fontsize=6, color='white', ha='center', va='center')
 
         plt.xlabel("Longitude")
         plt.ylabel("Latitude")
-        plt.title(f"Geographic Grid Error Heatmap - {metric_name.upper()} ({prefix})")
+        plt.title(title_to_display)
         plt.grid(True, linestyle=':', alpha=0.6)
-        plt.gca().set_aspect('equal', adjustable='box') # 確保地理比例正確
-        plt.savefig(os.path.join(save_dir, f'{prefix}_grid_{metric_name.lower()}.png'), dpi=300, bbox_inches='tight')
+        plt.gca().set_aspect('equal', adjustable='box')
+        plt.savefig(os.path.join(save_dir, f'{prefix}_grid_{metric_name.lower().replace(" ", "_")}.png'), dpi=300, bbox_inches='tight')
         plt.close()
-        logger_func.info(f"Saved {metric_name} geographic grid error map for {prefix}.")
-                        
+        logger_func.info(f"已儲存 {metric_name} 的地理網格誤差圖: {prefix}")                        
 
 def truncate_colormap(cmap, minval: float = 0.0, maxval: float = 1.0, n: int = 256):
     new_cmap = mcolors.LinearSegmentedColormap.from_list(
@@ -2048,8 +2068,6 @@ def evaluate_baseline_model_for_comparison(
     prefix: str = "eval_baseline"
 ) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
     
-    # [注意] 此函式是 evaluate_baseline_model 的簡化版，專用於此處的比較
-    # 它返回與 evaluate_model 相同的指標結構
     model_trained.eval()
     target_mean, target_std = target_norm_stats['mean'], target_norm_stats['std']
     all_generated_denorm, all_target_denorm = [], []
@@ -2057,7 +2075,14 @@ def evaluate_baseline_model_for_comparison(
 
     for target_norm_b, cond_norm_b in dataloader:
         target_norm, cond_norm = target_norm_b.to(config["device"]), cond_norm_b.to(config["device"])
-        generated_norm = model_trained.sample(target_norm.shape[0], cond_norm) # 直接呼叫 Baseline 的 sample
+        
+        # *** 關鍵修正 ***
+        # 直接將已經組裝好的 5 通道條件張量傳遞給 sample 函式
+        generated_norm = model_trained.sample(
+             batch_size=target_norm.shape[0],
+             mode=ConditionMode.BASELINE_EVAL, # 使用一個特殊模式告訴 sample 直接使用條件
+             condition_args={"direct_condition": cond_norm}
+        )
         
         generated_denorm = generated_norm * target_std + target_mean
         target_denorm = target_norm * target_std + target_mean
@@ -2066,10 +2091,9 @@ def evaluate_baseline_model_for_comparison(
         all_generated_norm.append(generated_norm.cpu())
         all_target_norm.append(target_norm.cpu())
 
+    # --- 後續指標計算不變 ---
     pred_t = torch.cat(all_generated_denorm, dim=0)
     target_t = torch.cat(all_target_denorm, dim=0)
-    
-    # 指標計算 (與 evaluate_model 內部的邏輯完全一致)
     epsilon=1e-8
     mse = F.mse_loss(pred_t, target_t).item()
     mae = F.l1_loss(pred_t, target_t).item()
@@ -2080,17 +2104,12 @@ def evaluate_baseline_model_for_comparison(
     smape_avg_grid = torch.mean((errors / smape_denom) * 100).item()
     mape_overall = (torch.sum(errors) / (torch.sum(actual_vals) + epsilon)).item() * 100
     smape_overall = (200.0 * torch.sum(errors) / (torch.sum(actual_vals + torch.abs(pred_t)) + epsilon)).item()
-
-    # FID 計算
     gen_fid_tensor = torch.cat(all_generated_norm, dim=0)
     real_fid_tensor = torch.cat(all_target_norm, dim=0)
     act_gen = get_activations(gen_fid_tensor, inception_model_fid, config["device"], config["fid_batch_size"])
     act_real = get_activations(real_fid_tensor, inception_model_fid, config["device"], config["fid_batch_size"])
     fid = calculate_fid(act_real, act_gen)
-
     results = {"mse": mse, "mae": mae, "mape_avg_grid": mape_avg_grid, "smape_avg_grid": smape_avg_grid, "mape_overall": mape_overall, "smape_overall": smape_overall, "fid": fid}
-    
-    # 逐網格誤差
     pred_s, target_s = pred_t.squeeze(1).squeeze(1), target_t.squeeze(1).squeeze(1)
     mse_g = torch.mean((pred_s - target_s)**2, dim=0).cpu().numpy()
     mae_g = torch.mean(torch.abs(pred_s - target_s), dim=0).cpu().numpy()
@@ -2120,11 +2139,14 @@ if __name__ == '__main__':
 
     # --- 載入完整數據 ---
     full_df = pd.read_csv(CONFIG["data_path"])
+    if 'hoilday' in full_df.columns and 'holiday' not in full_df.columns:
+        logger.info("偵測到欄位名稱 'hoilday'，自動更名為 'holiday' 以修正拼寫錯誤。")
+        full_df.rename(columns={'hoilday': 'holiday'}, inplace=True)
     logger.info(f"已載入資料: {CONFIG['data_path']}. 形狀: {full_df.shape}")
     # === 新增步驟：創建「組合特徵」欄位 ===
-    if '月' in full_df.columns and '日' in full_df.columns:
-        full_df['month_day_combined'] = full_df['月'] * 31 + full_df['日']
-        logger.info("已成功創建 'month_day_combined' 組合特徵欄位。")
+    if '月' in full_df.columns and '日' in full_df.columns and '年' in full_df.columns:
+        full_df['date_combined'] = (full_df['年'] - 2018) * 365 + full_df['月'] * 31 + full_df['日']
+        logger.info("已成功創建 'month_day_cdate_combinedombined' 組合特徵欄位。")
     else:
         raise ValueError("DataFrame 中缺少 '月' 或 '日' 欄位，無法創建組合特徵。")
 
@@ -2415,6 +2437,7 @@ if __name__ == '__main__':
     
     if event_filter_config["enabled"]:
         event_file_path = event_filter_config["file_path"]
+        year_col = event_filter_config["year_col"]
         month_col = event_filter_config["month_col"]
         day_col = event_filter_config["day_col"]
         
@@ -2426,15 +2449,17 @@ if __name__ == '__main__':
         events_df = pd.read_excel(event_file_path)
 
         # 檢查必要欄位是否存在
-        if not all(col in events_df.columns for col in [month_col, day_col]):
-            raise ValueError(f"Excel 檔案 '{event_file_path}' 中缺少必要的欄位:'{month_col}', 或 '{day_col}'")
+        required_cols = [year_col, month_col, day_col]
+        if not all(col in events_df.columns for col in required_cols):
+            raise ValueError(f"Excel 檔案 '{event_file_path}' 中缺少必要的欄位，需要: {required_cols}")
 
-        event_month_day_set = set(zip(events_df[month_col], events_df[day_col]))
-        logger.info(f"從檔案中提取了 {len(event_month_day_set)} 個不重複的活動日期 (月, 日)。")
+        #event_date_set = set(zip(events_df[year_col], events_df[month_col], events_df[day_col]))
+        event_date_set = set(zip(events_df[month_col], events_df[day_col]))
+        logger.info(f"從檔案中提取了 {len(event_date_set)} 個不重複的活動日期 (年, 月, 日)。")
 
         # 3. 根據 (月, 日) 集合，在主 DataFrame 上創建布林遮罩
-        final_mask = full_df.apply(lambda row: (row['月'], row['日']) in event_month_day_set, axis=1)
-
+        #final_mask = full_df.apply(lambda row: (row['年'], row['月'], row['日']) in event_date_set, axis=1)
+        final_mask = full_df.apply(lambda row: (row['月'], row['日']) in event_date_set, axis=1)
     else:
         # 如果禁用事件過濾，則預設不過濾任何數據
         logger.info("事件過濾已禁用，將使用所有數據進行 Stage 4 訓練。")
@@ -2530,7 +2555,7 @@ if __name__ == '__main__':
         )
         test_loader_s4_final = DataLoader(test_dataset_s4, batch_size=CONFIG["eval_batch_size"], shuffle=False, num_workers=CONFIG["num_workers"], pin_memory=True)
         logger.info(f"Stage4 測試數據集創建，含 {len(test_dataset_s4)} 樣本。")
-
+#%%
     # --- Stage4 模型訓練迴圈 ---
     stage4_model: Optional[DDPM3D] = None 
     stage4_model_save_checkpoint_path_full = CONFIG["stage4_checkpoint_full_path"]
@@ -2638,7 +2663,7 @@ if __name__ == '__main__':
                 avg_val_loss_s4_to_record = float('inf')
                 val_calculated_this_epoch_s4 = False
                 if val_loader_s4_final and hasattr(val_loader_s4_final, 'dataset') and len(val_loader_s4_final.dataset) > 0:
-                    if epoch_s4_current == epochs_to_run_s4 or \
+                    if epoch_s4_current == 1 or epoch_s4_current == epochs_to_run_s4 or \
                        (epoch_s4_current >= start_epoch_s4 and (epoch_s4_current - start_epoch_s4 + 1) % val_freq_s4 == 0) :
                         val_calculated_this_epoch_s4 = True
                         stage4_model.eval()
@@ -2763,8 +2788,7 @@ if __name__ == '__main__':
         if not os.path.exists(baseline_model_path):
             logger.error(f"未找到 Baseline 模型檢查點: {baseline_model_path}，跳過比較。")
         else:
-            chkpt_baseline = torch.load(baseline_model_path, map_location=CONFIG["device"])
-            cfg_baseline = chkpt_baseline['config_snapshot_at_save']
+            chkpt_baseline = torch.load(baseline_model_path, map_location=CONFIG["device"], weights_only=False)
             
             unet_baseline = UNet3D(cfg_baseline["image_channels"], cfg_baseline["base_channels_unet"], cfg_baseline["time_emb_dim"], cfg_baseline["condition_encode_dim"], dropout_rate=cfg_baseline["unet_dropout_rate"]).to(CONFIG["device"])
             final_baseline_model_to_eval = DDPM3D(
@@ -2777,7 +2801,9 @@ if __name__ == '__main__':
             logger.info(f"Baseline 模型載入完成。")
 
             baseline_test_dataset = BaselineDataset(
-                df_for_processing=df_for_s4_specialist.iloc[s4_test_indices], config=cfg_baseline, mode='test',
+                df_for_processing=df_for_s4_specialist.iloc[s4_test_indices], 
+                config=CONFIG,  # <--- 修改點：直接使用全域 CONFIG 字典
+                mode='test',
                 norm_stats_from_train=chkpt_baseline['cond_norm_stats'],
                 target_info_from_train={"avg_flow_map": chkpt_baseline['target_avg_flow_map'], "norm_stats": chkpt_baseline['target_norm_stats']}
             )
@@ -2792,14 +2818,6 @@ if __name__ == '__main__':
             final_baseline_metrics = {"baseline_model": baseline_metrics_raw}
             final_baseline_error_grids = {"baseline_model": baseline_error_grids_raw}
             logger.info(f"Baseline 最終評估指標: {json.dumps(final_baseline_metrics, indent=2)}")
-
-            # --- [新增] 為 Baseline 模型產生獨立的地理誤差圖 ---
-            plot_grid_with_error_long_term(
-                dataset_for_coords=baseline_test_dataset,
-                error_metrics_grids=baseline_error_grids_raw,
-                config=CONFIG,
-                prefix="final_baseline_evaluation_grid_errors"
-            )
 
         # 3. --- [修改] 合併所有結果並處理誤差差異 ---
         logger.info("合併 Stage4, Stage3, 和 Baseline 的評估結果...")

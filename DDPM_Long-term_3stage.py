@@ -77,10 +77,9 @@ CONFIG = {
     "seed": 42,
     "weight_decay": 1e-5,
     "lr_scheduler_factor": 0.5,
-    "lr_scheduler_patience": 3,
+    "lr_scheduler_patience": 4,
     "lr_scheduler_min_lr": 1e-7,
-    "early_stopping_patience": 6,
-    "val_calculation_freq": 3,
+    "early_stopping_patience": 8,
 
     # --- 評估參數 ---
     "eval_batch_size": 256,
@@ -2227,26 +2226,23 @@ if __name__ == '__main__':
                 logger.error(f"從 Stage3 檢查點恢復訓練失敗: {e}。將從當前模型狀態開始訓練。")
                 # start_epoch_s3_train 等變數保持預設值或基於 Stage2 初始化的狀態
 
-        epochs_to_run_s3 = CONFIG.get("epochs", 100)
+        epochs_to_run_s3 = CONFIG.get("epochs", 128)
         logger.info(f"開始訓練 Stage3 模型: {CONFIG['stage3_model_name']} for {epochs_to_run_s3} epochs...")
 
         # --- 主 Epoch 迴圈 for Stage3 ---
         epoch_pbar_s3 = tqdm(range(start_epoch_s3_train, epochs_to_run_s3 + 1),
-                             desc=f"Stage3 Training ({CONFIG['stage3_model_name']})",
-                             leave=True, position=0, dynamic_ncols=True, unit="epoch")
+                            desc=f"Stage3 Training ({CONFIG['stage3_model_name']})",
+                            leave=True, position=0, dynamic_ncols=True, unit="epoch")
 
         for epoch_s3_current in epoch_pbar_s3:
+            # --- 訓練階段 ---
             stage3_model.train()
             total_train_loss_epoch_s3 = 0.0
-
             train_pbar_s3_loop = tqdm(train_loader_s3_final,
-                                      desc=f"Epoch {epoch_s3_current} [S3 Train]",
-                                      leave=False, position=1, dynamic_ncols=True, unit="batch")
+                                    desc=f"Epoch {epoch_s3_current} [S3 Train]",
+                                    leave=False, position=1, dynamic_ncols=True, unit="batch")
             
-            # Stage3Dataset __getitem__ returns 9 items
-            for target_s3_b, s2_out_grid_b, s3_new_feat_grid_b, \
-                _, _, _, _, _, _ in train_pbar_s3_loop:
-
+            for target_s3_b, s2_out_grid_b, s3_new_feat_grid_b, _, _, _, _, _, _ in train_pbar_s3_loop:
                 optimizer_s3.zero_grad()
                 target_s3_b = target_s3_b.to(CONFIG["device"])
                 s2_out_grid_b = s2_out_grid_b.to(CONFIG["device"]) # Cond1 for S3
@@ -2266,110 +2262,78 @@ if __name__ == '__main__':
 
             avg_train_loss_epoch_s3 = total_train_loss_epoch_s3 / len(train_loader_s3_final) if len(train_loader_s3_final) > 0 else 0.0
             metrics_hist_s3_train['train_loss'].append(avg_train_loss_epoch_s3)
-            current_lr_epoch_s3 = optimizer_s3.param_groups[0]['lr']
-            metrics_hist_s3_train['lr'].append(current_lr_epoch_s3)
-
-            # --- Stage3 驗證邏輯 ---
-            avg_val_loss_s3_to_record = float('inf')
-            val_calculated_this_epoch_s3 = False
-            val_freq_s3 = CONFIG.get("val_calculation_freq", 4)
-
-            should_validate_this_epoch_s3 = False
+            
+            # --- 驗證階段 (每個 Epoch 都執行) ---
+            stage3_model.eval()
+            total_val_loss_epoch_s3 = 0.0
+            
             if val_loader_s3_final and hasattr(val_loader_s3_final, 'dataset') and len(val_loader_s3_final.dataset) > 0:
-                if epoch_s3_current == epochs_to_run_s3: # 最後一個 epoch 必須驗證
-                    should_validate_this_epoch_s3 = True
-                elif epoch_s3_current >= start_epoch_s3_train and (epoch_s3_current - start_epoch_s3_train +1) % val_freq_s3 == 0 : # 確保第一個 epoch 也可能驗證
-                     should_validate_this_epoch_s3 = True
-
-
-            if should_validate_this_epoch_s3:
-                val_calculated_this_epoch_s3 = True
-                stage3_model.eval()
-                total_val_loss_p_s3_epoch = 0.0
-                num_val_samples_p_s3_epoch = 0
-                actual_avg_val_loss_this_epoch_s3 = float('inf')
-
-                val_pbar_s3_loop = tqdm(val_loader_s3_final,
-                                        desc=f"Epoch {epoch_s3_current} [S3 Validate]",
-                                        leave=False, position=1, dynamic_ncols=True, unit="batch")
                 with torch.no_grad():
-                    for target_s3_val_norm, s2_out_val_cond, s3_new_feat_val_cond, \
-                        _, _, _, _, _, _ in val_pbar_s3_loop:
-                        
+                    val_pbar_s3_loop = tqdm(val_loader_s3_final,
+                                            desc=f"Epoch {epoch_s3_current} [S3 Validate]",
+                                            leave=False, position=1, dynamic_ncols=True, unit="batch")
+                    for target_s3_val_norm, s2_out_val_cond, s3_new_feat_val_cond, _, _, _, _, _, _ in val_pbar_s3_loop:
                         target_s3_val_norm = target_s3_val_norm.to(CONFIG["device"])
                         s2_out_val_cond = s2_out_val_cond.to(CONFIG["device"])
                         s3_new_feat_val_cond = s3_new_feat_val_cond.to(CONFIG["device"])
 
-                        s3_generated_val_norm = stage3_model.sample(
-                            batch_size=target_s3_val_norm.shape[0],
+                        # 使用 p_losses 快速計算驗證損失
+                        t_s3_val_b = torch.randint(0, stage3_model.timesteps, (target_s3_val_norm.shape[0],), device=CONFIG["device"]).long()
+                        val_loss_b_s3 = stage3_model.p_losses(
+                            x_start_target_flow=target_s3_val_norm,
+                            t=t_s3_val_b,
                             stage2_output_grid_batch_for_s3=s2_out_val_cond,
                             stage3_new_condition_feature_grid_batch=s3_new_feat_val_cond
                         )
-                        
-                        # 使用 train_dataset_s3 的 norm_stats_stage3_target 進行反正規化
-                        s3_target_stats_for_denorm = train_dataset_s3.norm_stats_stage3_target
-                        val_target_mean_s3 = s3_target_stats_for_denorm['mean']
-                        val_target_std_s3 = s3_target_stats_for_denorm['std']
-                        if val_target_std_s3 < 1e-6: val_target_std_s3 = 1.0
+                        total_val_loss_epoch_s3 += val_loss_b_s3.item()
 
-                        s3_generated_val_denorm = s3_generated_val_norm * val_target_std_s3 + val_target_mean_s3
-                        s3_target_val_denorm = target_s3_val_norm * val_target_std_s3 + val_target_mean_s3
-                        s3_generated_val_denorm = torch.clamp(s3_generated_val_denorm, min=0.0)
+                avg_val_loss_s3 = total_val_loss_epoch_s3 / len(val_loader_s3_final)
+            else:
+                avg_val_loss_s3 = float('inf') # 若驗證集為空，設為無效值
 
-                        val_loss_b_s3 = F.mse_loss(s3_generated_val_denorm, s3_target_val_denorm).item()
+            metrics_hist_s3_train['val_loss'].append(avg_val_loss_s3)
 
-                        if not np.isnan(val_loss_b_s3):
-                            total_val_loss_p_s3_epoch += val_loss_b_s3 * target_s3_val_norm.shape[0]
-                            num_val_samples_p_s3_epoch += target_s3_val_norm.shape[0]
-                        val_pbar_s3_loop.set_postfix({"Val Batch MSE": f"{val_loss_b_s3:.5f}" if not np.isnan(val_loss_b_s3) else "NaN"})
-                
-                if num_val_samples_p_s3_epoch > 0:
-                    actual_avg_val_loss_this_epoch_s3 = total_val_loss_p_s3_epoch / num_val_samples_p_s3_epoch
-                else:
-                    logger.warning(f"Stage3 Epoch {epoch_s3_current}: 驗證時處理的樣本數為0。")
-                    actual_avg_val_loss_this_epoch_s3 = float('inf')
-                
-                avg_val_loss_s3_to_record = actual_avg_val_loss_this_epoch_s3
+            # --- 更新、日誌、儲存與早停 ---
+            
+            # 使用驗證損失來更新學習率排程器
+            scheduler_s3.step(avg_val_loss_s3)
+            current_lr_epoch_s3 = optimizer_s3.param_groups[0]['lr']
+            metrics_hist_s3_train['lr'].append(current_lr_epoch_s3)
 
-                if actual_avg_val_loss_this_epoch_s3 != float('inf'):
-                    scheduler_s3.step(actual_avg_val_loss_this_epoch_s3)
-                    if actual_avg_val_loss_this_epoch_s3 < best_val_loss_s3_train:
-                        best_val_loss_s3_train = actual_avg_val_loss_this_epoch_s3
-                        early_stopping_counter_s3_train = 0
-                        tqdm.write(f"Epoch {epoch_s3_current}: 新最佳 Stage3 模型已儲存 (Val Loss: {best_val_loss_s3_train:.5f})。")
-                        
-                        torch.save({
-                            'epoch': epoch_s3_current,
-                            'ddpm_state_dict': stage3_model.state_dict(),
-                            'optimizer_state_dict': optimizer_s3.state_dict(),
-                            'scheduler_state_dict': scheduler_s3.state_dict(),
-                            'best_val_loss_s3': best_val_loss_s3_train,
-                            'config_snapshot_at_save': CONFIG, # 儲存當前的全局 CONFIG
-                            'metrics_hist_s3': metrics_hist_s3_train,
-                            'early_stopping_counter_s3': early_stopping_counter_s3_train,
-                            # 從 train_dataset_s3 獲取並儲存統計數據
-                            's3_new_cond_feature_norm_stats': train_dataset_s3.norm_stats_s3_new_cond_feature,
-                            'stage3_avg_flow_map_dict': train_dataset_s3.average_flow_map_dict_s3,
-                            'norm_stats_stage3_target': train_dataset_s3.norm_stats_stage3_target
-                        }, stage3_model_save_checkpoint_path_full)
-                    else: # 驗證損失沒有改善
-                        early_stopping_counter_s3_train += 1
-            else: # 本 epoch 不執行驗證 (或驗證 loader 為空)
-                avg_val_loss_s3_to_record = metrics_hist_s3_train['val_loss'][-1] if metrics_hist_s3_train['val_loss'] else float('inf')
-
-            metrics_hist_s3_train['val_loss'].append(avg_val_loss_s3_to_record)
-            val_loss_display_s3 = f"{avg_val_loss_s3_to_record:.5f}" if avg_val_loss_s3_to_record != float('inf') else "N/A"
-            if val_calculated_this_epoch_s3 and avg_val_loss_s3_to_record != float('inf'):
-                val_loss_display_s3 += " (Calc)"
-
+            val_loss_display_s3 = f"{avg_val_loss_s3:.5f}" if avg_val_loss_s3 != float('inf') else "N/A"
+            
+            # 更新主 epoch 進度條的後綴信息
             epoch_pbar_s3.set_postfix_str(f"Tr_Loss: {avg_train_loss_epoch_s3:.4f}, Val_Loss: {val_loss_display_s3}, LR: {current_lr_epoch_s3:.1e}, ES: {early_stopping_counter_s3_train}/{CONFIG.get('early_stopping_patience', 6)}")
+
+            # 使用驗證損失來判斷是否儲存最佳模型與早停
+            if avg_val_loss_s3 < best_val_loss_s3_train:
+                best_val_loss_s3_train = avg_val_loss_s3
+                early_stopping_counter_s3_train = 0
+                tqdm.write(f"Epoch {epoch_s3_current}: 新最佳 Stage3 模型已儲存 (Val Loss: {best_val_loss_s3_train:.5f})。")
+                
+                torch.save({
+                    'epoch': epoch_s3_current,
+                    'ddpm_state_dict': stage3_model.state_dict(),
+                    'optimizer_state_dict': optimizer_s3.state_dict(),
+                    'scheduler_state_dict': scheduler_s3.state_dict(),
+                    'best_val_loss_s3': best_val_loss_s3_train,
+                    'config_snapshot_at_save': CONFIG,
+                    'metrics_hist_s3': metrics_hist_s3_train,
+                    'early_stopping_counter_s3': early_stopping_counter_s3_train,
+                    's3_new_cond_feature_norm_stats': train_dataset_s3.norm_stats_s3_new_cond_feature,
+                    'stage3_avg_flow_map_dict': train_dataset_s3.average_flow_map_dict_s3,
+                    'norm_stats_stage3_target': train_dataset_s3.norm_stats_stage3_target
+                }, stage3_model_save_checkpoint_path_full)
+            else: # 驗證損失沒有改善
+                early_stopping_counter_s3_train += 1
 
             if early_stopping_counter_s3_train >= CONFIG.get("early_stopping_patience", 6):
                 tqdm.write(f"Stage3 訓練因早停機制觸發於 Epoch {epoch_s3_current}。")
                 break
-        
+
         if 'epoch_pbar_s3' in locals() and isinstance(epoch_pbar_s3, tqdm):
             epoch_pbar_s3.close()
+
         logger.info(f"Stage3 模型 '{CONFIG['stage3_model_name']}' 訓練完成。")
         # Log final stats
         final_train_loss_s3 = metrics_hist_s3_train['train_loss'][-1] if metrics_hist_s3_train['train_loss'] else float('nan')

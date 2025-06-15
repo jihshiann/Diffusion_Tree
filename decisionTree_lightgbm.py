@@ -1,3 +1,4 @@
+#%%
 import os
 import pandas as pd
 import numpy as np
@@ -9,6 +10,47 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 from sklearn.multioutput import MultiOutputRegressor
 import time
+
+# ================== CONFIG 設定區塊 ==================
+CONFIG = {
+    # 在此處指定要用於模型訓練的特徵（中文名稱）。
+    # 將您想使用的特徵名稱加入到下面的列表中。
+    # 如果要使用 `feature_mapping` 中的所有特徵，請將此列表設為 None。
+    'features_to_use': [
+        '時',
+        '日',
+        '月',
+        'weekday',      
+        'ArenaEvents',
+        'hoilday'
+    ]
+    # 'features_to_use': None  # 使用所有特徵的範例，取消此行註解以啟用
+}
+# LightGBM 參數
+ind_tree_params = {
+            'objective': 'regression',
+            'metric': ['l2', 'l1'],
+            'boosting_type': 'gbdt',
+            'num_leaves': 31,
+            'learning_rate': 0.01,
+            'feature_fraction': 0.9,
+            'seed': 42
+        }
+#num_boost_round
+shared_params = {
+    'objective': 'regression',          # 任務目標：設定為 'regression' (回歸)，模型將以最小化L2損失（均方誤差）為目標進行學習。
+    'metric': ['l2', 'l1'],               # 評估指標：在訓練過程中，同時監控 'l2' (MSE, 均方誤差) 和 'l1' (MAE, 平均絕對誤差) 這兩個指標。
+    'learning_rate': 0.01,                 # 學習率：每次迭代（每棵樹）的步長縮減。較小的值有助於防止過擬合，但通常需要更多的迭代次數。
+    'num_leaves': 31,                     # 每棵樹的最大葉子節點數：控制樹模型複雜度的主要參數。值越大，樹越複雜，越容易過擬合。31是一個常見的預設值。
+    'min_data_in_leaf': 20,               # 每個葉子節點上最少的數據筆數：用於防止過擬合。如果一次分裂後，某個葉子節點的數據量少於此值，則不會進行這次分裂。
+    'feature_fraction': 0.9,              # 特徵抽樣比例：在建立每棵樹之前，隨機選取90%的特徵。這可以加速訓練並有助於防止過擬合。
+    'bagging_fraction': 0.8,              # 數據抽樣比例（不進行重採樣）：在每次迭代時，隨機選取80%的數據來訓練當前的樹。這有助於防止過擬合，也稱為子抽樣 (subsampling)。
+    'bagging_freq': 5,                    # 數據抽樣頻率：每隔5次迭代執行一次數據抽樣（bagging）。
+    'verbose': -1,                        # 控制輸出的詳細程度：-1 代表 'silent'（靜默模式），在訓練過程中不打印任何訊息。
+    'num_iterations': 10000,               # 總迭代次數（樹的數量）：模型將建立的總樹木數量。這是 'n_estimators' 的別名。
+    'early_stopping_rounds': 10,          # 提早停止的迭代次數：如果在驗證集上的評估指標連續50次迭代都沒有改善，訓練將會提早停止。此參數需要提供驗證集才能生效。
+}
+# ========================================================
 
 # ---------------------------
 # 設定與數據讀取
@@ -23,11 +65,6 @@ os.makedirs(result_dir, exist_ok=True)
 sub_dirs = ["learning_curve", "tree", "shap_summary", "shap_bar", "model", "group_tree", "individual_target_models"]
 for sub in sub_dirs:
     os.makedirs(os.path.join(result_dir, sub), exist_ok=True)
-
-# 處理角度變數
-for col in ['最大陣風風向', '風向']:
-    df[f'sin_{col}'] = np.sin(np.deg2rad(df[col]))
-    df[f'cos_{col}'] = np.cos(np.deg2rad(df[col]))
 
 # 建立特徵名稱翻譯對應表
 feature_mapping = {
@@ -49,20 +86,31 @@ feature_mapping = {
     '總雲量': 'Total_Cloud_Cover',
     'hoilday': 'Holiday',
     'weekday': 'Weekday',
-    #'年': 'Year',
+    '年': 'Year',
     '月': 'Month',
     '日': 'Day',
-    '時': 'Hour'
+    '時': 'Hour',
+    'ArenaEvents': 'ArenaEvents'
 }
 reverse_mapping = {v: k for k, v in feature_mapping.items()}
+
+# 處理角度變數，並更新 feature_mapping
+for col in ['最大陣風風向', '風向']:
+    df[f'sin_{col}'] = np.sin(np.deg2rad(df[col]))
+    df[f'cos_{col}'] = np.cos(np.deg2rad(df[col]))
+    if col in feature_mapping:
+        base_eng_name = feature_mapping[col]
+        feature_mapping[f'sin_{col}'] = f'sin_{base_eng_name}'
+        feature_mapping[f'cos_{col}'] = f'cos_{base_eng_name}'
+
 rule_statistics = {} # 用於存儲規則及其累計分數
-df_original = df.copy()
+df_original = df.copy() # df_original 現在包含 sin/cos 特徵
 
 # 提取座標欄位（假設格式為 "(經度, 緯度)"）
 target_columns = [col for col in df.columns if '(' in col and ')' in col]
 # 確保 target_columns 中的座標是唯一的，如果原始數據中可能有重複
 target_columns = sorted(list(set(target_columns)))
-print("所有座標點：", target_columns)
+print("所有座標點：", len(target_columns))
 
 # 解析座標字串函式 (如果尚未在全域定義，則移至此處或確保可訪問)
 def parse_coord_string(coord_str):
@@ -126,22 +174,54 @@ else:
     print("警告：target_columns 為空，無法進行座標篩選。")
 # --- 篩選結束 ---
 
+# 根據 CONFIG 決定要使用的特徵列表 (中文)
+if CONFIG['features_to_use'] is not None:
+    features_to_use_chinese = CONFIG['features_to_use']
+else:
+    # 使用 feature_mapping 中的所有特徵 (排除已被 sin/cos 取代的原始角度特徵)
+    all_mapped_features = list(feature_mapping.keys())
+    # 移除已經轉換為 sin/cos 的原始角度特徵，避免重複使用
+    features_to_use_chinese = [f for f in all_mapped_features if f not in ['最大陣風風向', '風向']]
 
-# 替換 DataFrame 欄位名稱為英文供 LightGBM 使用
-df_tree = df.rename(columns=feature_mapping)
+# 將選擇的特徵列表轉換為最終用於模型的欄位列表
+# 如果選擇了角度特徵，則自動替換為其 sin/cos 版本
+final_features_for_X = []
+angle_base_features = ['最大陣風風向', '風向']
+for feature_name in features_to_use_chinese:
+    if feature_name in angle_base_features:
+        final_features_for_X.append(f'sin_{feature_name}')
+        final_features_for_X.append(f'cos_{feature_name}')
+    else:
+        final_features_for_X.append(feature_name)
 
-# 定義 X 與 y (y 現在會使用篩選後的 target_columns)
-X = df_original[list(feature_mapping.keys())]
-y = df_original[target_columns] # 確保 y 只包含篩選後的目標
+# 確保所有選擇的特徵都存在於 DataFrame 中，過濾掉不存在的
+final_features_for_X = [f for f in final_features_for_X if f in df_original.columns]
+print(f"將使用以下 {len(final_features_for_X)} 個特徵進行訓練: {final_features_for_X}")
+
+# 根據最終選擇的特徵列表定義 X
+X = df_original[final_features_for_X]
+y = df_original[target_columns] # y 保持不變
 
 # 切分訓練集與測試集
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# 將訓練和測試集的特徵名替換為英文
+# rename 會自動忽略 feature_mapping 中存在但 X_train/X_test 中不存在的鍵值對
 X_train_tree = X_train.rename(columns=feature_mapping)
 X_test_tree = X_test.rename(columns=feature_mapping)
 
-cat_features = ['Holiday']
+# 動態定義類別特徵列表 (cat_features)
+# 首先定義所有可能的類別特徵（中文名）
+all_possible_cat_features_chinese = ['hoilday', 'ArenaEvents'] # 根據您的 feature_mapping 調整
+# 從最終使用的特徵中，篩選出哪些是類別特徵
+selected_cat_features_chinese = [f for f in X.columns if f in all_possible_cat_features_chinese]
+# 將它們轉換為英文名，供 LightGBM 使用
+cat_features = [feature_mapping[f] for f in selected_cat_features_chinese if f in feature_mapping]
+print(f"偵測到並使用的類別特徵 (英文名): {cat_features}")
+
 # 將 feature_names_english 的定義移到此處，確保在後續的規則統計和分群邏輯中可用
 feature_names_english = list(X_train_tree.columns) 
+
 
 # 解析座標字串函式
 def parse_coord_string(coord_str):
@@ -243,7 +323,7 @@ def format_rule_to_string(rule_tuple, feature_names_eng_list, reverse_mapping_di
     except Exception as e:
         # print(f"格式化規則時出錯: {rule_tuple}, 錯誤: {e}")
         return "格式化錯誤"
-
+#%%    
 # ---------------------------
 # 主循環：對每個 target 訓練模型、提取規則
 predictions = {}
@@ -296,23 +376,15 @@ for target in target_columns: # 此迴圈現在只會遍歷篩選後的 target_c
         print(f"  為 {target} 訓練新模型...")
         train_data = lgb.Dataset(X_train_tree, label=y_train[target], categorical_feature=cat_features)
         test_data = lgb.Dataset(X_test_tree, label=y_test[target], reference=train_data, categorical_feature=cat_features)
-        params = {
-            'objective': 'regression',
-            'metric': ['l2', 'l1'],
-            'boosting_type': 'gbdt',
-            'num_leaves': 63,
-            'learning_rate': 0.005,
-            'feature_fraction': 0.9,
-            'seed': 42
-        }
+        
         evals_result = {}
         lgb_model = lgb.train(
-            params,
+            ind_tree_params,
             train_data,
             num_boost_round=10000,
             valid_sets=[test_data],
             valid_names=["valid_0"],
-            callbacks=[lgb.early_stopping(stopping_rounds=10, verbose=100), # 調整 verbose
+            callbacks=[lgb.early_stopping(stopping_rounds=10, verbose=-1), 
                        lgb.record_evaluation(evals_result),
                        lgb.log_evaluation(100)]
         )
@@ -454,21 +526,6 @@ for i in range(n_targets):
 X_test_expanded = pd.concat(X_test_expanded, axis=0)
 y_test_expanded = np.concatenate(y_test_expanded)
 
-# LightGBM 參數
-shared_params = {
-    'objective': 'regression',
-    'metric': ['l2', 'l1'],
-    'learning_rate': 0.1,
-    'num_leaves': 63,
-    'min_data_in_leaf': 20,
-    'feature_fraction': 0.9,
-    'bagging_fraction': 0.8,
-    'bagging_freq': 5,
-    'verbose': -1,
-    'num_iterations': 10000,
-    'early_stopping_rounds': 10,
-}
-
 # 模型文件路徑
 model_file_path = os.path.join(shared_result_dir, 'model', 'shared_model.txt')
 
@@ -482,6 +539,7 @@ train_data_shared = lgb.Dataset(X_train_expanded, label=y_train_expanded,
 valid_data_shared = lgb.Dataset(X_test_expanded, label=y_test_expanded, 
                                 reference=train_data_shared, 
                                 feature_name=english_feature_names)
+#%%
 # 訓練共享模型
 print("開始訓練共享模型以預測所有網格...")
 evals_result = {}
@@ -597,7 +655,7 @@ tree_plot_path = os.path.join(shared_result_dir, 'tree', 'best_tree.png')
 plt.savefig(tree_plot_path, dpi=900, bbox_inches="tight")
 plt.close()
 print(f"最佳決策樹圖已儲存至: {tree_plot_path}")
-
+#%%
 # --- 儲存決策樹規則 ---
 def get_breadth_first_path(tree_structure):
     """以廣度優先順序遍歷樹，返回所有節點的 (split_feature, threshold) 規則"""
@@ -1025,7 +1083,6 @@ def find_most_frequent_rule(merged_rule_to_count):
         return None # 或者 max(merged_rule_to_count, key=merged_rule_to_count.get) 如果允許 None 為最常見
     return max(valid_rules, key=valid_rules.get)
 
-
 # 分層分群主邏輯
 initial_targets = list(target_columns) # target_columns 已更新
 # 每個元素是 (targets_list, defining_rules_dict)
@@ -1034,6 +1091,7 @@ processing_groups = [(initial_targets, {})]
 final_eight_groups_details = []
 
 rule_keys_for_splitting = ['r1_root', 'r2_d2top', 'r3_d2second'] # Updated keys
+#%%
 print("開始分層分群...")
 for i, rule_key_base in enumerate(rule_keys_for_splitting): # Use rule_key_base
     print(f"  處理分群層級: {rule_key_base} (第 {i+1} 層)")
@@ -1254,5 +1312,40 @@ grouping_plot_path = os.path.join(result_dir, "geo_hierarchical_grouping.png")
 plt.savefig(grouping_plot_path, dpi=300, bbox_inches="tight")
 plt.close()
 print(f"階層式分群地理分佈圖已儲存至: {grouping_plot_path}")
+print("開始為每個群組單獨繪製地理分佈圖...")
+# 取得所有唯一的組別ID (排除未分組的-1)
+unique_group_ids = sorted([gid for gid in set(plot_group_labels) if gid != -1])
 
+# 迴圈遍歷每個組別ID
+for group_id in unique_group_ids:
+    plt.figure(figsize=(12, 10))
+
+    # 1. 將所有座標點以灰色繪製為背景，以提供地理位置參考
+    plt.scatter(plot_lons, plot_lats, c='lightgray', s=30, alpha=0.5, label='其他所有點')
+
+    # 2. 篩選出當前組別的座標點
+    current_group_mask = (np.array(plot_group_labels) == group_id)
+    group_lons = np.array(plot_lons)[current_group_mask]
+    group_lats = np.array(plot_lats)[current_group_mask]
+
+    # 從已有的顏色列表中獲取該組別的特定顏色
+    group_color = colors[group_id]
+
+    # 3. 在背景之上，用該組別的特定顏色高亮繪製其座標點
+    plt.scatter(group_lons, group_lats, c=group_color, s=60, alpha=0.9, label=f'組別 {group_id + 1}')
+
+    # 4. 設定圖表屬性並儲存
+    plt.ticklabel_format(useOffset=False, style='plain', axis='both')
+    plt.xlabel("經度 (Longitude)")
+    plt.ylabel("緯度 (Latitude)")
+    plt.title(f"組別 {group_id + 1} 之地理分佈圖")
+    plt.legend()
+    plt.grid(True)
+
+    # 產生並儲存該組別的獨立圖檔
+    individual_group_plot_path = os.path.join(result_dir, f"geo_hierarchical_grouping_group_{group_id + 1}.png")
+    plt.savefig(individual_group_plot_path, dpi=300, bbox_inches="tight")
+    plt.close() # 關閉當前圖形，以便在下一次迴圈中創建新圖
+    print(f"  組別 {group_id + 1} 的地理分佈圖已儲存至: {individual_group_plot_path}")
 print("所有處理完成。")
+# %%

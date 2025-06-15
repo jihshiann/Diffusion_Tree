@@ -71,12 +71,11 @@ CONFIG = {
     # "stage4_checkpoint_path": "best_stage4_model_hour_le_20.pth", # stage4 模型的檢查點檔名 (相對路徑)
     # === Stage4 特定配置 (使用組合特徵) ===
     "stage4_config": {
-        "model_name": "stage4_ArenaEventDays",
+        "model_name": "stage4_arenaEvents", # 第四階段模型的名稱
         "checkpoint_path": "best_stage4_model_arena_events.pth",
         
         # 1. 定義基於事件的過濾規則
         "event_filter": {
-            "enabled": True,
             "file_path": r"C:\thesis\code\Taipei_CF\ArenaEvents.xlsx",
             # --- 主要修改點：指定年、月、日分別是哪個欄位 ---
             "year_col": "年",
@@ -92,8 +91,8 @@ CONFIG = {
         "時", 
         "holiday", 
         "weekday", 
-        "date_combined", 
-        "時"
+        "月", 
+        "date_combined"
     ],
 
     # --- DDPM 擴散參數 ---
@@ -111,10 +110,9 @@ CONFIG = {
     "seed": 42,
     "weight_decay": 1e-5,
     "lr_scheduler_factor": 0.5,
-    "lr_scheduler_patience": 4,
+    "lr_scheduler_patience": 8,
     "lr_scheduler_min_lr": 1e-7,
-    "early_stopping_patience": 8,
-    "val_calculation_freq": 2,
+    "early_stopping_patience": 16,
 
     # --- 評估參數 ---
     "eval_batch_size": 256,
@@ -1519,33 +1517,53 @@ def plot_grid_with_error_long_term(
         
         error_values_for_plot_display = np.where(np.isfinite(error_values_for_plot), error_values_for_plot, np.nan)
         
-        # --- 修改開始：根據指標名稱選擇色票和顏色範圍 ---
         is_diff_plot = 'diff' in metric_name.lower()
 
         if is_diff_plot:
-            # 這是差異圖，使用發散色票
-            cmap_to_use = RedBlackGreen_div_cmap
-            # 計算對稱的顏色範圍，讓 0 對應黑色
-            abs_max = np.nanmax(np.abs(error_values_for_plot_display))
-            if abs_max == 0 or np.isnan(abs_max): abs_max = 1.0 # 避免範圍為0
-            vmin, vmax = -abs_max, abs_max
             title_to_display = f"Geographic Grid Error Difference - {metric_name} ({prefix})"
-        else:
-            # 這是一般的絕對誤差圖，使用黑到紅色票
-            cmap_to_use = black_to_red_cmap
-            # 範圍是從最小值到最大值
+            
+            vmin = np.nanmin(error_values_for_plot_display)
+            vmax = np.nanmax(error_values_for_plot_display)
+
+            if np.isnan(vmin) or np.isnan(vmax) or vmin == vmax:
+                # 邊界情況：如果數據無效或全為同一個值，給定一個預設範圍
+                vmin, vmax = -1.0, 1.0
+                norm = mcolors.TwoSlopeNorm(vcenter=0, vmin=vmin, vmax=vmax)
+                cmap_to_use = RedBlackGreen_div_cmap
+            elif vmin < 0 and vmax > 0:
+                # 情況1: 數據跨越 0 (有正有負)，使用非對稱的 TwoSlopeNorm
+                norm = mcolors.TwoSlopeNorm(vcenter=0, vmin=vmin, vmax=vmax)
+                cmap_to_use = RedBlackGreen_div_cmap
+            elif vmax <= 0:
+                # 情況2: 數據全部為負或零，只使用「紅到黑」部分
+                norm = mcolors.Normalize(vmin=vmin, vmax=0)
+                # 從完整的發散色票中，只截取代表負值的前半部分 (0.0 到 0.5)
+                cmap_to_use = mcolors.LinearSegmentedColormap.from_list(
+                    'RedToBlack_trunc', RedBlackGreen_div_cmap(np.linspace(0, 0.5, 128))
+                )
+            else: # vmin >= 0
+                # 情況3: 數據全部為正或零，只使用「黑到綠」部分
+                norm = mcolors.Normalize(vmin=0, vmax=vmax)
+                # 從完整的發散色票中，只截取代表正值的後半部分 (0.5 到 1.0)
+                cmap_to_use = mcolors.LinearSegmentedColormap.from_list(
+                    'BlackToGreen_trunc', RedBlackGreen_div_cmap(np.linspace(0.5, 1.0, 128))
+                )
+            
+            # 將 norm 和 cmap 傳遞給繪圖指令
+            scatter_args = {'cmap': cmap_to_use, 'norm': norm}
+
+        else: # 非差異圖的邏輯保持不變
+            title_to_display = f"Geographic Grid Error Heatmap - {metric_name.upper()} ({prefix})"
             min_val = np.nanmin(error_values_for_plot_display)
             max_val = np.nanmax(error_values_for_plot_display)
             if np.isnan(min_val) or np.isnan(max_val) or min_val == max_val:
-                min_val, max_val = 0.0, 1.0 # 提供預設範圍
-            vmin, vmax = min_val, max_val
-            title_to_display = f"Geographic Grid Error Heatmap - {metric_name.upper()} ({prefix})"
-        # --- 修改結束 ---
+                min_val, max_val = 0.0, 1.0
+            scatter_args = {'cmap': black_to_red_cmap, 'vmin': min_val, 'vmax': max_val}
 
 
         plt.figure(figsize=(12, 12))
         scatter = plt.scatter(actual_sensor_lons, actual_sensor_lats, c=error_values_for_plot_display, 
-                                cmap=cmap_to_use, marker='s', s=100, vmin=vmin, vmax=vmax)
+                                marker='s', s=100, **scatter_args)
         
         plt.colorbar(scatter, label=metric_name)
 
@@ -2435,35 +2453,31 @@ if __name__ == '__main__':
     logger.info(f"===== STAGE 4 Pre-processing: Filtering data based on external event file =====")
     event_filter_config = CONFIG["stage4_config"]["event_filter"]
     
-    if event_filter_config["enabled"]:
-        event_file_path = event_filter_config["file_path"]
-        year_col = event_filter_config["year_col"]
-        month_col = event_filter_config["month_col"]
-        day_col = event_filter_config["day_col"]
-        
-        if not os.path.exists(event_file_path):
-            raise FileNotFoundError(f"找不到活動日期 Excel 檔案: {event_file_path}")
-        
-        # 1. 讀取 Excel 檔案
-        logger.info(f"正在從 {event_file_path} 讀取活動日期...")
-        events_df = pd.read_excel(event_file_path)
+    event_file_path = event_filter_config["file_path"]
+    year_col = event_filter_config["year_col"]
+    month_col = event_filter_config["month_col"]
+    day_col = event_filter_config["day_col"]
+    
+    if not os.path.exists(event_file_path):
+        raise FileNotFoundError(f"找不到活動日期 Excel 檔案: {event_file_path}")
+    
+    # 1. 讀取 Excel 檔案
+    logger.info(f"正在從 {event_file_path} 讀取活動日期...")
+    events_df = pd.read_excel(event_file_path)
 
-        # 檢查必要欄位是否存在
-        required_cols = [year_col, month_col, day_col]
-        if not all(col in events_df.columns for col in required_cols):
-            raise ValueError(f"Excel 檔案 '{event_file_path}' 中缺少必要的欄位，需要: {required_cols}")
+    # 檢查必要欄位是否存在
+    required_cols = [year_col, month_col, day_col]
+    if not all(col in events_df.columns for col in required_cols):
+        raise ValueError(f"Excel 檔案 '{event_file_path}' 中缺少必要的欄位，需要: {required_cols}")
 
-        #event_date_set = set(zip(events_df[year_col], events_df[month_col], events_df[day_col]))
-        event_date_set = set(zip(events_df[month_col], events_df[day_col]))
-        logger.info(f"從檔案中提取了 {len(event_date_set)} 個不重複的活動日期 (年, 月, 日)。")
+    event_date_set = set(zip(events_df[year_col], events_df[month_col], events_df[day_col]))
+    #event_date_set = set(zip(events_df[month_col], events_df[day_col]))
+    logger.info(f"從檔案中提取了 {len(event_date_set)} 個不重複的活動日期 (年, 月, 日)。")
 
-        # 3. 根據 (月, 日) 集合，在主 DataFrame 上創建布林遮罩
-        #final_mask = full_df.apply(lambda row: (row['年'], row['月'], row['日']) in event_date_set, axis=1)
-        final_mask = full_df.apply(lambda row: (row['月'], row['日']) in event_date_set, axis=1)
-    else:
-        # 如果禁用事件過濾，則預設不過濾任何數據
-        logger.info("事件過濾已禁用，將使用所有數據進行 Stage 4 訓練。")
-        final_mask = pd.Series(True, index=full_df.index)
+    # 3. 根據 (月, 日) 集合，在主 DataFrame 上創建布林遮罩
+    final_mask = full_df.apply(lambda row: (row['年'], row['月'], row['日']) in event_date_set, axis=1)
+    #final_mask = full_df.apply(lambda row: (row['月'], row['日']) in event_date_set, axis=1)
+    
 
     # 後續的篩選和日誌記錄邏輯不變
     df_for_s4_specialist = full_df[final_mask].copy()
@@ -2607,7 +2621,6 @@ if __name__ == '__main__':
             early_stopping_counter_s4 = 0
             metrics_hist_s4 = {'train_loss':[], 'val_loss':[], 'lr':[]}
             epochs_to_run_s4 = CONFIG.get("epochs")
-            val_freq_s4 = CONFIG.get("val_calculation_freq")
 
             if os.path.exists(stage4_model_save_checkpoint_path_full):
                 logger.info(f"從 Stage4 檢查點恢復訓練狀態: {stage4_model_save_checkpoint_path_full}")
@@ -2627,12 +2640,18 @@ if __name__ == '__main__':
                 logger.info(f"Stage4 訓練將從 epoch {start_epoch_s4} 開始。")
 
             logger.info(f"開始訓練 Stage4 模型: {model_name_for_log} for {epochs_to_run_s4} epochs...")
-            epoch_pbar_s4 = tqdm(range(start_epoch_s4, epochs_to_run_s4 + 1), desc=f"Stage4 Training ({model_name_for_log})", leave=True, position=0, dynamic_ncols=True, unit="epoch")
+
+            epoch_pbar_s4 = tqdm(range(start_epoch_s4, epochs_to_run_s4 + 1), 
+                                desc=f"Stage4 Training ({model_name_for_log})", 
+                                leave=True, position=0, dynamic_ncols=True, unit="epoch")
 
             for epoch_s4_current in epoch_pbar_s4:
+                # --- 訓練階段 ---
                 stage4_model.train()
                 total_train_loss_epoch_s4 = 0.0
-                train_pbar_s4_loop = tqdm(train_loader_s4_final, desc=f"Epoch {epoch_s4_current} [S4 Train]", leave=False, position=1, dynamic_ncols=True, unit="batch")
+                train_pbar_s4_loop = tqdm(train_loader_s4_final, 
+                                        desc=f"Epoch {epoch_s4_current} [S4 Train]", 
+                                        leave=False, position=1, dynamic_ncols=True, unit="batch")
                 
                 for batch_data_s4_train in train_pbar_s4_loop:
                     target_s4_b = batch_data_s4_train[0].to(CONFIG["device"])
@@ -2654,78 +2673,81 @@ if __name__ == '__main__':
                     optimizer_s4.step()
                     total_train_loss_epoch_s4 += loss_s4_batch.item()
                     train_pbar_s4_loop.set_postfix({"Batch Loss": f"{loss_s4_batch.item():.5f}"})
-                
+
                 avg_train_loss_epoch_s4 = total_train_loss_epoch_s4 / len(train_loader_s4_final) if len(train_loader_s4_final) > 0 else 0.0
                 metrics_hist_s4['train_loss'].append(avg_train_loss_epoch_s4)
+
+                # --- 驗證階段 (每個 Epoch 都執行) ---
+                stage4_model.eval()
+                total_val_loss_s4 = 0.0
+
+                if val_loader_s4_final and hasattr(val_loader_s4_final, 'dataset') and len(val_loader_s4_final.dataset) > 0:
+                    with torch.no_grad():
+                        val_pbar_s4_loop = tqdm(val_loader_s4_final, desc=f"Epoch {epoch_s4_current} [S4 Validate]", leave=False, position=1)
+                        for batch_data_s4_val in val_pbar_s4_loop:
+                            target_s4_val_norm = batch_data_s4_val[0].to(CONFIG["device"])
+                            s3_out_val_cond = batch_data_s4_val[1].to(CONFIG["device"])
+                            s4_new_feat_val_cond = batch_data_s4_val[2].to(CONFIG["device"])
+
+                            # 使用 p_losses 快速計算驗證損失
+                            t_s4_val_b = torch.randint(0, stage4_model.timesteps, (target_s4_val_norm.shape[0],), device=CONFIG["device"]).long()
+                            condition_args_s4_val = {
+                                "stage3_output_grid_batch_for_s4": s3_out_val_cond,
+                                "stage4_new_condition_feature_grid_batch": s4_new_feat_val_cond
+                            }
+                            val_loss_b_s4 = stage4_model.p_losses(
+                                x_start_target_flow=target_s4_val_norm, t=t_s4_val_b,
+                                mode=ConditionMode.STAGE4, condition_args=condition_args_s4_val
+                            )
+                            total_val_loss_s4 += val_loss_b_s4.item()
+                    
+                    avg_val_loss_s4 = total_val_loss_s4 / len(val_loader_s4_final)
+                else:
+                    avg_val_loss_s4 = float('inf') # 若驗證集為空，設為無效值
+
+                metrics_hist_s4['val_loss'].append(avg_val_loss_s4)
+
+                # --- 更新、日誌、儲存與早停 ---
+                
+                # 使用驗證損失來更新學習率排程器
+                scheduler_s4.step(avg_val_loss_s4)
                 current_lr_epoch_s4 = optimizer_s4.param_groups[0]['lr']
                 metrics_hist_s4['lr'].append(current_lr_epoch_s4)
 
-                avg_val_loss_s4_to_record = float('inf')
-                val_calculated_this_epoch_s4 = False
-                if val_loader_s4_final and hasattr(val_loader_s4_final, 'dataset') and len(val_loader_s4_final.dataset) > 0:
-                    if epoch_s4_current == 1 or epoch_s4_current == epochs_to_run_s4 or \
-                       (epoch_s4_current >= start_epoch_s4 and (epoch_s4_current - start_epoch_s4 + 1) % val_freq_s4 == 0) :
-                        val_calculated_this_epoch_s4 = True
-                        stage4_model.eval()
-                        total_val_loss_s4 = 0.0
-                        num_val_samples_s4 = 0
-                        val_pbar_s4_loop = tqdm(val_loader_s4_final, desc=f"Epoch {epoch_s4_current} [S4 Validate]", leave=False, position=1)
-                        with torch.no_grad():
-                            for batch_data_s4_val in val_pbar_s4_loop:
-                                target_s4_val_norm = batch_data_s4_val[0].to(CONFIG["device"])
-                                s3_out_val_cond = batch_data_s4_val[1].to(CONFIG["device"])
-                                s4_new_feat_val_cond = batch_data_s4_val[2].to(CONFIG["device"])
-                                cond_args_s4_val_sample = {
-                                    "stage3_output_grid_batch_for_s4": s3_out_val_cond,
-                                    "stage4_new_condition_feature_grid_batch": s4_new_feat_val_cond
-                                }
-                                s4_generated_val_norm = stage4_model.sample(target_s4_val_norm.shape[0], ConditionMode.STAGE4, cond_args_s4_val_sample)
-                                
-                                s4_val_mean = train_dataset_s4.norm_stats_current_stage_target['mean']
-                                s4_val_std = train_dataset_s4.norm_stats_current_stage_target['std']
-                                if s4_val_std < 1e-6: s4_val_std = 1.0
+                val_loss_display_s4 = f"{avg_val_loss_s4:.5f}" if avg_val_loss_s4 != float('inf') else "N/A"
 
-                                s4_gen_denorm = s4_generated_val_norm * s4_val_std + s4_val_mean
-                                s4_target_denorm = target_s4_val_norm * s4_val_std + s4_val_mean
-                                s4_gen_denorm = torch.clamp(s4_gen_denorm, min=0.0)
-                                
-                                total_val_loss_s4 += F.mse_loss(s4_gen_denorm, s4_target_denorm).item() * target_s4_val_norm.shape[0]
-                                num_val_samples_s4 += target_s4_val_norm.shape[0]
-                                val_pbar_s4_loop.set_postfix({"Val Batch MSE": f"{F.mse_loss(s4_gen_denorm, s4_target_denorm).item():.5f}"})
-                        avg_val_loss_s4_to_record = total_val_loss_s4 / num_val_samples_s4 if num_val_samples_s4 > 0 else float('inf')
-
-                metrics_hist_s4['val_loss'].append(avg_val_loss_s4_to_record)
-                if avg_val_loss_s4_to_record != float('inf'):
-                    scheduler_s4.step(avg_val_loss_s4_to_record)
-                    if avg_val_loss_s4_to_record < best_val_loss_s4:
-                        best_val_loss_s4 = avg_val_loss_s4_to_record
-                        early_stopping_counter_s4 = 0
-                        tqdm.write(f"Epoch {epoch_s4_current}: 新最佳 Stage4 模型已儲存 (Val Loss: {best_val_loss_s4:.5f})。")
-                        torch.save({
-                            'epoch': epoch_s4_current,
-                            'ddpm_state_dict': stage4_model.state_dict(),
-                            'optimizer_state_dict': optimizer_s4.state_dict(),
-                            'scheduler_state_dict': scheduler_s4.state_dict(),
-                            'best_val_loss_s4': best_val_loss_s4,
-                            'config_snapshot_at_save': CONFIG,
-                            'metrics_hist_s4': metrics_hist_s4,
-                            'early_stopping_counter_s4': early_stopping_counter_s4,
-                            's4_new_cond_feature_norm_stats': train_dataset_s4.norm_stats_s4_new_cond_feature, 
-                            'stage4_avg_flow_map_dict': train_dataset_s4.average_flow_map_dict_current_stage,
-                            'norm_stats_stage4_target': train_dataset_s4.norm_stats_current_stage_target
-                        }, stage4_model_save_checkpoint_path_full)
-                    else:
-                        early_stopping_counter_s4 +=1
-                
-                val_loss_display_s4 = f"{avg_val_loss_s4_to_record:.5f}" if avg_val_loss_s4_to_record != float('inf') else "N/A"
-                if val_calculated_this_epoch_s4 and avg_val_loss_s4_to_record != float('inf'): val_loss_display_s4 += " (Calc)"
+                # 更新主 epoch 進度條的後綴信息
                 epoch_pbar_s4.set_postfix_str(f"Tr_Loss: {avg_train_loss_epoch_s4:.4f}, Val_Loss: {val_loss_display_s4}, LR: {current_lr_epoch_s4:.1e}, ES: {early_stopping_counter_s4}/{CONFIG.get('early_stopping_patience')}")
+
+                # 使用驗證損失來判斷是否儲存最佳模型與早停
+                if avg_val_loss_s4 < best_val_loss_s4:
+                    best_val_loss_s4 = avg_val_loss_s4
+                    early_stopping_counter_s4 = 0
+                    tqdm.write(f"Epoch {epoch_s4_current}: 新最佳 Stage4 模型已儲存 (Val Loss: {best_val_loss_s4:.5f})。")
+                    
+                    torch.save({
+                        'epoch': epoch_s4_current,
+                        'ddpm_state_dict': stage4_model.state_dict(),
+                        'optimizer_state_dict': optimizer_s4.state_dict(),
+                        'scheduler_state_dict': scheduler_s4.state_dict(),
+                        'best_val_loss_s4': best_val_loss_s4,
+                        'config_snapshot_at_save': CONFIG,
+                        'metrics_hist_s4': metrics_hist_s4,
+                        'early_stopping_counter_s4': early_stopping_counter_s4,
+                        's4_new_cond_feature_norm_stats': train_dataset_s4.norm_stats_s4_new_cond_feature, 
+                        'stage4_avg_flow_map_dict': train_dataset_s4.average_flow_map_dict_current_stage,
+                        'norm_stats_stage4_target': train_dataset_s4.norm_stats_current_stage_target
+                    }, stage4_model_save_checkpoint_path_full)
+                else:
+                    early_stopping_counter_s4 +=1
                 
                 if early_stopping_counter_s4 >= CONFIG.get("early_stopping_patience"):
                     tqdm.write(f"Stage4 訓練因早停機制觸發於 Epoch {epoch_s4_current}。")
                     break
-            
-            if 'epoch_pbar_s4' in locals() and isinstance(epoch_pbar_s4, tqdm): epoch_pbar_s4.close()
+                    
+            if 'epoch_pbar_s4' in locals() and isinstance(epoch_pbar_s4, tqdm):
+                epoch_pbar_s4.close()
+                
             logger.info(f"Stage4 模型 '{model_name_for_log}' 訓練完成。")
         else: # stage4_model is None (創建失敗)
             logger.error("Stage4 模型未能成功實例化，跳過訓練。")
@@ -2789,7 +2811,7 @@ if __name__ == '__main__':
             logger.error(f"未找到 Baseline 模型檢查點: {baseline_model_path}，跳過比較。")
         else:
             chkpt_baseline = torch.load(baseline_model_path, map_location=CONFIG["device"], weights_only=False)
-            
+            cfg_baseline = chkpt_baseline.get('config_snapshot_at_save', chkpt_baseline.get('config'))
             unet_baseline = UNet3D(cfg_baseline["image_channels"], cfg_baseline["base_channels_unet"], cfg_baseline["time_emb_dim"], cfg_baseline["condition_encode_dim"], dropout_rate=cfg_baseline["unet_dropout_rate"]).to(CONFIG["device"])
             final_baseline_model_to_eval = DDPM3D(
                 unet_model=unet_baseline, timesteps=cfg_baseline["timesteps"], 

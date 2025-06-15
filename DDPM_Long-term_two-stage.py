@@ -1,4 +1,5 @@
-﻿import os
+﻿#%%
+import os
 import re
 import math
 import json
@@ -48,12 +49,12 @@ CONFIG = {
     "basemodel_checkpoint_to_load_for_stage2": r"C:\thesis\code\DIFFUSION_TREE\results_ddpm_long-term\best_ddpm_model_during_training.pth",
 
     # === Stage2 特定配置 ===
-    "stage2_new_condition_feature_column": "氣溫", # 新條件的欄位名
+    "stage2_new_condition_feature_column": "時", # 新條件的欄位名
     "stage2_new_conditional_operator": "<=",         # 新條件的運算符
-    "stage2_new_conditional_value": 13.5,             # 新條件的閾值
-    "stage2_model_name": "Stage2_TemperatureLe135",    # 第二階段模型的名稱
+    "stage2_new_conditional_value": 20,             # 新條件的閾值
+    "stage2_model_name": "Stage2_HourLe20",    # 第二階段模型的名稱
     "stage2_ddpm_condition_input_channels": 2,       # Stage2 DDPM 的 condition_processor 輸入通道數 (固定為2: bm_out + uv_grid)
-    "stage2_checkpoint_path": "best_stage2_model_temperature_le_13_5.pth", # Stage2 模型的檢查點檔名 (相對路徑，相對於stage2_model_save_dir)
+    "stage2_checkpoint_path": "best_stage2_model_hour_le_20.pth", # Stage2 模型的檢查點檔名 (相對路徑，相對於stage2_model_save_dir)
 
     # --- DDPM 擴散參數 ---
     "timesteps": 1000,          # 擴散時間步長
@@ -70,10 +71,9 @@ CONFIG = {
     "seed": 42,
     "weight_decay": 1e-5,
     "lr_scheduler_factor": 0.5,
-    "lr_scheduler_patience": 3,
+    "lr_scheduler_patience": 4,
     "lr_scheduler_min_lr": 1e-7, 
-    "early_stopping_patience": 6,
-    "val_calculation_freq": 3,  
+    "early_stopping_patience": 8, 
 
     # --- 評估參數 ---
     "eval_batch_size": 256,
@@ -111,7 +111,7 @@ logger.info(f"Stage2 結果將儲存於: {CONFIG['stage2_model_save_dir']}")
 
 if not os.path.exists(CONFIG["basemodel_checkpoint_to_load_for_stage2"]):
     logger.error(f"【【【警告】】】 Basemodel 檢查點路徑未設定或檔案不存在: {CONFIG['basemodel_checkpoint_to_load_for_stage2']}")
-
+#%%
 # ==============================================================================
 # UNet3D, DDPM3D
 # ==============================================================================
@@ -1526,7 +1526,7 @@ def evaluate_stage2_models(
             )
 
     return results, error_grids_all_models
-
+#%%
 if __name__ == '__main__':
     logger.info(f"===== DDPM Stage 2 Training and Evaluation =====")
     logger.info(f"Full CONFIG: {json.dumps(CONFIG, indent=2)}")
@@ -1787,26 +1787,27 @@ if os.path.exists(stage2_model_save_checkpoint_path_full):
         metrics_hist_s2_train = {'train_loss':[], 'val_loss':[], 'lr':[]}
 
 epochs_to_run_s2 = CONFIG.get("epochs", 100)
+
+#%%
 logger.info(f"開始訓練 Stage2 模型: {STAGE2_MODEL_NAME} for {epochs_to_run_s2} epochs...")
 
 # --- 主 Epoch 迴圈 ---
 epoch_pbar = tqdm(range(start_epoch_s2_train, epochs_to_run_s2 + 1),
-                    desc=f"Stage2 Training ({STAGE2_MODEL_NAME})",
-                    leave=True, # 完成後保留最後狀態
-                    position=0,
-                    dynamic_ncols=True, # 允許進度條適應終端寬度
-                    unit="epoch"
-                    )
+                  desc=f"Stage2 Training ({STAGE2_MODEL_NAME})",
+                  leave=True,
+                  position=0,
+                  dynamic_ncols=True,
+                  unit="epoch"
+                  )
 
 for epoch_s2_current in epoch_pbar:
+    # --- 訓練階段 ---
     stage2_model.train()
     total_train_loss_epoch_s2 = 0.0
-
-    # 內部訓練批次迴圈的進度條
     train_pbar_s2_loop = tqdm(train_loader_s2,
                               desc=f"Epoch {epoch_s2_current} [Train]",
-                              leave=False, # 完成後清除此內部進度條
-                              position=1,  # 顯示在主進度條下方
+                              leave=False,
+                              position=1,
                               dynamic_ncols=True,
                               unit="batch")
 
@@ -1830,137 +1831,92 @@ for epoch_s2_current in epoch_pbar:
 
     avg_train_loss_epoch_s2 = total_train_loss_epoch_s2 / len(train_loader_s2) if len(train_loader_s2) > 0 else 0.0
     metrics_hist_s2_train['train_loss'].append(avg_train_loss_epoch_s2)
+    
+    # --- 驗證階段 (每個 Epoch 都執行) ---
+    stage2_model.eval()
+    total_val_loss_epoch_s2 = 0.0
+    
+    if val_loader_s2 and hasattr(val_loader_s2, 'dataset') and len(val_loader_s2.dataset) > 0:
+        with torch.no_grad():
+            val_pbar_s2_loop = tqdm(val_loader_s2,
+                                    desc=f"Epoch {epoch_s2_current} [S2 Validate]",
+                                    leave=False,
+                                    position=1,
+                                    dynamic_ncols=True,
+                                    unit="batch")
+            for target_s2_val_norm, bm_out_val_cond, new_cond_val_cond, _, _ in val_pbar_s2_loop:
+                target_s2_val_norm = target_s2_val_norm.to(CONFIG["device"])
+                bm_out_val_cond = bm_out_val_cond.to(CONFIG["device"])
+                new_cond_val_cond = new_cond_val_cond.to(CONFIG["device"])
+
+                # 使用 p_losses 快速計算驗證損失
+                t_s2_val_b = torch.randint(0, stage2_model.timesteps, (target_s2_val_norm.shape[0],), device=CONFIG["device"]).long()
+                val_loss_b_s2 = stage2_model.p_losses(
+                    x_start_target_flow=target_s2_val_norm,
+                    t=t_s2_val_b,
+                    basemodel_output_grid_batch=bm_out_val_cond,
+                    new_condition_feature_grid_batch=new_cond_val_cond
+                )
+                total_val_loss_epoch_s2 += val_loss_b_s2.item()
+
+        avg_val_loss_s2 = total_val_loss_epoch_s2 / len(val_loader_s2)
+    else:
+        avg_val_loss_s2 = float('inf') # 若驗證集為空，設為無效值
+
+    metrics_hist_s2_train['val_loss'].append(avg_val_loss_s2)
+    
+    # --- 更新、日誌、儲存與早停 ---
+    
+    # 使用驗證損失來更新學習率排程器
+    scheduler_s2.step(avg_val_loss_s2)
     current_lr_epoch_s2 = optimizer_s2.param_groups[0]['lr']
     metrics_hist_s2_train['lr'].append(current_lr_epoch_s2)
 
-    # --- 驗證邏輯 ---
-    avg_val_loss_s2_to_record = float('inf')
-    val_calculated_this_epoch = False
-    val_freq_s2 = CONFIG.get("val_calculation_freq_stage2", CONFIG.get("val_calculation_freq", 1))
-
-    should_validate_this_epoch = False
-    if val_loader_s2:
-        if epoch_s2_current == epochs_to_run_s2:
-            should_validate_this_epoch = True
-        elif (epoch_s2_current == start_epoch_s2_train) or \
-             (epoch_s2_current > start_epoch_s2_train and (epoch_s2_current - start_epoch_s2_train) % val_freq_s2 == 0):
-            should_validate_this_epoch = True
-
-    if should_validate_this_epoch:
-        val_calculated_this_epoch = True
-        stage2_model.eval()
-        total_val_loss_p_s2_epoch = 0.0
-        num_val_samples_p_s2_epoch = 0
-        actual_avg_val_loss_this_epoch = float('inf')
-
-        if hasattr(val_loader_s2, 'dataset') and len(val_loader_s2.dataset) > 0:
-            # 計算 Val Loss 時顯示進度條
-            val_pbar_s2_loop = tqdm(val_loader_s2,
-                                    desc=f"Epoch {epoch_s2_current} [S2 Validate]",
-                                    leave=False, # 完成後清除
-                                    position=1,  # 顯示在主進度條下方
-                                    dynamic_ncols=True,
-                                    unit="batch")
-            with torch.no_grad():
-                for target_s2_val_norm, bm_out_val_cond, new_cond_val_cond, \
-                    _, _ in val_pbar_s2_loop: # val_pbar_s2_loop 應該會顯示進度
-                    target_s2_val_norm = target_s2_val_norm.to(CONFIG["device"])
-                    bm_out_val_cond = bm_out_val_cond.to(CONFIG["device"])
-                    new_cond_val_cond = new_cond_val_cond.to(CONFIG["device"])
-
-                    s2_generated_val_norm = stage2_model.sample(
-                        batch_size=target_s2_val_norm.shape[0],
-                        basemodel_output_grid_batch=bm_out_val_cond,
-                        new_condition_feature_grid_batch=new_cond_val_cond
-                    )
-                    val_target_mean_to_use: float
-                    val_target_std_to_use: float
-                    if hasattr(train_dataset_s2, 'norm_stats_stage2_target') and \
-                       train_dataset_s2.norm_stats_stage2_target is not None: # 驗證時直接從 train_dataset_s2 取
-                        
-                        current_s2_target_stats_val = train_dataset_s2.norm_stats_stage2_target
-                        val_target_mean_to_use = current_s2_target_stats_val['mean']
-                        val_target_std_to_use = current_s2_target_stats_val['std']
-                        if val_target_std_to_use < 1e-6: val_target_std_to_use = 1.0
-                    else: # 回退到 cached_basemodel_stats
-                        val_target_mean_to_use = CONFIG.get("cached_basemodel_mean")
-                        val_target_std_to_use = CONFIG.get("cached_basemodel_std")
-                        if val_target_mean_to_use is None or val_target_std_to_use is None:
-                            if epoch_s2_current == start_epoch_s2_train or not metrics_hist_s2_train['val_loss'] or metrics_hist_s2_train['val_loss'][-1] == float('inf') :
-                                tqdm.write(f"ERROR: Epoch {epoch_s2_current}: CONFIG 中缺少 Base Model 正規化統計量，無法計算反正規化 Val Loss。")
-                            val_loss_b_s2 = float('nan')
-                            continue 
-                        if val_target_std_to_use < 1e-6: val_target_std_to_use = 1.0
-                    
-                    s2_generated_val_denorm = s2_generated_val_norm * val_target_std_to_use + val_target_mean_to_use
-                    s2_target_val_denorm = target_s2_val_norm * val_target_std_to_use + val_target_mean_to_use
-                    s2_generated_val_denorm = torch.clamp(s2_generated_val_denorm, min=0.0)
-
-                    val_loss_b_s2 = F.mse_loss(s2_generated_val_denorm, s2_target_val_denorm).item()
-
-                    if not np.isnan(val_loss_b_s2):
-                        total_val_loss_p_s2_epoch += val_loss_b_s2 * target_s2_val_norm.shape[0]
-                        num_val_samples_p_s2_epoch += target_s2_val_norm.shape[0]
-                    val_pbar_s2_loop.set_postfix({"Val Batch MSE": f"{val_loss_b_s2:.5f}" if not np.isnan(val_loss_b_s2) else "NaN"})
-            
-            if num_val_samples_p_s2_epoch > 0:
-                actual_avg_val_loss_this_epoch = total_val_loss_p_s2_epoch / num_val_samples_p_s2_epoch
-            else: # 驗證集dataset非空，但遍歷後num_val_samples_p_s2_epoch為0（例如batch size > dataset size）
-                logger.warning(f"Stage2 Epoch {epoch_s2_current}: 驗證時處理的樣本數為0，無法計算有效驗證損失。")
-                actual_avg_val_loss_this_epoch = float('inf')
-        else: # val_loader_s2.dataset 為空
-            logger.info(f"Stage2 Epoch {epoch_s2_current}: 驗證數據加載器為空或其數據集為空，跳過驗證損失計算。")
-            actual_avg_val_loss_this_epoch = float('inf')
-
-
-        avg_val_loss_s2_to_record = actual_avg_val_loss_this_epoch
-
-        if actual_avg_val_loss_this_epoch != float('inf'):
-            scheduler_s2.step(actual_avg_val_loss_this_epoch)
-            if actual_avg_val_loss_this_epoch < best_val_loss_s2_train:
-                best_val_loss_s2_train = actual_avg_val_loss_this_epoch
-                early_stopping_counter_s2_train = 0
-                tqdm.write(f"Epoch {epoch_s2_current}: 新最佳模型已儲存 (Val Loss: {best_val_loss_s2_train:.5f})。") # 使用 tqdm.write
-                avg_flow_map_to_save = train_dataset_s2.average_flow_map_dict_s2 if 'train_dataset_s2' in locals() and hasattr(train_dataset_s2, 'average_flow_map_dict_s2') else None
-                new_cond_stats_to_save = train_dataset_s2.norm_stats_new_cond_feature if 'train_dataset_s2' in locals() and hasattr(train_dataset_s2, 'norm_stats_new_cond_feature') else None
-                if avg_flow_map_to_save is None or new_cond_stats_to_save is None :
-                     tqdm.write(f"WARNING: Epoch {epoch_s2_current}: 無法獲取 train_dataset_s2 的統計數據以儲存到檢查點。")
-
-                torch.save({
-                    'epoch': epoch_s2_current,
-                    'ddpm_state_dict': stage2_model.state_dict(),
-                    'optimizer_state_dict': optimizer_s2.state_dict(),
-                    'scheduler_state_dict': scheduler_s2.state_dict(),
-                    'best_val_loss_s2': best_val_loss_s2_train,
-                    'config_snapshot_at_save': config_for_s2_dataset_use, # 使用傳給Dataset的config
-                    'metrics_hist_s2': metrics_hist_s2_train,
-                    'early_stopping_counter_s2': early_stopping_counter_s2_train,
-                    'stage2_avg_flow_map_dict': avg_flow_map_to_save,
-                    'new_cond_feature_norm_stats': new_cond_stats_to_save,
-                    'norm_stats_stage2_target': train_dataset_s2.norm_stats_stage2_target
-                }, stage2_model_save_checkpoint_path_full)
-            else: # 驗證損失沒有改善
-                early_stopping_counter_s2_train += 1
-    else: # 本 epoch 不執行驗證
-        avg_val_loss_s2_to_record = metrics_hist_s2_train['val_loss'][-1] if metrics_hist_s2_train['val_loss'] else float('inf')
-
-    metrics_hist_s2_train['val_loss'].append(avg_val_loss_s2_to_record)
-    val_loss_display_s2 = f"{avg_val_loss_s2_to_record:.5f}" if avg_val_loss_s2_to_record != float('inf') else "N/A"
-    if val_calculated_this_epoch and avg_val_loss_s2_to_record != float('inf'):
-        val_loss_display_s2 += " (Calc)"
-
+    val_loss_display_s2 = f"{avg_val_loss_s2:.5f}" if avg_val_loss_s2 != float('inf') else "N/A"
+    
     # 更新主 epoch 進度條的後綴信息
     epoch_pbar.set_postfix_str(f"Tr_Loss: {avg_train_loss_epoch_s2:.4f}, Val_Loss: {val_loss_display_s2}, LR: {current_lr_epoch_s2:.1e}, ES: {early_stopping_counter_s2_train}/{early_stopping_patience_s2}")
 
+    # 使用驗證損失來判斷是否儲存最佳模型與早停
+    if avg_val_loss_s2 < best_val_loss_s2_train:
+        best_val_loss_s2_train = avg_val_loss_s2
+        early_stopping_counter_s2_train = 0
+        tqdm.write(f"Epoch {epoch_s2_current}: 新最佳 Stage2 模型已儲存 (Val Loss: {best_val_loss_s2_train:.5f})。")
+        
+        # 確保要儲存的統計數據存在
+        avg_flow_map_to_save = train_dataset_s2.average_flow_map_dict_s2 if 'train_dataset_s2' in locals() and hasattr(train_dataset_s2, 'average_flow_map_dict_s2') else None
+        new_cond_stats_to_save = train_dataset_s2.norm_stats_new_cond_feature if 'train_dataset_s2' in locals() and hasattr(train_dataset_s2, 'norm_stats_new_cond_feature') else None
+        target_stats_to_save = train_dataset_s2.norm_stats_stage2_target if 'train_dataset_s2' in locals() and hasattr(train_dataset_s2, 'norm_stats_stage2_target') else None
+        if avg_flow_map_to_save is None or new_cond_stats_to_save is None or target_stats_to_save is None:
+            tqdm.write(f"WARNING: Epoch {epoch_s2_current}: 無法獲取 train_dataset_s2 的統計數據以儲存到檢查點。")
+
+        torch.save({
+            'epoch': epoch_s2_current,
+            'ddpm_state_dict': stage2_model.state_dict(),
+            'optimizer_state_dict': optimizer_s2.state_dict(),
+            'scheduler_state_dict': scheduler_s2.state_dict(),
+            'best_val_loss_s2': best_val_loss_s2_train,
+            'config_snapshot_at_save': config_for_s2_dataset_use,
+            'metrics_hist_s2': metrics_hist_s2_train,
+            'early_stopping_counter_s2': early_stopping_counter_s2_train,
+            'stage2_avg_flow_map_dict': avg_flow_map_to_save,
+            'new_cond_feature_norm_stats': new_cond_stats_to_save,
+            'norm_stats_stage2_target': target_stats_to_save
+        }, stage2_model_save_checkpoint_path_full)
+    else: # 驗證損失沒有改善
+        early_stopping_counter_s2_train += 1
+
     if early_stopping_counter_s2_train >= early_stopping_patience_s2:
-        tqdm.write(f"Stage2 訓練因早停機制觸發於 Epoch {epoch_s2_current} (計數器: {early_stopping_counter_s2_train})。")
-        break # 跳出 epoch 迴圈
+        tqdm.write(f"Stage2 訓練因早停機制觸發於 Epoch {epoch_s2_current}。")
+        break
 
 # 確保在迴圈結束後關閉主進度條
 if 'epoch_pbar' in locals() and isinstance(epoch_pbar, tqdm):
     epoch_pbar.close()
 
 logger.info(f"Stage2 模型 '{STAGE2_MODEL_NAME}' 訓練完成。")
+#%%
+
 # 訓練完成後，可以選擇打印一次最終的統計數據（這部分 logger.info 可以保留）
 final_train_loss = metrics_hist_s2_train['train_loss'][-1] if metrics_hist_s2_train['train_loss'] else float('nan')
 final_val_loss = metrics_hist_s2_train['val_loss'][-1] if metrics_hist_s2_train['val_loss'] else float('nan')
@@ -2232,3 +2188,4 @@ else:
     logger.warning("Stage2 最終評估的測試數據集為空，跳過評估。")
 
 logger.info(f"===== Stage2 流程全部結束 ({STAGE2_MODEL_NAME}) =====")
+# %%

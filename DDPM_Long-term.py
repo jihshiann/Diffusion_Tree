@@ -1,4 +1,5 @@
-﻿import os
+﻿#%%
+import os
 import re
 import math
 import json
@@ -42,7 +43,6 @@ CONFIG = {
     "base_channels_unet": 64,   # UNet3D 的基礎通道數
     "unet_dropout_rate": 0.1,
     "time_emb_dim": 256,        # 時間嵌入維度
-    "val_calculation_freq": 4, #驗證損失計算的頻率
 
     # --- DDPM 參數 ---
     "timesteps": 1000,          # 擴散時間步長
@@ -51,22 +51,22 @@ CONFIG = {
 
     # --- 訓練參數 ---
     "epochs": 128, # 可調整
-    "batch_size": 128, # 依 GPU 記憶體調整
+    "batch_size": 256, # 依 GPU 記憶體調整
     "lr": 1e-3, # 學習率
     "num_workers": 0, # DataLoader 工作執行緒 (Windows 建議 0, Linux 可 >0)
     "device": "cuda" if torch.cuda.is_available() else "cpu",
     "seed": 42, # 隨機種子
     "weight_decay": 1e-5, # 優化器的權重衰減 
     "lr_scheduler_factor": 0.5, # ReduceLROnPlateau: 學習率降低因子
-    "lr_scheduler_patience": 3,   # ReduceLROnPlateau: 多少個 epoch 驗證損失未改善則降低學習率
-    "lr_scheduler_min_lr": 1e-6,  # ReduceLROnPlateau: 學習率下限
-    "early_stopping_patience": 6, # 早停: 多少個 epoch 驗證損失未改善則停止訓練 
+    "lr_scheduler_patience": 4,   # ReduceLROnPlateau: 多少個 epoch 驗證損失未改善則降低學習率
+    "lr_scheduler_min_lr": 1e-7,  # ReduceLROnPlateau: 學習率下限
+    "early_stopping_patience": 8, # 早停: 多少個 epoch 驗證損失未改善則停止訓練 
     "resume_from_checkpoint": True,  # 是否嘗試從檢查點恢復訓練
     "checkpoint_path": "best_ddpm_model_training.pth", #預設使用的檢查點檔案名
 
     # --- 評估參數 ---
-    "eval_batch_size": 32,
-    "fid_batch_size": 64,
+    "eval_batch_size": 256,
+    "fid_batch_size": 256,
     "fid_num_samples": 128, # FID 計算樣本數
 
     # --- 路徑與儲存 ---
@@ -507,7 +507,8 @@ class PeopleFlowDatasetCondition(Dataset):
         # --- 返回修改後的元組: (流量, 小時, 是否假日, 額外特徵) ---
         return target_flow_tensor, int(current_hour_original), int(current_is_holiday_original), extra_data_row_tensor     
 
-    # ==============================================================================
+#%%
+# ==============================================================================
 # UNet3D, DDPM3D
 # ==============================================================================
 
@@ -1190,7 +1191,7 @@ def evaluate_model(ddpm_model: DDPM3D,
     else: logger.warning("Dataset missing H/W attributes. Skipping grid error plot.")
     logger.info("Detailed evaluation visualizations finished.")
     return metrics, error_metrics_grids
-
+#%%
 # 主訓練腳本
 # (假設其定義與先前完整腳本相同，
 # 但呼叫 ddpm.p_losses 的部分需傳遞純量小時/星期)
@@ -1305,7 +1306,6 @@ scheduler = ReduceLROnPlateau(optimizer,
                               min_lr=CONFIG["lr_scheduler_min_lr"])
 
 start_epoch = 1 # 預設從 epoch 1 開始
-best_loss_for_early_stopping_and_scheduler = float('inf')
 best_val_loss_for_saving = float('inf')
 best_val_loss_epoch = 0
 metrics_hist = {'train_loss':[], 'val_loss':[], 'lr':[]}
@@ -1346,15 +1346,6 @@ if CONFIG.get("resume_from_checkpoint", True) and os.path.exists(checkpoint_full
         # 恢復最佳驗證損失 (用於模型保存)
         best_val_loss_for_saving = chkpt.get('best_val_loss_for_saving', float('inf'))
         best_val_loss_epoch = chkpt.get('epoch', 0) # epoch ที่บันทึก best_val_loss
-
-        # 恢復用於早停和 LR scheduler 的訓練損失 (如果您的邏輯是基於訓練損失)
-        # 如果您的早停和 scheduler 基於驗證損失，則不需要下面這行
-        # best_loss_for_early_stopping_and_scheduler = chkpt.get('best_train_loss_for_scheduler', float('inf')) 
-        
-        # 嘗試恢復 metrics_hist, early_stopping_counter, last_calculated_avg_val_loss
-        # 這些通常在訓練迴圈內更新，如果檢查點是 epoch 結束時存的，可以考慮恢復
-        # 但更簡單的做法是讓它們從頭開始記錄，或者只恢復 epoch 和損失，讓 scheduler 自己判斷
-        # 為了簡單起見，這裡只恢復 epoch 和關鍵損失，其他讓訓練迴圈重新建立
         
         # 比較儲存的CONFIG和當前的CONFIG (可選，但建議)
         saved_config = chkpt.get('config', None)
@@ -1371,7 +1362,6 @@ if CONFIG.get("resume_from_checkpoint", True) and os.path.exists(checkpoint_full
         logger.error(f"載入檢查點 {checkpoint_full_path} 失敗: {e}。將從頭開始訓練。")
         start_epoch = 1 # 確保如果載入失敗，從頭開始
         # 重置其他可能被部分修改的變數
-        best_loss_for_early_stopping_and_scheduler = float('inf')
         best_val_loss_for_saving = float('inf')
         best_val_loss_epoch = 0
         metrics_hist = {'train_loss':[], 'val_loss':[], 'lr':[]}
@@ -1380,38 +1370,29 @@ if CONFIG.get("resume_from_checkpoint", True) and os.path.exists(checkpoint_full
 else:
     logger.info("未找到檢查點或未設定從檢查點恢復。將從頭開始訓練。")
     # start_epoch 等變數已是預設值
-
+#%%
 logger.info("開始訓練迴圈...")
 
-# 用於早停和 scheduler 的最佳訓練損失
-best_loss_for_early_stopping_and_scheduler = float('inf')
-
-# 用於保存最佳模型的最佳驗證損失
-best_val_loss_for_saving = float('inf')
+# 最佳驗證損失，用於 scheduler 和模型保存
+best_val_loss = float('inf')
 best_val_loss_epoch = 0
-
 
 metrics_hist = {'train_loss':[], 'val_loss':[], 'lr':[]}
 
 early_stopping_patience = CONFIG["early_stopping_patience"]
 early_stopping_counter = 0
 
-# (新增) 用於儲存每個 epoch 的驗證損失，即使不是每個 epoch 都計算
-# 如果某個 epoch 不計算，則沿用上一次計算的值或者標記為無效
-# current_epoch_val_loss 將代表當前 epoch 計算出 (或沿用) 的驗證損失
-# last_calculated_avg_val_loss 用於記錄最近一次 *實際計算* 的驗證損失
-last_calculated_avg_val_loss = float('inf')
-
 
 for epoch in range(1, CONFIG["epochs"] + 1):
+    # --- 訓練階段 ---
     ddpm.train()
     total_train_loss = 0
     train_pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{CONFIG['epochs']} [訓練]", leave=False)
-    for x_start, hour_s, is_holiday_s, _ in train_pbar: # <--- 修改迭代變數名
+    for x_start, hour_s, is_holiday_s, _ in train_pbar:
         optimizer.zero_grad()
         x_start = x_start.to(CONFIG["device"])
         t = torch.randint(0, CONFIG["timesteps"], (x_start.shape[0],), device=CONFIG["device"]).long()
-        loss = ddpm.p_losses(x_start, t, hour_s, is_holiday_s) # <--- 修改傳遞的變數
+        loss = ddpm.p_losses(x_start, t, hour_s, is_holiday_s)
         loss.backward()
         optimizer.step()
         total_train_loss += loss.item()
@@ -1420,118 +1401,66 @@ for epoch in range(1, CONFIG["epochs"] + 1):
     avg_train_loss = total_train_loss / len(train_loader)
     metrics_hist['train_loss'].append(avg_train_loss)
 
-    # --- 計算驗證集損失 (圖像 MSE) ---
-    # 初始化本 epoch 的驗證損失為 "未計算" 或上一次的值
-    current_epoch_val_loss_calculated = False # 標記本 epoch 是否實際計算了 val loss
-    avg_val_epoch_loss = last_calculated_avg_val_loss # 預設沿用，如果本 epoch 不計算
-
-    if epoch % CONFIG.get("val_calculation_freq", 1) == 0: # (修改) 從 CONFIG 讀取頻率，預設為1 (每個epoch)
-                                                          # 如果您仍想用 % 8 == 1, 請改為 (epoch -1) % 8 == 0 or epoch == 1
-                                                          # 或者更簡單： CONFIG["val_calculation_freq"] = 8, if epoch % CONFIG["val_calculation_freq"] == 0 (或 1 如果從1開始)
-        # 假設 CONFIG["val_calculation_freq"] = 8, 那就是每8個epoch計算一次
-        # 若要與您原來的 if epoch % 8 == 1 一致 (即epoch 1, 9, 17...), 可以這樣：
-        # if (epoch - 1) % CONFIG.get("val_calculation_freq", 8) == 0:PeopleFlowDatasetCondition
-        # 為了簡化，這裡假設 val_calculation_freq 指的是間隔，例如每 val_calculation_freq 個 epoch 計算一次
-        # 如果 CONFIG["val_calculation_freq"] = 1，則每個 epoch 都計算
-        # 如果 CONFIG["val_calculation_freq"] = 8，則 epoch 8, 16, 24... 計算
-        # 如果您希望是 epoch 1, 9, 17... ，則條件應為 (epoch - 1) % N == 0
-
-        # 採用每 N 個 epoch 計算一次的邏輯，N 來自 CONFIG["val_calculation_freq"]
-        # 預設 val_calculation_freq 為 1 (即每個 epoch 都計算驗證損失，以便最佳模型選擇更準確)
-        # 如果您堅持之前的每8個epoch在第1,9,17...計算，請將此條件改回 if (epoch-1)%8 == 0:
-        val_freq = CONFIG.get("val_calculation_freq", 1) # 預設每個epoch都計算
-        if epoch == 1 or (epoch % val_freq == 0) : # 在第一個epoch和之後每val_freq個epoch計算
-            current_epoch_val_loss_calculated = True
-            ddpm.eval()
-            total_val_epoch_loss_for_period = 0
-            num_val_samples_processed = 0
-            avg_val_epoch_loss = float('inf') # 重置為inf，如果驗證集為空則保持inf
-
-            if len(val_loader.dataset) > 0:
-                with torch.no_grad():
-                    val_pbar = tqdm(val_loader, desc=f"Epoch {epoch}/{CONFIG['epochs']} [驗證損失計算]", leave=False)
-                    for val_x_start, val_hour_s, val_is_holiday_s, _ in val_pbar:
-                        val_x_start = val_x_start.to(CONFIG["device"])
-                        generated_flow_norm = ddpm.sample(batch_size=val_x_start.shape[0], hour_scalars_batch=val_hour_s, is_holiday_scalars_batch=val_is_holiday_s)
-                        if not hasattr(train_dataset, 'norm_stats_flow') or train_dataset.norm_stats_flow is None:
-                            raise ValueError("train_dataset.norm_stats_flow 未定義或為 None，無法進行反正規化。")
-                        mean_val = train_dataset.norm_stats_flow['mean']
-                        std_val = train_dataset.norm_stats_flow['std']
-                        generated_flow_denorm = generated_flow_norm * std_val + mean_val
-                        target_avg_flow_denorm = val_x_start * std_val + mean_val
-                        batch_val_loss = F.mse_loss(generated_flow_denorm, target_avg_flow_denorm).item()
-                        total_val_epoch_loss_for_period += batch_val_loss * val_x_start.shape[0]
-                        num_val_samples_processed += val_x_start.shape[0]
-
-                if num_val_samples_processed > 0:
-                    avg_val_epoch_loss = total_val_epoch_loss_for_period / num_val_samples_processed
-                    last_calculated_avg_val_loss = avg_val_epoch_loss # 更新最近 *實際計算* 的驗證損失
-                else:
-                    logger.warning(f"Epoch {epoch}: 驗證集為空，無法計算驗證損失。")
-                    # avg_val_epoch_loss 保持 float('inf')
-            else:
-                 logger.warning(f"Epoch {epoch}: 驗證集為空，跳過驗證損失計算。")
-                 # avg_val_epoch_loss 保持 float('inf')
+    # --- 驗證階段 (每個 Epoch 都執行) ---
+    ddpm.eval()
+    total_val_loss = 0
     
-    metrics_hist['val_loss'].append(avg_val_epoch_loss) # 記錄當前epoch的驗證損失（可能是新算的，也可能是沿用的）
+    if len(val_loader.dataset) > 0:
+        with torch.no_grad():
+            val_pbar = tqdm(val_loader, desc=f"Epoch {epoch}/{CONFIG['epochs']} [驗證]", leave=False)
+            for val_x_start, val_hour_s, val_is_holiday_s, _ in val_pbar:
+                val_x_start = val_x_start.to(CONFIG["device"])
+                t = torch.randint(0, CONFIG["timesteps"], (val_x_start.shape[0],), device=CONFIG["device"]).long()
+                batch_val_loss = ddpm.p_losses(val_x_start, t, val_hour_s, val_is_holiday_s)
+                total_val_loss += batch_val_loss.item()
+        
+        avg_val_loss = total_val_loss / len(val_loader)
+    else:
+        avg_val_loss = float('inf') # 若驗證集為空，設為無效值
+
+    metrics_hist['val_loss'].append(avg_val_loss)
     
-    # (修改) 更新學習率，基於 avg_train_loss
-    scheduler.step(avg_train_loss)
+    # --- 更新、日誌、儲存與早停 ---
+    
+    # 使用驗證損失來更新學習率排程器
+    scheduler.step(avg_val_loss)
     current_lr = optimizer.param_groups[0]['lr']
     metrics_hist['lr'].append(current_lr)
     
-    val_loss_display = f"{avg_val_epoch_loss:.5f}" if avg_val_epoch_loss != float('inf') else "N/A"
-    if current_epoch_val_loss_calculated:
-        val_loss_display += " (Calculated)"
-    else:
-        val_loss_display += " (Carried Over)"
+    val_loss_display = f"{avg_val_loss:.5f}" if avg_val_loss != float('inf') else "N/A"
+    logger.info(f"Epoch {epoch}: Train Loss: {avg_train_loss:.5f} | Val Loss: {val_loss_display} | LR: {current_lr:.8f}")
 
-    logger.info(f"Epoch {epoch}: Train Loss: {avg_train_loss:.5f} | Val Loss (Best Model Metric): {val_loss_display} | LR: {current_lr:.8f}")
-
-    # --- 早停邏輯，基於 avg_train_loss ---
-    if avg_train_loss < best_loss_for_early_stopping_and_scheduler:
-        best_loss_for_early_stopping_and_scheduler = avg_train_loss
-        early_stopping_counter = 0 # 重置早停計數器
+    # 使用驗證損失來判斷是否儲存最佳模型與早停
+    if avg_val_loss < best_val_loss:
+        best_val_loss = avg_val_loss
+        best_val_loss_epoch = epoch
+        early_stopping_counter = 0
+        
+        save_path = os.path.join(CONFIG["save_dir"], "best_ddpm_model_during_training.pth")
+        torch.save({
+            'epoch': epoch,
+            'ddpm_state_dict': ddpm.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'best_val_loss': best_val_loss,
+            'train_loss_at_best_val': avg_train_loss,
+            'config': CONFIG,
+            'norm_stats_flow': train_dataset.norm_stats_flow,
+            'sorted_flow_columns': train_dataset.sorted_flow_columns,
+            'grid_idx_to_rc_map': train_dataset.grid_idx_to_rc_map,
+            'selected_sensor_info': train_dataset.selected_sensor_info,
+            'processed_extra_columns': train_dataset.processed_extra_columns,
+        }, save_path)
+        logger.info(f"已儲存新的最佳模型 (Epoch {best_val_loss_epoch} based on Val Loss: {best_val_loss:.5f})")
     else:
         early_stopping_counter += 1
-        logger.info(f"訓練損失未改善 (current: {avg_train_loss:.5f} vs best for ES: {best_loss_for_early_stopping_and_scheduler:.5f})，早停計數: {early_stopping_counter}/{early_stopping_patience}")
+        logger.info(f"驗證損失未改善，早停計數: {early_stopping_counter}/{early_stopping_patience}")
         if early_stopping_counter >= early_stopping_patience:
-            logger.info(f"早停機制觸發於 Epoch {epoch} (基於訓練損失)。")
-            break # 跳出訓練迴圈
-
-    # --- 儲存最佳模型，基於 avg_val_epoch_loss ---
-    # 只有當本 epoch 實際計算了驗證損失，並且該損失有效時，才考慮更新最佳模型
-    if current_epoch_val_loss_calculated and avg_val_epoch_loss != float('inf'):
-        if avg_val_epoch_loss < best_val_loss_for_saving:
-            best_val_loss_for_saving = avg_val_epoch_loss
-            best_val_loss_epoch = epoch
-            save_path = os.path.join(CONFIG["save_dir"], "best_ddpm_model_during_training.pth") # 檔名保持不變或按需更改
-            torch.save({
-                'epoch': epoch,
-                'ddpm_state_dict': ddpm.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'best_val_loss_for_saving': best_val_loss_for_saving, # 記錄的是驗證損失
-                'train_loss_at_best_val': avg_train_loss, # 記錄此時的訓練損失
-                'config': CONFIG,
-                'norm_stats_flow': train_dataset.norm_stats_flow,
-                'sorted_flow_columns': train_dataset.sorted_flow_columns,
-                'grid_idx_to_rc_map': train_dataset.grid_idx_to_rc_map,
-                'selected_sensor_info': train_dataset.selected_sensor_info,
-                'processed_extra_columns': train_dataset.processed_extra_columns,
-            }, save_path)
-            logger.info(f"已儲存新的最佳模型 (Epoch {best_val_loss_epoch} based on Val Loss: {best_val_loss_for_saving:.5f}) 至 {save_path}")
+            logger.info(f"早停機制觸發於 Epoch {epoch}。")
+            break
 
 logger.info("訓練完成。")
-if epoch < CONFIG["epochs"]:
-    logger.info(f"訓練因早停而提前結束於 Epoch {epoch}。")
-
-logger.info(f"訓練過程中，用於早停和LR調度的最低訓練損失是: {best_loss_for_early_stopping_and_scheduler:.5f}")
-if best_val_loss_for_saving != float('inf'):
-    logger.info(f"訓練過程中，用於模型選擇的最低驗證損失發生在 epoch {best_val_loss_epoch}，Val Loss (MSE): {best_val_loss_for_saving:.5f}")
-else:
-    logger.info("訓練過程中，未計算或未記錄到有效的最低驗證損失用於模型保存。")
-
+#%%
     # --- 所有 epoch 訓練完成後，載入最佳模型並進行最終評估 ---
 logger.info("載入訓練過程中驗證損失最低的模型以進行最終測試集評估...")
 best_model_path = os.path.join(CONFIG["save_dir"], "best_ddpm_model_during_training.pth")
@@ -1695,3 +1624,4 @@ else:
     logger.info("沒有足夠的數據來繪製訓練和驗證損失歷史圖表 (可能由於訓練提早中斷)。")
 
 logger.info("================ 腳本執行完成 ================")
+# %%

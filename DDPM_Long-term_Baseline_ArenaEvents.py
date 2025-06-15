@@ -45,15 +45,14 @@ CONFIG = {
     "time_emb_dim": 256,        # 時間嵌入維度
     "condition_encode_dim": 16, # 條件處理器輸出的特徵維度 / UNet中與x_t合併的維度
     
-    # --- Baseline 模型要使用的 5 個條件特徵 ---
+    # --- Baseline 模型要使用的條件特徵 ---
     "baseline_feature_columns": [
         "時", 
         "holiday", 
         "weekday", 
-        "date_combined", 
-        "時"
+        "月", 
+        "date_combined"
     ],
-    # 模型的條件處理器現在需要接收 5 個通道
     "condition_input_channels": 5, 
     
     # === Baseline 專家模型配置 ===
@@ -76,12 +75,11 @@ CONFIG = {
 
     # === 過濾規則：基於外部 Excel 檔案 ===
     "stage4_config": {
-        "model_name": "stage4_ArenaEventDays",
+        "model_name": "stage4_arenaEvents", # 第四階段模型的名稱
         "checkpoint_path": "best_stage4_model_arena_events.pth",
         
         # 1. 定義基於事件的過濾規則
         "event_filter": {
-            "enabled": True,
             "file_path": r"C:\thesis\code\Taipei_CF\ArenaEvents.xlsx",
             "year_col": "年",
             "month_col": "月",
@@ -106,10 +104,9 @@ CONFIG = {
     "seed": 42,
     "weight_decay": 1e-5,
     "lr_scheduler_factor": 0.5,
-    "lr_scheduler_patience": 4,
+    "lr_scheduler_patience": 8,
     "lr_scheduler_min_lr": 1e-7,
-    "early_stopping_patience": 8,
-    "val_calculation_freq": 2,
+    "early_stopping_patience": 16,
 
     # --- 評估參數 ---
     "eval_batch_size": 128,
@@ -251,12 +248,12 @@ class UNet3D(nn.Module):
             nn.Linear(time_emb_dim, time_emb_dim), nn.SiLU(),
             nn.Linear(time_emb_dim, time_emb_dim)
         )
-        
+
+        factor = 2 if bilinear_upsample else 1
         self.inc = DoubleConv3D(actual_in_channels, base_channels)
         self.down1 = Down3D(base_channels, base_channels * 2)
         self.down2 = Down3D(base_channels * 2, base_channels * 4)
         self.down3 = Down3D(base_channels * 4, base_channels * 8)
-        factor = 2 if bilinear_upsample else 1
         self.down4 = Down3D(base_channels * 8, base_channels * 16 // factor)
         self.dropout = nn.Dropout3d(dropout_rate) if dropout_rate > 0 else nn.Identity()
 
@@ -1005,30 +1002,27 @@ if __name__ == '__main__':
     # --- 根據 CONFIG 中的規則過濾數據 ---
     logger.info(f"===== Baseline Model: 根據規則過濾數據 =====")
     event_filter_config = CONFIG["stage4_config"]["event_filter"] # 從 stage4_config 獲取
-    if event_filter_config["enabled"]:
-        event_file_path = event_filter_config["file_path"]
-        year_col = event_filter_config["year_col"]
-        month_col = event_filter_config["month_col"]
-        day_col = event_filter_config["day_col"]
-        
-        if not os.path.exists(event_file_path):
-            raise FileNotFoundError(f"找不到活動日期 Excel 檔案: {event_file_path}")
-        
-        logger.info(f"正在從 {event_file_path} 讀取活動日期...")
-        events_df = pd.read_excel(event_file_path)
+    event_file_path = event_filter_config["file_path"]
+    year_col = event_filter_config["year_col"]
+    month_col = event_filter_config["month_col"]
+    day_col = event_filter_config["day_col"]
+    
+    if not os.path.exists(event_file_path):
+        raise FileNotFoundError(f"找不到活動日期 Excel 檔案: {event_file_path}")
+    
+    logger.info(f"正在從 {event_file_path} 讀取活動日期...")
+    events_df = pd.read_excel(event_file_path)
 
-        required_cols = [year_col, month_col, day_col]
-        if not all(col in events_df.columns for col in required_cols):
-            raise ValueError(f"Excel 檔案 '{event_file_path}' 中缺少必要的欄位，需要: {required_cols}")
+    required_cols = [year_col, month_col, day_col]
+    if not all(col in events_df.columns for col in required_cols):
+        raise ValueError(f"Excel 檔案 '{event_file_path}' 中缺少必要的欄位，需要: {required_cols}")
 
-        #event_date_set = set(zip(events_df[year_col], events_df[month_col], events_df[day_col]))
-        event_date_set = set(zip(events_df[month_col], events_df[day_col]))
-        logger.info(f"從檔案中提取了 {len(event_date_set)} 個不重複的活動日期 (年, 月, 日)。")
+    event_date_set = set(zip(events_df[year_col], events_df[month_col], events_df[day_col]))
+    #event_date_set = set(zip(events_df[month_col], events_df[day_col]))
+    logger.info(f"從檔案中提取了 {len(event_date_set)} 個不重複的活動日期 (年, 月, 日)。")
 
-        #final_mask = full_df.apply(lambda row: (row['年'], row['月'], row['日']) in event_date_set, axis=1)
-        final_mask = full_df.apply(lambda row: (row['月'], row['日']) in event_date_set, axis=1)
-    else:
-        final_mask = pd.Series(True, index=full_df.index)
+    final_mask = full_df.apply(lambda row: (row['年'], row['月'], row['日']) in event_date_set, axis=1)
+    #final_mask = full_df.apply(lambda row: (row['月'], row['日']) in event_date_set, axis=1)
 
     df_for_baseline = full_df[final_mask].copy()
     logger.info(f"數據過濾完成。將使用 {len(df_for_baseline)} 筆資料進行訓練和評估。")
@@ -1106,16 +1100,6 @@ if __name__ == '__main__':
         start_epoch = 1
         
         model_checkpoint_path = CONFIG["checkpoint_full_path"]
-
-        if os.path.exists(model_checkpoint_path):
-            logger.info(f"從檢查點恢復訓練: {model_checkpoint_path}")
-            checkpoint = torch.load(model_checkpoint_path, map_location=CONFIG["device"], weights_only=False)
-            baseline_model.load_state_dict(checkpoint['ddpm_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            start_epoch = checkpoint['epoch'] + 1
-            best_val_loss = checkpoint.get('best_val_loss', float('inf'))
-            logger.info(f"將從 Epoch {start_epoch} 繼續訓練。")
 
         for epoch in range(start_epoch, CONFIG["epochs"] + 1):
             baseline_model.train()

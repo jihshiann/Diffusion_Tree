@@ -405,3 +405,9 @@ FodyWeavers.xsd
 /results_ddpm_baseline/Baseline_ArenaEvents
 /results_ddpm_stage3/Stage3_WeekdayLe4
 /results_ddpm_stage4/stage4_ArenaEventDays
+/results_ddpm_baseline/Baseline_ArenaEvents_concert
+/results_ddpm_baseline/Baseline_ArenaEvents_Others
+/results_ddpm_stage4/model_outputs_cache/basemodel_outputs_for_s2_normalized.npy
+/results_ddpm_stage4/stage4_ArenaEvents
+/results_ddpm_stage4/stage4_arenaEvents_concert
+/results_ddpm_stage4/stage4_arenaEvents_others

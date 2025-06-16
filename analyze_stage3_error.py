@@ -268,7 +268,8 @@ def plot_grid_map(
     grid_map_info: Dict[str, Any],
     cmap: Any = 'viridis',
     is_categorical: bool = False,
-    cat_labels: Optional[List[str]] = None
+    cat_labels: Optional[List[str]] = None,
+    cbar_label: str = "Value"
 ):
     """繪製地理網格分佈圖並儲存。"""
     H, W = config["H"], config["W"]
@@ -301,19 +302,24 @@ def plot_grid_map(
     fig, ax = plt.subplots(figsize=(12, 12))
     
     if is_categorical and cat_labels:
-        # 處理分類數據
         n_cats = len(cat_labels)
-        cmap_cat = plt.get_cmap(cmap, n_cats)
+        # --- 【核心修改】讓 cmap 可以接收顏色列表 ---
+        if isinstance(cmap, list):
+            if len(cmap) < n_cats:
+                raise ValueError(f"提供的顏色列表有 {len(cmap)} 種顏色，但需要 {n_cats} 種。")
+            cmap_cat = mcolors.ListedColormap(cmap)
+        else:
+            cmap_cat = plt.get_cmap(cmap, n_cats)
+            
         scatter = ax.scatter(lons, lats, c=plot_values, cmap=cmap_cat, marker='s', s=120, vmin=-0.5, vmax=n_cats-0.5)
         cbar = fig.colorbar(scatter, ax=ax, ticks=np.arange(n_cats))
         cbar.set_ticklabels(cat_labels)
     else:
-        # 處理連續數據
         scatter = ax.scatter(lons, lats, c=plot_values, cmap=cmap, marker='s', s=120)
-        fig.colorbar(scatter, ax=ax, label="Accumulated Normalized Error")
+        fig.colorbar(scatter, ax=ax, label=cbar_label)
 
-    ax.set_xlabel("經度 (Longitude)")
-    ax.set_ylabel("緯度 (Latitude)")
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
     ax.set_title(title, fontsize=16)
     ax.set_aspect('equal', adjustable='box')
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
@@ -452,22 +458,24 @@ if __name__ == '__main__':
     logger.info(f"累計誤差計算完成。形狀: {accumulated_error.shape}")
     logger.info(f"累計誤差統計: Min={np.min(accumulated_error):.2f}, Max={np.max(accumulated_error):.2f}, Mean={np.mean(accumulated_error):.2f}")
 
-    # --- 7. 視覺化誤差地圖 ---
+   # --- 7. 視覺化誤差地圖 ---
     logger.info("===== 步驟 7: 視覺化並儲存誤差地圖 =====")
+    # 此圖不受影響，維持原樣
     plot_grid_map(
         grid_values=accumulated_error,
         title="Accumulated Normalized Error Distribution",
         output_filename="accumulated_normalized_error_map.png",
         config=CONFIG,
         grid_map_info=grid_map_info,
-        cmap='coolwarm'
+        cmap='coolwarm',
+        cbar_label="Accumulated Normalized Error"
     )
-#%%    
+        
     # --- 8. 原始分組: 依累計正規化誤差 ---
     logger.info("===== 步驟 8: 依累計正規化誤差進行網格分組 =====")
     error_flat = accumulated_error.flatten()
     grid_indices = np.arange(len(error_flat))
-    top_index = 50 # 您可以調整這個數值來決定 Top 組的大小
+    top_index = 50 
     error_df = pd.DataFrame({'grid_idx': grid_indices, 'error': error_flat})
 
     pos_errors = error_df[error_df['error'] >= 0].sort_values(by='error', ascending=False)
@@ -478,6 +486,7 @@ if __name__ == '__main__':
     top_neg = neg_errors.head(top_index)
     other_neg = neg_errors.tail(len(neg_errors) - top_index)
 
+    # Group ID: 0=正Top, 1=正其餘, 2=負Top, 3=負其餘
     group_grid = np.full_like(error_flat, -1, dtype=int)
     group_grid[top_pos.index] = 0
     group_grid[other_pos.index] = 1
@@ -492,133 +501,144 @@ if __name__ == '__main__':
         3: 'Accumulated Error: Negative Others',
     }
     error_df['group_accumulated'] = error_df['group_id_accumulated'].map(group_labels_accumulated)
-logger.info("依累計誤差分組完成。")
+    logger.info("依累計誤差分組完成。")
 
 
-# --- 9. 視覺化原始分組地圖 ---
-logger.info("===== 步驟 9: 視覺化並儲存原始分組地圖 =====")
-plot_grid_map(
-    grid_values=group_grid.reshape(CONFIG['H'], CONFIG['W']),
-    title="Accumulated Error Grouping Map",
-    output_filename="accumulated_error_grouping_map.png",
-    config=CONFIG,
-    grid_map_info=grid_map_info,
-    cmap='coolwarm',
-    is_categorical=True,
-    cat_labels=[group_labels_accumulated[i] for i in sorted(group_labels_accumulated.keys())]
-)
+    # --- 9. 視覺化原始分組地圖 ---
+    logger.info("===== 步驟 9: 視覺化並儲存原始分組地圖 =====")
+    # 定義您要的顏色列表，順序對應 Group ID (0, 1, 2, 3)
+    custom_colors = ['darkred', 'lightcoral', 'blue', 'lightblue']
+    
+    plot_grid_map(
+        grid_values=group_grid.reshape(CONFIG['H'], CONFIG['W']),
+        title="Accumulated Error Grouping Map",
+        output_filename="accumulated_error_grouping_map.png",
+        config=CONFIG,
+        grid_map_info=grid_map_info,
+        cmap=custom_colors, # <-- 使用自訂顏色列表
+        is_categorical=True,
+        cat_labels=[group_labels_accumulated[i] for i in sorted(group_labels_accumulated.keys())]
+    )
 
 
-# --- 9.1. 全新分析: 計算標準差誤差時數 ---
-logger.info("===== 步驟 9.1: 計算每小時誤差超過1個標準差的時數 =====")
-# `normalized_error` 的形狀為 (時間, H, W)
-pos_exceed_counts = np.sum(normalized_error > 1.0, axis=0)  # 正向超過1個標準差的次數
-neg_exceed_counts = np.sum(normalized_error < -1.0, axis=0) # 負向超過1個標準差的次數
+    # --- 9.1. 全新分析: 計算標準差誤差時數 ---
+    logger.info("===== 步驟 9.1: 計算每小時誤差超過1個標準差的時數 =====")
+    pos_exceed_counts = np.sum(normalized_error > 1.0, axis=0)
+    neg_exceed_counts = np.sum(normalized_error < -1.0, axis=0)
+    pos_counts_flat = pos_exceed_counts.flatten()
+    neg_counts_flat = neg_exceed_counts.flatten()
 
-pos_counts_flat = pos_exceed_counts.flatten()
-neg_counts_flat = neg_exceed_counts.flatten()
+    exceed_df = pd.DataFrame({
+        'grid_idx': grid_indices,
+        'pos_exceed_hours': pos_counts_flat,
+        'neg_exceed_hours': neg_counts_flat,
+    })
 
-exceed_df = pd.DataFrame({
-    'grid_idx': grid_indices,
-    'pos_exceed_hours': pos_counts_flat, # A欄
-    'neg_exceed_hours': neg_counts_flat, # B欄
-})
-
-# 判斷每個網格的主要誤差類型 (取AB欄分數較高者)
-exceed_df['dominant_type'] = np.where(
-    exceed_df['pos_exceed_hours'] >= exceed_df['neg_exceed_hours'], 'pos', 'neg'
-)
-exceed_df['dominant_hours'] = exceed_df[['pos_exceed_hours', 'neg_exceed_hours']].max(axis=1)
-
-
-# --- 9.2. 全新分組: 依誤差時數分組 ---
-logger.info("===== 步驟 9.2: 依誤差時數進行網格分組 =====")
-top_n_exceed = 50 # 設定Top組的大小
-
-# 分離出主要為正誤差和主要為負誤差的網格
-pos_dominant_grids = exceed_df[exceed_df['dominant_type'] == 'pos'].sort_values(by='dominant_hours', ascending=False)
-neg_dominant_grids = exceed_df[exceed_df['dominant_type'] == 'neg'].sort_values(by='dominant_hours', ascending=False)
-
-# 進行分組
-top_pos_exceed = pos_dominant_grids.head(top_n_exceed)
-other_pos_exceed = pos_dominant_grids.iloc[top_n_exceed:]
-
-top_neg_exceed = neg_dominant_grids.head(top_n_exceed)
-other_neg_exceed = neg_dominant_grids.iloc[top_n_exceed:]
-
-# 建立分組陣列
-group_grid_exceed = np.full_like(error_flat, -1, dtype=int)
-group_grid_exceed[top_pos_exceed['grid_idx']] = 0
-group_grid_exceed[other_pos_exceed['grid_idx']] = 1
-group_grid_exceed[top_neg_exceed['grid_idx']] = 2
-group_grid_exceed[other_neg_exceed['grid_idx']] = 3
-
-# 建立分組標籤
-exceed_df['group_id_exceed'] = group_grid_exceed[exceed_df['grid_idx']]
-group_labels_exceed = {
-    0: f'誤差時數: 正 Top {top_n_exceed}',
-    1: '誤差時數: 正 其餘',
-    2: f'誤差時數: 負 Top {top_n_exceed}',
-    3: '誤差時數: 負 其餘',
-}
-exceed_df['group_exceed'] = exceed_df['group_id_exceed'].map(group_labels_exceed)
-logger.info("依誤差時數分組完成。各組數量:\n" + str(exceed_df['group_exceed'].value_counts()))
+    dominant_type = np.where(
+        exceed_df['pos_exceed_hours'] >= exceed_df['neg_exceed_hours'], 'pos', 'neg'
+    )
+    signed_dominant_hours = np.where(
+        dominant_type == 'pos', exceed_df['pos_exceed_hours'], -exceed_df['neg_exceed_hours']
+    )
+    exceed_df['signed_dominant_hours'] = signed_dominant_hours
+    exceed_df['dominant_type'] = dominant_type
 
 
-# --- 9.3. 視覺化全新分組地圖 ---
-logger.info("===== 步驟 9.3: 視覺化並儲存全新分組地圖 =====")
-plot_grid_map(
-    grid_values=group_grid_exceed.reshape(CONFIG['H'], CONFIG['W']),
-    title="Std Dev Exceedance Count Grouping Map",
-    output_filename="std_dev_exceedance_map.png",
-    config=CONFIG,
-    grid_map_info=grid_map_info,
-    cmap='viridis',
-    is_categorical=True,
-    cat_labels=[group_labels_exceed[i] for i in sorted(group_labels_exceed.keys())]
-)
+    # --- 9.2. 視覺化【帶方向性】的主要誤差時數連續分佈圖 ---
+    logger.info("===== 步驟 9.2: 視覺化帶方向性的主要誤差時數連續分佈圖 =====")
+    # 此圖不受影響，維持原樣
+    directional_hours_grid = exceed_df['signed_dominant_hours'].values.reshape(CONFIG['H'], CONFIG['W'])
+    plot_grid_map(
+        grid_values=directional_hours_grid,
+        title="Distribution of Directional Std Dev Exceedance Hours",
+        output_filename="directional_exceedance_hours_map.png",
+        config=CONFIG,
+        grid_map_info=grid_map_info,
+        cmap='coolwarm',
+        is_categorical=False,
+        cbar_label="Directional Count of Hours Exceeding 1 Std Dev"
+    )
+
+    # --- 9.3. 全新分組: 依誤差時數分組 ---
+    logger.info("===== 步驟 9.3: 依誤差時數進行網格分組 =====")
+    top_n_exceed = 50
+    exceed_df['dominant_hours_for_grouping'] = exceed_df[['pos_exceed_hours', 'neg_exceed_hours']].max(axis=1)
+
+    pos_dominant_grids = exceed_df[exceed_df['dominant_type'] == 'pos'].sort_values(by='dominant_hours_for_grouping', ascending=False)
+    neg_dominant_grids = exceed_df[exceed_df['dominant_type'] == 'neg'].sort_values(by='dominant_hours_for_grouping', ascending=False)
+
+    top_pos_exceed = pos_dominant_grids.head(top_n_exceed)
+    other_pos_exceed = pos_dominant_grids.iloc[top_n_exceed:]
+    top_neg_exceed = neg_dominant_grids.head(top_n_exceed)
+    other_neg_exceed = neg_dominant_grids.iloc[top_n_exceed:]
+
+    # Group ID: 0=正Top, 1=正其餘, 2=負Top, 3=負其餘
+    group_grid_exceed = np.full_like(error_flat, -1, dtype=int)
+    group_grid_exceed[top_pos_exceed['grid_idx']] = 0
+    group_grid_exceed[other_pos_exceed['grid_idx']] = 1
+    group_grid_exceed[top_neg_exceed['grid_idx']] = 2
+    group_grid_exceed[other_neg_exceed['grid_idx']] = 3
+
+    exceed_df['group_id_exceed'] = group_grid_exceed
+    group_labels_exceed = {
+        0: f'Exceedance Hours: Positive Top {top_n_exceed}',
+        1: 'Exceedance Hours: Positive Others',
+        2: f'Exceedance Hours: Negative Top {top_n_exceed}',
+        3: 'Exceedance Hours: Negative Others',
+    }
+    exceed_df['group_exceed'] = exceed_df['group_id_exceed'].map(group_labels_exceed)
+    logger.info("依誤差時數分組完成。")
 
 
-# --- 10. 匯出合併後的 Excel ---
-logger.info("===== 步驟 10: 匯出合併後的結果至 Excel =====")
-# 合併兩種分析的結果
-final_df = pd.merge(error_df, exceed_df, on='grid_idx', how='left')
+    # --- 9.4. 視覺化全新分組地圖 ---
+    logger.info("===== 步驟 9.4: 視覺化並儲存全新分組地圖 =====")
+    plot_grid_map(
+        grid_values=group_grid_exceed.reshape(CONFIG['H'], CONFIG['W']),
+        title="Std Dev Exceedance Count Grouping Map",
+        output_filename="std_dev_exceedance_map.png",
+        config=CONFIG,
+        grid_map_info=grid_map_info,
+        cmap=custom_colors, # <-- 同樣使用自訂顏色列表
+        is_categorical=True,
+        cat_labels=[group_labels_exceed[i] for i in sorted(group_labels_exceed.keys())]
+    )
 
-# 獲取地理資訊
-rc_map = grid_map_info["grid_idx_to_rc_map"]
-if rc_map:
-    final_df['R'] = final_df['grid_idx'].apply(lambda idx: rc_map.get(idx, (-1, -1))[0])
-    final_df['C'] = final_df['grid_idx'].apply(lambda idx: rc_map.get(idx, (-1, -1))[1])
-else:
-    final_df['R'] = -1
-    final_df['C'] = -1
+    # --- 10. 匯出合併後的 Excel ---
+    # (此處省略步驟 10 的程式碼，因為它沒有變動)
+    final_df = pd.merge(error_df, exceed_df, on='grid_idx', how='left')
 
-sensor_coords_df = pd.DataFrame(grid_map_info["selected_sensor_info"])[['name', 'lon', 'lat']]
-flow_cols_df = pd.DataFrame({'name': flow_columns}).reset_index().rename(columns={'index': 'grid_idx'})
+    rc_map = grid_map_info["grid_idx_to_rc_map"]
+    if rc_map:
+        final_df['R'] = final_df['grid_idx'].apply(lambda idx: rc_map.get(idx, (-1, -1))[0])
+        final_df['C'] = final_df['grid_idx'].apply(lambda idx: rc_map.get(idx, (-1, -1))[1])
+    else:
+        final_df['R'] = -1
+        final_df['C'] = -1
 
-# 合併地理資訊
-excel_df = pd.merge(final_df, flow_cols_df, on='grid_idx', how='left')
-excel_df = pd.merge(excel_df, sensor_coords_df, on='name', how='left')
+    sensor_coords_df = pd.DataFrame(grid_map_info["selected_sensor_info"])[['name', 'lon', 'lat']]
+    flow_cols_df = pd.DataFrame({'name': flow_columns}).reset_index().rename(columns={'index': 'grid_idx'})
 
-# 整理欄位並重新命名
-excel_output = excel_df[[
-    'grid_idx', 'R', 'C', 'lon', 'lat',
-    'error', 'group_accumulated',
-    'pos_exceed_hours', 'neg_exceed_hours', 'dominant_hours', 'group_exceed'
-]]
-excel_output = excel_output.rename(columns={
-    'lon': '經度', 'lat': '緯度',
-    'error': '累計正規化誤差',
-    'group_accumulated': '分組(依累計誤差)',
-    'pos_exceed_hours': '正向誤差時數(A欄)',
-    'neg_exceed_hours': '負向誤差時數(B欄)',
-    'dominant_hours': '主要誤差時數',
-    'group_exceed': '分組(依誤差時數)'
-})
+    excel_df = pd.merge(final_df, flow_cols_df, on='grid_idx', how='left')
+    excel_df = pd.merge(excel_df, sensor_coords_df, on='name', how='left')
 
-excel_path = os.path.join(CONFIG['output_dir'], 'stage3_error_analysis_combined.xlsx')
-excel_output.to_excel(excel_path, index=False)
-logger.info(f"合併後的分析結果已成功匯出至: {excel_path}")
+    excel_output = excel_df[[
+        'grid_idx', 'R', 'C', 'lon', 'lat',
+        'error', 'group_accumulated',
+        'pos_exceed_hours', 'neg_exceed_hours', 'signed_dominant_hours', 'group_exceed'
+    ]]
+    excel_output = excel_output.rename(columns={
+        'lon': '經度', 'lat': '緯度',
+        'error': '累計正規化誤差',
+        'group_accumulated': '分組(依累計誤差)',
+        'pos_exceed_hours': '正向誤差時數(A欄)',
+        'neg_exceed_hours': '負向誤差時數(B欄)',
+        'signed_dominant_hours': '方向性主要誤差時數',
+        'group_exceed': '分組(依誤差時數)'
+    })
 
-logger.info("===== 全部分析流程結束 =====")
+    excel_path = os.path.join(CONFIG['output_dir'], 'stage3_error_analysis_combined.xlsx')
+    excel_output.to_excel(excel_path, index=False)
+    logger.info(f"合併後的分析結果已成功匯出至: {excel_path}")
+
+    logger.info("===== 全部分析流程結束 =====")
 # %%

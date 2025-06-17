@@ -22,6 +22,8 @@ CONFIG = {
         '月',
         'weekday',      
         'ArenaEvents',
+        'ArenaEvents_concert',
+        'ArenaEvents_others',
         'hoilday'
     ]
     # 'features_to_use': None  # 使用所有特徵的範例，取消此行註解以啟用
@@ -90,7 +92,9 @@ feature_mapping = {
     '月': 'Month',
     '日': 'Day',
     '時': 'Hour',
-    'ArenaEvents': 'ArenaEvents'
+    'ArenaEvents': 'ArenaEvents',
+    'ArenaEvents_concert': 'ArenaEvents_concert',
+    'ArenaEvents_others': 'ArenaEvents_others'
 }
 reverse_mapping = {v: k for k, v in feature_mapping.items()}
 
@@ -212,7 +216,7 @@ X_test_tree = X_test.rename(columns=feature_mapping)
 
 # 動態定義類別特徵列表 (cat_features)
 # 首先定義所有可能的類別特徵（中文名）
-all_possible_cat_features_chinese = ['hoilday', 'ArenaEvents'] # 根據您的 feature_mapping 調整
+all_possible_cat_features_chinese = ['hoilday', 'ArenaEvents', 'ArenaEvents_concert', 'ArenaEvents_others'] # 根據您的 feature_mapping 調整
 # 從最終使用的特徵中，篩選出哪些是類別特徵
 selected_cat_features_chinese = [f for f in X.columns if f in all_possible_cat_features_chinese]
 # 將它們轉換為英文名，供 LightGBM 使用

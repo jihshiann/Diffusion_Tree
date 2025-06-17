@@ -1,8 +1,8 @@
+#%%
 import pandas as pd
-
 # --- 1. 設定檔案路徑 ---
 # 注意：讀取和儲存的路徑現在是同一個檔案
-path_events = r"C:\thesis\code\Taipei_CF\ArenaEvents.xlsx"
+path_events = r"C:\thesis\code\Taipei_CF\ArenaEvents_others.xlsx"
 path_all_merged_original = r"C:\thesis\code\Taipei_CF\all_merged.csv"
 
 
@@ -27,15 +27,15 @@ try:
 
     # --- 5. 建立新的 'ArenaEvents' 欄位 ---
     # 將合併後產生的輔助欄位 'is_event_day' 的 NaN 填補為 0
-    df_final['ArenaEvents'] = df_final['is_event_day'].fillna(0)
+    df_final['ArenaEvents_others'] = df_final['is_event_day'].fillna(0)
     
     # 將欄位型態轉換為整數 (integer)
-    df_final['ArenaEvents'] = df_final['ArenaEvents'].astype(int)
+    df_final['ArenaEvents_others'] = df_final['ArenaEvents_others'].astype(int)
     
     # 移除輔助用的 'is_event_day' 欄位
     df_final = df_final.drop(columns=['is_event_day'])
 
-    print("新欄位 'ArenaEvents' 已成功建立。")
+    print("新欄位 'ArenaEvents_others' 已成功建立。")
 
     # --- 6. 儲存結果並覆蓋原檔案 ---
     # **********************************************************
@@ -51,11 +51,12 @@ try:
     print("\n更新後資料預覽 (前 5 筆):")
     print(df_final.head())
     
-    print("\n欄位 'ArenaEvents' 的數值分佈:")
-    print(df_final['ArenaEvents'].value_counts())
+    print("\n欄位 'ArenaEvents_others' 的數值分佈:")
+    print(df_final['ArenaEvents_others'].value_counts())
 
 
 except FileNotFoundError as e:
     print(f"錯誤：找不到檔案！請檢查路徑是否正確。\n{e}")
 except Exception as e:
     print(f"發生未預期的錯誤：\n{e}")
+# %%

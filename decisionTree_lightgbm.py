@@ -25,9 +25,15 @@ CONFIG = {
         'ArenaEvents_concert',
         'ArenaEvents_others',
         'hoilday'
-    ]
-    # 'features_to_use': None  # 使用所有特徵的範例，取消此行註解以啟用
+    ],
+    'features_to_use': None  # 使用所有特徵的範例，取消此行註解以啟用
 }
+ENABLE_EXTERNAL_FILTER = True
+
+# 外部檔案路徑和篩選條件 (僅在 ENABLE_EXTERNAL_FILTER 為 True 時才會使用)
+external_filter_file = r"C:\thesis\code\DIFFUSION_TREE\results_ddpm_stage3\Stage3_WeekdayLe4\analysis_error\stage3_error_analysis_4_ways.xlsx"
+filter_column = "分組(原始誤差)"
+filter_value = "Raw Error: Positive Top 50"
 # LightGBM 參數
 ind_tree_params = {
             'objective': 'regression',
@@ -115,6 +121,51 @@ target_columns = [col for col in df.columns if '(' in col and ')' in col]
 # 確保 target_columns 中的座標是唯一的，如果原始數據中可能有重複
 target_columns = sorted(list(set(target_columns)))
 print("所有座標點：", len(target_columns))
+
+if ENABLE_EXTERNAL_FILTER:
+    print(f"\n--- 外部檔案網格篩選已啟用 ---")
+    print(f"讀取檔案: {external_filter_file}")
+    
+    # 讀取 Excel 檔案
+    # 如果檔案路徑或名稱錯誤，程式將在此處停止並報錯
+    df_filter = pd.read_excel(external_filter_file)
+    
+    # 根據條件篩選資料
+    # 如果欄位名稱錯誤，程式將在此處停止並報錯
+    filtered_df = df_filter[df_filter[filter_column] == filter_value]
+    
+    if filtered_df.empty:
+        print(f"警告: 在檔案中找不到符合條件 '{filter_column}' == '{filter_value}' 的資料。腳本將繼續使用所有先前定義的網格。")
+    else:
+        # 從篩選後的資料中提取經緯度，並建立一個目標座標字串的集合
+        desired_coords_set = set()
+        for index, row in filtered_df.iterrows():
+            # 如果 '經度' 或 '緯度' 欄位不存在，程式將在此處停止並報錯
+            lon = row['經度']
+            lat = row['緯度']
+            coord_str = f"({lon}, {lat})"
+            desired_coords_set.add(coord_str)
+            
+        print(f"從篩選檔案中成功讀取 {len(desired_coords_set)} 組唯一的目標經緯度。")
+
+        original_target_count = len(target_columns)
+        
+        # 過濾 target_columns，只保留存在於 desired_coords_set 中的座標
+        filtered_target_columns = [tc for tc in target_columns if tc in desired_coords_set]
+        
+        if not filtered_target_columns and original_target_count > 0:
+             print("警告: 外部檔案中的座標與原始資料中的座標格式或數值不符，沒有匹配到任何網格。")
+        
+        # 更新 target_columns 為篩選後的列表
+        target_columns = sorted(list(set(filtered_target_columns)))
+        print(f"座標點已根據外部檔案篩選。數量從 {original_target_count} 更新為 {len(target_columns)}。")
+        if original_target_count > 0 and len(target_columns) == 0:
+            print("=> 重要提示：篩選後沒有剩餘的目標網格可以執行，程式可能會在後續步驟中出錯。")
+        
+        print(f"--- 外部檔案網格篩選結束 ---\n")
+
+else:
+    print("\n--- 外部檔案網格篩選已停用。將使用所有先前定義的網格進行分析。---\n")
 
 # 解析座標字串函式 (如果尚未在全域定義，則移至此處或確保可訪問)
 def parse_coord_string(coord_str):

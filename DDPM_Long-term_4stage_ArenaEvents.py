@@ -133,6 +133,8 @@ CONFIG = {
     # 以下兩個檔名將在 CONFIG 字典定義後動態設定
     # "cached_stage2_outputs_for_s3_filename": "stage2_outputs_for_s3_normalized.npy", 
     # "cached_stage3_outputs_for_s4_filename": "stage3_outputs_for_s4_normalized.npy",
+
+    "mape_threshold": 1.0
 }
 
 # 動態設定 Stage2 和 Stage3 的快取檔案名稱
@@ -1595,16 +1597,15 @@ def truncate_colormap(cmap, minval: float = 0.0, maxval: float = 1.0, n: int = 2
 def evaluate_model(
     current_stage_model_trained: 'DDPM3D',
     previous_stage_model_eval_instance: Optional['DDPM3D'],
-    basemodel_eval_instance_for_s2_cond_generation: Optional['DDPM3D'], # 僅當 prev_stage 是 S2 時，才需要 BM 生成 S2 的條件1
+    basemodel_eval_instance_for_s2_cond_generation: Optional['DDPM3D'],
     current_stage_mode: ConditionMode,
     dataloader_current_stage: DataLoader,
     inception_model_fid: nn.Module,
     config: Dict[str, Any],
-    # 各階段目標的正規化統計量 (從對應階段的訓練/檢查點獲取)
     current_stage_target_norm_stats: Dict[str, float],
+    target_grid_stds: np.ndarray,
+    target_overall_std: float,
     previous_stage_target_norm_stats: Optional[Dict[str, float]] = None,
-    # 如果前一階段是S2，那麼它需要BM的目標統計量來反正規化BM的輸出(雖然此函數不直接評估BM)
-    # 但更重要的是，previous_stage_model_eval_instance 的輸出要用 previous_stage_target_norm_stats 反正規化
     max_samples_for_fid: Optional[int] = None,
     prefix: str = "eval"
 ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, Any]]]:
@@ -1826,6 +1827,19 @@ def evaluate_model(
         smape_overall_numerator = torch.sum(torch.abs(cs_target_all_t - pred_t))
         smape_overall_denominator_sum_abs = torch.sum(torch.abs(cs_target_all_t) + torch.abs(pred_t))
         smape_overall = (200.0 * smape_overall_numerator / (smape_overall_denominator_sum_abs + epsilon) ).item() if smape_overall_denominator_sum_abs > 1e-7 else float('inf')
+        stde_avg_grid = float('nan')
+        stde_overall = float('nan')
+        stde_g = np.full((config["H"] * config["W"],), np.nan)
+        if target_grid_stds is not None and target_overall_std is not None:
+            # STDE (Overall) = MAE / 總體標準差
+            stde_overall = mae / (target_overall_std + epsilon)
+
+            # STDE (AvgGrid)
+            grid_stds_t = torch.from_numpy(target_grid_stds.reshape(1, 1, 1, config["H"], config["W"])).to(pred_t.device)
+            standardized_error_t = torch.abs(pred_t - cs_target_all_t) / (grid_stds_t + epsilon)
+            stde_g_map = torch.mean(standardized_error_t, dim=0).squeeze().cpu().numpy()
+            stde_g = stde_g_map.flatten()
+            stde_avg_grid = np.nanmean(stde_g)
         
         fid = float('nan')
         if gen_fid_list_for_model and all_cs_target_norm_for_fid_list: # 使用當前模型的 FID 列表
@@ -1851,6 +1865,8 @@ def evaluate_model(
             "mse": mse, "mae": mae, 
             "mape_avg_grid": mape_avg_grid, "smape_avg_grid": smape_avg_grid,
             "mape_overall": mape_overall, "smape_overall": smape_overall,
+            "stde_avg_grid": stde_avg_grid,
+            "stde_overall": stde_overall,
             "fid": fid if np.isfinite(fid) else float('nan')
         }
         logger.info(f"Metrics for {model_name} ({prefix}): {results[model_name]}")
@@ -1869,7 +1885,8 @@ def evaluate_model(
             smape_g = torch.mean(smape_g_t, dim=0).cpu().numpy()
             error_grids_all_models[model_name] = {
                 'MSE': mse_g.flatten(), 'MAE': mae_g.flatten(),
-                'MAPE': mape_g.flatten(), 'SMAPE': smape_g.flatten()
+                'MAPE': mape_g.flatten(), 'SMAPE': smape_g.flatten(),
+                'STDE_AvgGrid': stde_g
             }
         else:
             error_grids_all_models[model_name] = {m: np.full((config["H"] * config["W"],), np.nan) for m in ['MSE','MAE','MAPE','SMAPE']}
@@ -2083,6 +2100,8 @@ def evaluate_model(
 def evaluate_baseline_model_for_comparison(
     model_trained: 'DDPM3D', dataloader: DataLoader, inception_model_fid: nn.Module,
     config: Dict[str, Any], target_norm_stats: Dict[str, float],
+    target_grid_stds: np.ndarray,
+    target_overall_std: float,
     prefix: str = "eval_baseline"
 ) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
     
@@ -2122,18 +2141,35 @@ def evaluate_baseline_model_for_comparison(
     smape_avg_grid = torch.mean((errors / smape_denom) * 100).item()
     mape_overall = (torch.sum(errors) / (torch.sum(actual_vals) + epsilon)).item() * 100
     smape_overall = (200.0 * torch.sum(errors) / (torch.sum(actual_vals + torch.abs(pred_t)) + epsilon)).item()
+    epsilon=1e-8
+    stde_overall = mae / (target_overall_std + epsilon)
+    grid_stds_t = torch.from_numpy(target_grid_stds.reshape(1, 1, 1, config["H"], config["W"])).to(pred_t.device)
+    standardized_error_t = torch.abs(pred_t - target_t) / (grid_stds_t + epsilon)
+    stde_g_map = torch.mean(standardized_error_t, dim=0).squeeze().cpu().numpy()
+    stde_g = stde_g_map.flatten()
+    stde_avg_grid = np.nanmean(stde_g)
     gen_fid_tensor = torch.cat(all_generated_norm, dim=0)
     real_fid_tensor = torch.cat(all_target_norm, dim=0)
     act_gen = get_activations(gen_fid_tensor, inception_model_fid, config["device"], config["fid_batch_size"])
     act_real = get_activations(real_fid_tensor, inception_model_fid, config["device"], config["fid_batch_size"])
     fid = calculate_fid(act_real, act_gen)
-    results = {"mse": mse, "mae": mae, "mape_avg_grid": mape_avg_grid, "smape_avg_grid": smape_avg_grid, "mape_overall": mape_overall, "smape_overall": smape_overall, "fid": fid}
+    results = {
+        "mse": mse, "mae": mae, "mape_avg_grid": mape_avg_grid, 
+        "smape_avg_grid": smape_avg_grid, "mape_overall": mape_overall, 
+        "smape_overall": smape_overall, 
+        "stde_avg_grid": stde_avg_grid, "stde_overall": stde_overall, 
+        "fid": fid
+    }
     pred_s, target_s = pred_t.squeeze(1).squeeze(1), target_t.squeeze(1).squeeze(1)
     mse_g = torch.mean((pred_s - target_s)**2, dim=0).cpu().numpy()
     mae_g = torch.mean(torch.abs(pred_s - target_s), dim=0).cpu().numpy()
     mape_g = torch.mean(torch.abs((target_s - pred_s) / (target_s + epsilon)) * 100, dim=0).cpu().numpy()
     smape_g = torch.mean((torch.abs(pred_s-target_s) / ((torch.abs(target_s)+torch.abs(pred_s))/2 + epsilon)) * 100, dim=0).cpu().numpy()
-    error_grids = {'MSE': mse_g.flatten(), 'MAE': mae_g.flatten(), 'MAPE': mape_g.flatten(), 'SMAPE': smape_g.flatten()}
+    error_grids = {
+        'MSE': mse_g.flatten(), 'MAE': mae_g.flatten(), 
+        'MAPE': mape_g.flatten(), 'SMAPE': smape_g.flatten(),
+        'STDE_AvgGrid': stde_g
+    }
     
     return results, error_grids
 
@@ -2226,6 +2262,21 @@ if __name__ == '__main__':
     basemodel_for_output_generation.load_state_dict(chkpt_basemodel['ddpm_state_dict'])
     basemodel_for_output_generation.eval()
     logger.info(f"Basemodel (for output generation) 載入完成。")
+    logger.info("正在從【整個原始資料集】計算全域目標流量標準差 (用於 STDE 指標)...")
+    
+    # 確保 'sorted_flow_columns' 已經從 Basemodel 檢查點載入
+    if not CONFIG["cached_basemodel_sorted_flow_columns"]:
+        raise ValueError("未能從 Basemodel 檢查點載入 'sorted_flow_columns'，無法計算標準差。")
+        
+    all_flow_data = full_df[CONFIG["cached_basemodel_sorted_flow_columns"]].values.astype(np.float32)
+    
+    # 計算全域的、逐網格的標準差
+    global_target_grid_stds = np.std(all_flow_data, axis=0)
+    # 計算全域的、總體的標準差
+    global_target_overall_std = np.std(all_flow_data)
+    
+    logger.info(f"  - 全域逐網格標準差 (Global Grid STDs) shape: {global_target_grid_stds.shape}")
+    logger.info(f"  - 全域總體標準差 (Global Overall STD): {global_target_overall_std:.4f}")
 
     # === 步驟 2: 準備 Basemodel 輸出 (作為S2條件) ===
     df_for_bm_output_gen = full_df.copy() 
@@ -2798,6 +2849,8 @@ if __name__ == '__main__':
             config=CONFIG,
             current_stage_target_norm_stats=stage4_target_norm_stats_for_eval,
             previous_stage_target_norm_stats=stage3_target_norm_stats_for_eval,
+            target_grid_stds=global_target_grid_stds,
+            target_overall_std=global_target_overall_std,
             max_samples_for_fid=CONFIG.get("fid_num_samples"),
             prefix=f"final_S4_vs_S3_evaluation"
         )
@@ -2835,6 +2888,8 @@ if __name__ == '__main__':
                 model_trained=final_baseline_model_to_eval, dataloader=baseline_test_loader, 
                 inception_model_fid=inception_model_for_fid_final_eval, config=CONFIG,
                 target_norm_stats=chkpt_baseline['target_norm_stats'],
+                target_grid_stds=global_target_grid_stds,
+                target_overall_std=global_target_overall_std,
                 prefix="final_baseline_evaluation"
             )
             final_baseline_metrics = {"baseline_model": baseline_metrics_raw}
@@ -2875,6 +2930,7 @@ if __name__ == '__main__':
                 row_data = {'資料來源': model_key, '網格座標_R': flat_idx // CONFIG["W"], '網格座標_C': flat_idx % CONFIG["W"]}
                 for metric in ['MSE', 'MAE', 'MAPE', 'SMAPE']:
                     row_data[metric] = error_grids.get(metric, [np.nan] * num_grid_cells)[flat_idx]
+                row_data['STDE_AvgGrid'] = error_grids.get('STDE_AvgGrid', [np.nan] * num_grid_cells)[flat_idx]
                 excel_rows.append(row_data)
 
         # 寫入逐網格誤差差異 (S4-S3)
@@ -2883,6 +2939,7 @@ if __name__ == '__main__':
             excel_rows.append({'資料來源': "--- Difference (Stage4 - Stage3) 逐網格誤差 ---"})
             for metric in ['MSE', 'MAE', 'MAPE', 'SMAPE']:
                 s4_s3_diff_grids[metric] = combined_error_grids['stage4_model'][metric] - combined_error_grids['stage3_model_on_stage4_data'][metric]
+            s4_s3_diff_grids['STDE_AvgGrid'] = combined_error_grids['stage4_model']['STDE_AvgGrid'] - combined_error_grids['stage3_model_on_stage4_data']['STDE_AvgGrid']
             for flat_idx in range(num_grid_cells):
                 row_data = {'資料來源': "Diff(S4-S3)", '網格座標_R': flat_idx // CONFIG["W"], '網格座標_C': flat_idx % CONFIG["W"]}
                 for metric in ['MSE', 'MAE', 'MAPE', 'SMAPE']:
@@ -2896,6 +2953,8 @@ if __name__ == '__main__':
                 row_data = {'資料來源': "Diff(S4-Baseline)", '網格座標_R': flat_idx // CONFIG["W"], '網格座標_C': flat_idx % CONFIG["W"]}
                 for metric in ['MSE', 'MAE', 'MAPE', 'SMAPE']:
                     row_data[metric] = diff_s4_bl_grids.get(f"Diff_{metric}_(Stage4-Baseline)", [np.nan] * num_grid_cells)[flat_idx]
+                diff_stde_val = s4_err.get('STDE_AvgGrid', [np.nan]*num_grid_cells)[flat_idx] - bl_err.get('STDE_AvgGrid', [np.nan]*num_grid_cells)[flat_idx]
+                row_data['STDE_AvgGrid'] = diff_stde_val    
                 excel_rows.append(row_data)
 
         # 寫入總體平均指標
@@ -2904,19 +2963,28 @@ if __name__ == '__main__':
             if model_key not in combined_metrics: continue
             metrics = combined_metrics[model_key]
             avg_row = {'資料來源': model_key, '網格座標_R': '整體平均'}
-            avg_row.update({k.upper().replace("AVG_GRID", "MAPE/SMAPE(AvgGrid)").replace("_OVERALL", "(Overall)"): v for k, v in metrics.items()})
+            avg_row.update({
+                'MSE': metrics.get('mse'), 'MAE': metrics.get('mae'),
+                'MAPE(AvgGrid)': metrics.get('mape_avg_grid'), 'SMAPE(AvgGrid)': metrics.get('smape_avg_grid'),
+                'STDE_AvgGrid': metrics.get('stde_avg_grid'),
+                'MAPE(Overall)': metrics.get('mape_overall'), 'SMAPE(Overall)': metrics.get('smape_overall'),
+                'STDE_Overall': metrics.get('stde_overall'),
+                'FID': metrics.get('fid')
+            })
             excel_rows.append(avg_row)
 
         # 寫入總體指標差異
         if 'stage4_model' in combined_metrics and 'stage3_model_on_stage4_data' in combined_metrics:
             diff_row = {'資料來源': "Diff(S4-S3)", '網格座標_R': '整體平均差異'}
             for k in combined_metrics['stage4_model']:
-                diff_row[k.upper().replace("AVG_GRID", "MAPE/SMAPE(AvgGrid)").replace("_OVERALL", "(Overall)")] = combined_metrics['stage4_model'][k] - combined_metrics['stage3_model_on_stage4_data'][k]
+                excel_key = k.upper().replace("AVG_GRID", "(AvgGrid)").replace("_OVERALL", "(Overall)")
+                diff_row[excel_key] = combined_metrics['stage4_model'][k] - combined_metrics['stage3_model_on_stage4_data'][k]
             excel_rows.append(diff_row)
         if 'stage4_model' in combined_metrics and 'baseline_model' in combined_metrics:
             diff_row = {'資料來源': "Diff(S4-Baseline)", '網格座標_R': '整體平均差異'}
             for k in combined_metrics['stage4_model']:
-                diff_row[k.upper().replace("AVG_GRID", "MAPE/SMAPE(AvgGrid)").replace("_OVERALL", "(Overall)")] = combined_metrics['stage4_model'][k] - combined_metrics['baseline_model'][k]
+                excel_key = k.upper().replace("AVG_GRID", "(AvgGrid)").replace("_OVERALL", "(Overall)")
+                diff_row[excel_key] = combined_metrics['stage4_model'][k] - combined_metrics['baseline_model'][k]
             excel_rows.append(diff_row)
 
         # 匯出到 Excel

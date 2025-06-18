@@ -29,17 +29,17 @@ CONFIG = {
     'features_to_use': None  # 使用所有特徵的範例，取消此行註解以啟用
 }
 ENABLE_EXTERNAL_FILTER = True
-
+result_dir = r"C:\thesis\code\result_lgb\StdExcee_Positive_Top50"
 # 外部檔案路徑和篩選條件 (僅在 ENABLE_EXTERNAL_FILTER 為 True 時才會使用)
 external_filter_file = r"C:\thesis\code\DIFFUSION_TREE\results_ddpm_stage3\Stage3_WeekdayLe4\analysis_error\stage3_error_analysis_4_ways.xlsx"
-filter_column = "分組(原始誤差)"
-filter_value = "Raw Error: Positive Top 50"
+filter_column = "分組(超標時數Std)"
+filter_value = "StdExceed: Positive Top 50"
 # LightGBM 參數
 ind_tree_params = {
             'objective': 'regression',
             'metric': ['l2', 'l1'],
             'boosting_type': 'gbdt',
-            'num_leaves': 31,
+            'num_leaves': 63,
             'learning_rate': 0.01,
             'feature_fraction': 0.9,
             'seed': 42
@@ -49,7 +49,7 @@ shared_params = {
     'objective': 'regression',          # 任務目標：設定為 'regression' (回歸)，模型將以最小化L2損失（均方誤差）為目標進行學習。
     'metric': ['l2', 'l1'],               # 評估指標：在訓練過程中，同時監控 'l2' (MSE, 均方誤差) 和 'l1' (MAE, 平均絕對誤差) 這兩個指標。
     'learning_rate': 0.01,                 # 學習率：每次迭代（每棵樹）的步長縮減。較小的值有助於防止過擬合，但通常需要更多的迭代次數。
-    'num_leaves': 31,                     # 每棵樹的最大葉子節點數：控制樹模型複雜度的主要參數。值越大，樹越複雜，越容易過擬合。31是一個常見的預設值。
+    'num_leaves': 63,                     # 每棵樹的最大葉子節點數：控制樹模型複雜度的主要參數。值越大，樹越複雜，越容易過擬合。31是一個常見的預設值。
     'min_data_in_leaf': 20,               # 每個葉子節點上最少的數據筆數：用於防止過擬合。如果一次分裂後，某個葉子節點的數據量少於此值，則不會進行這次分裂。
     'feature_fraction': 0.9,              # 特徵抽樣比例：在建立每棵樹之前，隨機選取90%的特徵。這可以加速訓練並有助於防止過擬合。
     'bagging_fraction': 0.8,              # 數據抽樣比例（不進行重採樣）：在每次迭代時，隨機選取80%的數據來訓練當前的樹。這有助於防止過擬合，也稱為子抽樣 (subsampling)。
@@ -67,7 +67,6 @@ plt.rcParams['axes.unicode_minus'] = False
 
 data_path = r"C:\thesis\code\Taipei_CF\all_merged.csv"
 df = pd.read_csv(data_path)
-result_dir = r"C:\thesis\code\result_lgb"
 os.makedirs(result_dir, exist_ok=True)
 # 建立子目錄
 sub_dirs = ["learning_curve", "tree", "shap_summary", "shap_bar", "model", "group_tree", "individual_target_models"]
@@ -92,15 +91,16 @@ feature_mapping = {
     '能見度': 'Visibility',
     '紫外線指數': 'UV_Index',
     '總雲量': 'Total_Cloud_Cover',
-    'hoilday': 'Holiday',
-    'weekday': 'Weekday',
-    '年': 'Year',
+    #'hoilday': 'Holiday',
+    #'weekday': 'Weekday',
+    #'年': 'Year',
     '月': 'Month',
     '日': 'Day',
-    '時': 'Hour',
+    #'時': 'Hour',
     'ArenaEvents': 'ArenaEvents',
     'ArenaEvents_concert': 'ArenaEvents_concert',
-    'ArenaEvents_others': 'ArenaEvents_others'
+    'ArenaEvents_others': 'ArenaEvents_others',
+    'TombSweeping': 'Tomb_Sweeping',
 }
 reverse_mapping = {v: k for k, v in feature_mapping.items()}
 
@@ -121,51 +121,6 @@ target_columns = [col for col in df.columns if '(' in col and ')' in col]
 # 確保 target_columns 中的座標是唯一的，如果原始數據中可能有重複
 target_columns = sorted(list(set(target_columns)))
 print("所有座標點：", len(target_columns))
-
-if ENABLE_EXTERNAL_FILTER:
-    print(f"\n--- 外部檔案網格篩選已啟用 ---")
-    print(f"讀取檔案: {external_filter_file}")
-    
-    # 讀取 Excel 檔案
-    # 如果檔案路徑或名稱錯誤，程式將在此處停止並報錯
-    df_filter = pd.read_excel(external_filter_file)
-    
-    # 根據條件篩選資料
-    # 如果欄位名稱錯誤，程式將在此處停止並報錯
-    filtered_df = df_filter[df_filter[filter_column] == filter_value]
-    
-    if filtered_df.empty:
-        print(f"警告: 在檔案中找不到符合條件 '{filter_column}' == '{filter_value}' 的資料。腳本將繼續使用所有先前定義的網格。")
-    else:
-        # 從篩選後的資料中提取經緯度，並建立一個目標座標字串的集合
-        desired_coords_set = set()
-        for index, row in filtered_df.iterrows():
-            # 如果 '經度' 或 '緯度' 欄位不存在，程式將在此處停止並報錯
-            lon = row['經度']
-            lat = row['緯度']
-            coord_str = f"({lon}, {lat})"
-            desired_coords_set.add(coord_str)
-            
-        print(f"從篩選檔案中成功讀取 {len(desired_coords_set)} 組唯一的目標經緯度。")
-
-        original_target_count = len(target_columns)
-        
-        # 過濾 target_columns，只保留存在於 desired_coords_set 中的座標
-        filtered_target_columns = [tc for tc in target_columns if tc in desired_coords_set]
-        
-        if not filtered_target_columns and original_target_count > 0:
-             print("警告: 外部檔案中的座標與原始資料中的座標格式或數值不符，沒有匹配到任何網格。")
-        
-        # 更新 target_columns 為篩選後的列表
-        target_columns = sorted(list(set(filtered_target_columns)))
-        print(f"座標點已根據外部檔案篩選。數量從 {original_target_count} 更新為 {len(target_columns)}。")
-        if original_target_count > 0 and len(target_columns) == 0:
-            print("=> 重要提示：篩選後沒有剩餘的目標網格可以執行，程式可能會在後續步驟中出錯。")
-        
-        print(f"--- 外部檔案網格篩選結束 ---\n")
-
-else:
-    print("\n--- 外部檔案網格篩選已停用。將使用所有先前定義的網格進行分析。---\n")
 
 # 解析座標字串函式 (如果尚未在全域定義，則移至此處或確保可訪問)
 def parse_coord_string(coord_str):
@@ -229,6 +184,51 @@ else:
     print("警告：target_columns 為空，無法進行座標篩選。")
 # --- 篩選結束 ---
 
+if ENABLE_EXTERNAL_FILTER:
+    print(f"\n--- 外部檔案網格篩選已啟用 ---")
+    print(f"讀取檔案: {external_filter_file}")
+    
+    # 讀取 Excel 檔案
+    # 如果檔案路徑或名稱錯誤，程式將在此處停止並報錯
+    df_filter = pd.read_excel(external_filter_file)
+    
+    # 根據條件篩選資料
+    # 如果欄位名稱錯誤，程式將在此處停止並報錯
+    filtered_df = df_filter[df_filter[filter_column] == filter_value]
+    
+    if filtered_df.empty:
+        print(f"警告: 在檔案中找不到符合條件 '{filter_column}' == '{filter_value}' 的資料。腳本將繼續使用所有先前定義的網格。")
+    else:
+        # 從篩選後的資料中提取經緯度，並建立一個目標座標字串的集合
+        desired_coords_set = set()
+        for index, row in filtered_df.iterrows():
+            # 如果 '經度' 或 '緯度' 欄位不存在，程式將在此處停止並報錯
+            lon = row['經度']
+            lat = row['緯度']
+            coord_str = f"({lon}, {lat})"
+            desired_coords_set.add(coord_str)
+            
+        print(f"從篩選檔案中成功讀取 {len(desired_coords_set)} 組唯一的目標經緯度。")
+
+        original_target_count = len(target_columns)
+        
+        # 過濾 target_columns，只保留存在於 desired_coords_set 中的座標
+        filtered_target_columns = [tc for tc in target_columns if tc in desired_coords_set]
+        
+        if not filtered_target_columns and original_target_count > 0:
+             print("警告: 外部檔案中的座標與原始資料中的座標格式或數值不符，沒有匹配到任何網格。")
+        
+        # 更新 target_columns 為篩選後的列表
+        target_columns = sorted(list(set(filtered_target_columns)))
+        print(f"座標點已根據外部檔案篩選。數量從 {original_target_count} 更新為 {len(target_columns)}。")
+        if original_target_count > 0 and len(target_columns) == 0:
+            print("=> 重要提示：篩選後沒有剩餘的目標網格可以執行，程式可能會在後續步驟中出錯。")
+        
+        print(f"--- 外部檔案網格篩選結束 ---\n")
+
+else:
+    print("\n--- 外部檔案網格篩選已停用。將使用所有先前定義的網格進行分析。---\n")
+
 # 根據 CONFIG 決定要使用的特徵列表 (中文)
 if CONFIG['features_to_use'] is not None:
     features_to_use_chinese = CONFIG['features_to_use']
@@ -267,7 +267,7 @@ X_test_tree = X_test.rename(columns=feature_mapping)
 
 # 動態定義類別特徵列表 (cat_features)
 # 首先定義所有可能的類別特徵（中文名）
-all_possible_cat_features_chinese = ['hoilday', 'ArenaEvents', 'ArenaEvents_concert', 'ArenaEvents_others'] # 根據您的 feature_mapping 調整
+all_possible_cat_features_chinese = ['hoilday', 'ArenaEvents', 'ArenaEvents_concert', 'ArenaEvents_others', 'TombSweeping'] # 根據您的 feature_mapping 調整
 # 從最終使用的特徵中，篩選出哪些是類別特徵
 selected_cat_features_chinese = [f for f in X.columns if f in all_possible_cat_features_chinese]
 # 將它們轉換為英文名，供 LightGBM 使用
@@ -527,8 +527,6 @@ for target in target_columns: # 此迴圈現在只會遍歷篩選後的 target_c
     geo_coords.append(target) 
     grid_ids.append(target)
     
-# 定義結果儲存目錄
-result_dir = r"C:\\thesis\\code\\result_lgb"  # 請根據實際路徑調整
 shared_result_dir = os.path.join(result_dir, "shared_model")
 
 # 建立必要的子目錄
@@ -1403,4 +1401,4 @@ for group_id in unique_group_ids:
     plt.close() # 關閉當前圖形，以便在下一次迴圈中創建新圖
     print(f"  組別 {group_id + 1} 的地理分佈圖已儲存至: {individual_group_plot_path}")
 print("所有處理完成。")
-# %%
+

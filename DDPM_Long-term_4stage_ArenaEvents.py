@@ -64,27 +64,35 @@ CONFIG = {
     "stage3_checkpoint_path": "best_stage3_model_Weekday_le_4.pth", # Stage3 模型的檢查點檔名 (相對路徑)
 
     # === Stage4 特定配置 ===
-    # "stage4_new_condition_feature_column": "時", # stage4 新條件的欄位名 
-    # "stage4_new_conditional_operator": "<=",         # stage4 新條件的運算符
-    # "stage4_new_conditional_value": 20,             # stage4 新條件的閾值
-    # "stage4_model_name": "stage4_HourLe20",    # 第三階段模型的名稱
-    # "stage4_checkpoint_path": "best_stage4_model_hour_le_20.pth", # stage4 模型的檢查點檔名 (相對路徑)
-    # === Stage4 特定配置 (使用組合特徵) ===
     "stage4_config": {
-        "model_name": "stage4_arenaEvents", # 第四階段模型的名稱
-        "checkpoint_path": "best_stage4_model_arena_events.pth",
-        
-        # 1. 定義基於事件的過濾規則
-        "event_filter": {
-            "file_path": r"C:\thesis\code\Taipei_CF\ArenaEvents.xlsx",
-            # --- 主要修改點：指定年、月、日分別是哪個欄位 ---
-            "year_col": "年",
-            "month_col": "月",
-            "day_col": "日"
+        # --- 模式開關: 'event' 或 'feature' ---
+        "mode": "event", 
+
+        # --- 活動模式參數 (mode='event' 時啟用) ---
+        "event_params": {
+            "model_name": "stage4_arenaEvents",
+            "checkpoint_path": "best_stage4_model_arena_events.pth",
+            "event_filter": {
+                "file_path": r"C:\thesis\code\Taipei_CF\ArenaEvents.xlsx",
+                "year_col": "年",
+                "month_col": "月",
+                "day_col": "日"
+            },
+            # 這個欄位的值會被當作模型的條件輸入
+            "grid_feature_source_column": "date_combined" 
         },
-        
-        # 2. 指定用於【模型條件輸入】的組合特徵欄位名稱
-        "grid_feature_source_column": "date_combined"
+
+        # --- 特徵模式參數 (mode='feature' 時啟用) ---
+        "feature_params": {
+            "model_name": "stage4_weekend",
+            "checkpoint_path": "best_stage4_model_Weekday_le_4.pth",
+            # 這三個欄位用來篩選資料
+            "new_condition_feature_column": "weekday", 
+            "new_conditional_operator": "<=",
+            "new_conditional_value": 4,
+            # 這個欄位的值會被當作模型的條件輸入
+            "grid_feature_source_column": "weekday" 
+        }
     },
 
     "baseline_feature_columns": [
@@ -871,32 +879,30 @@ class MultiStageDataset(Dataset):
         if self.current_stage_mode_enum.value >= ConditionMode.STAGE4.value:
             if self.current_stage_mode_enum == ConditionMode.STAGE4:
                 
-                # --- 這是關鍵的修改點 ---
-                # 從我們新設計的 CONFIG 結構中，讀取代表性特徵的欄位名稱
-                self.s4_new_cond_col_name = self.config["stage4_config"]["grid_feature_source_column"]
+                # 統一從 CONFIG 讀取當前模式的參數
+                s4_mode = self.config["stage4_config"]["mode"]
+                s4_params = self.config["stage4_config"][f"{s4_mode}_params"]
                 
-                # 後續的程式碼邏輯幾乎不變，因為它們是基於 self.s4_new_cond_col_name 這個變數運作的
-                
-                # 根據新的欄位名稱，獲取組合特徵的原始數值 (例如 407, 408...)
+                # 統一獲取要作為【模型條件輸入】的特徵欄位
+                self.s4_new_cond_col_name = s4_params["grid_feature_source_column"]
                 self.s4_new_cond_original_values_np = self._get_original_cond_values(self.s4_new_cond_col_name)
                 
-                # 對於專家模型，所有數據都屬於同一個目標類別，直接設為 0 即可
-                # 這也避免了去讀取已經不存在的舊 CONFIG 鍵
+                # --- 核心邏輯 ---
+                # 因為數據已經在外部被過濾，所以這裡的所有樣本都屬於同一個目標類別 (類別 0)
+                # 這個邏輯對 'event' 和 'feature' 模式都適用
                 self.s4_new_cond_category_for_target_np = np.zeros(len(self.df_processed), dtype=int)
-                self.logger.info(f"專家模型模式：所有 {len(self.df_processed)} 筆 Stage4 數據的目標類別均設為 0。")
+                self.logger.info(f"Stage 4 ({s4_mode} mode): 所有 {len(self.df_processed)} 筆已過濾數據的目標類別均設為 0。")
 
+                # 後續的正規化統計量計算邏輯保持不變
                 if self.mode == 'train':
-                    # 在訓練集上，為我們的組合特徵計算正規化統計量 (mean 和 std)
                     self.norm_stats_s4_new_cond_feature = self._calculate_norm_stats(
                         self.s4_new_cond_original_values_np, self.s4_new_cond_col_name, "S4 new cond (Train)"
                     )
-                else: # S4 的驗證集或測試集
+                else: 
                     if s4_stats_source is None:
                         raise ValueError("Stage4 val/test mode 需要從訓練集傳入 Stage4 新條件的正規化統計量。")
-                    # 使用從訓練集傳過來的統計量
                     self.norm_stats_s4_new_cond_feature = s4_stats_source
                     
-                # 記錄日誌，顯示組合特徵在正規化後的統計分佈
                 self._log_normalized_scalar_stats(self.s4_new_cond_original_values_np, self.norm_stats_s4_new_cond_feature,
                                                   self.s4_new_cond_col_name, f"{self.current_stage_name}: Stage4 新條件")
 
@@ -2500,41 +2506,47 @@ if __name__ == '__main__':
             logger.error(f"儲存 Stage3 ({CONFIG['stage3_model_name']}) 輸出到快取失敗: {e}")
         logger.info(f"  生成並正規化後的 Stage3 ({CONFIG['stage3_model_name']}) 模型輸出 (作為S4條件) - MIN: {np.min(all_s3_outputs_s4_np_cond_normalized):.4f}, MAX: {np.max(all_s3_outputs_s4_np_cond_normalized):.4f}, MEAN: {np.mean(all_s3_outputs_s4_np_cond_normalized):.4f}, STD: {np.std(all_s3_outputs_s4_np_cond_normalized):.4f}")
 
-    # === 新增步驟 6.5: 根據 Stage4 複合條件過濾數據 ===
-    logger.info(f"===== STAGE 4 Pre-processing: Filtering data based on external event file =====")
-    event_filter_config = CONFIG["stage4_config"]["event_filter"]
+    # === 步驟 6.5: 根據 Stage4 模式過濾數據 ===
+    s4_mode = CONFIG["stage4_config"]["mode"]
+    logger.info(f"===== STAGE 4 Pre-processing: 執行 '{s4_mode}' 模式資料過濾 =====")
     
-    event_file_path = event_filter_config["file_path"]
-    year_col = event_filter_config["year_col"]
-    month_col = event_filter_config["month_col"]
-    day_col = event_filter_config["day_col"]
+    # 根據模式，產生一個布林遮罩 (final_mask) 來篩選數據
+    if s4_mode == "event":
+        params = CONFIG["stage4_config"]["event_params"]
+        event_filter_config = params["event_filter"]
+        event_file_path = event_filter_config["file_path"]
+        
+        logger.info(f"從事件檔案 '{event_file_path}' 讀取指定日期...")
+        if not os.path.exists(event_file_path):
+            raise FileNotFoundError(f"找不到活動日期 Excel 檔案: {event_file_path}")
+        
+        events_df = pd.read_excel(event_file_path)
+        required_cols = ["year_col", "month_col", "day_col"]
+        if not all(k in event_filter_config for k in required_cols):
+             raise ValueError(f"專家模式的 event_filter 配置不完整，需要: {required_cols}")
+        
+        year_col, month_col, day_col = event_filter_config["year_col"], event_filter_config["month_col"], event_filter_config["day_col"]
+        event_date_set = set(zip(events_df[year_col], events_df[month_col], events_df[day_col]))
+        logger.info(f"從檔案中提取了 {len(event_date_set)} 個不重複的活動日期。")
+        final_mask = full_df.apply(lambda row: (row['年'], row['月'], row['日']) in event_date_set, axis=1)
+
+    elif s4_mode == "feature":
+        params = CONFIG["stage4_config"]["feature_params"]
+        column = params["new_condition_feature_column"]
+        operator = params["new_conditional_operator"]
+        value = params["new_conditional_value"]
+        
+        logger.info(f"使用特徵條件進行過濾: {column} {operator} {value}")
+        final_mask = create_condition_mask(full_df, column, operator, value)
     
-    if not os.path.exists(event_file_path):
-        raise FileNotFoundError(f"找不到活動日期 Excel 檔案: {event_file_path}")
-    
-    # 1. 讀取 Excel 檔案
-    logger.info(f"正在從 {event_file_path} 讀取活動日期...")
-    events_df = pd.read_excel(event_file_path)
+    else:
+        raise ValueError(f"不支援的 Stage 4 模式: '{s4_mode}'。請選擇 'event' 或 'feature'。")
 
-    # 檢查必要欄位是否存在
-    required_cols = [year_col, month_col, day_col]
-    if not all(col in events_df.columns for col in required_cols):
-        raise ValueError(f"Excel 檔案 '{event_file_path}' 中缺少必要的欄位，需要: {required_cols}")
-
-    event_date_set = set(zip(events_df[year_col], events_df[month_col], events_df[day_col]))
-    #event_date_set = set(zip(events_df[month_col], events_df[day_col]))
-    logger.info(f"從檔案中提取了 {len(event_date_set)} 個不重複的活動日期 (年, 月, 日)。")
-
-    # 3. 根據 (月, 日) 集合，在主 DataFrame 上創建布林遮罩
-    final_mask = full_df.apply(lambda row: (row['年'], row['月'], row['日']) in event_date_set, axis=1)
-    #final_mask = full_df.apply(lambda row: (row['月'], row['日']) in event_date_set, axis=1)
-    
-
-    # 後續的篩選和日誌記錄邏輯不變
+    # --- 以下的篩選邏輯對兩種模式都通用 ---
     df_for_s4_specialist = full_df[final_mask].copy()
     num_total = len(full_df)
     num_filtered = len(df_for_s4_specialist)
-    logger.info(f"數據過濾完成。總共 {num_total} 筆資料，滿足活動日條件的有 {num_filtered} 筆 ({num_filtered/num_total:.2%})。")
+    logger.info(f"數據過濾完成。總共 {num_total} 筆資料，滿足 Stage 4 條件的有 {num_filtered} 筆 ({num_filtered/num_total:.2%})。")
 
     # 過濾之前階段生成的 NumPy 輸出陣列
     bm_outputs_for_s4_processing = all_bm_outputs_s2_np_cond_normalized[final_mask]
@@ -2543,8 +2555,17 @@ if __name__ == '__main__':
 
 #%%
     # === 步驟 7: Stage4 數據準備與模型訓練 ===
-    model_name_for_log = CONFIG["stage4_config"]["model_name"]
-    logger.info(f"===== STAGE 4: 數據準備與模型訓練 ({model_name_for_log}) =====")
+    s4_mode = CONFIG["stage4_config"]["mode"]
+    s4_params = CONFIG["stage4_config"][f"{s4_mode}_params"]
+    
+    model_name_for_log = s4_params["model_name"]
+    # 動態更新 CONFIG 中的 Stage4 模型儲存路徑，使其與當前模式匹配
+    CONFIG["stage4_model_save_dir"] = os.path.join(CONFIG["save_dir"], model_name_for_log)
+    os.makedirs(CONFIG["stage4_model_save_dir"], exist_ok=True)
+    CONFIG["stage4_checkpoint_full_path"] = os.path.join(CONFIG["stage4_model_save_dir"], s4_params["checkpoint_path"])
+    
+    logger.info(f"===== STAGE 4 ({s4_mode} mode): 數據準備與模型訓練 ({model_name_for_log}) =====")
+    logger.info(f"Stage4 模型結果將儲存於: {CONFIG['stage4_model_save_dir']}")
     df_for_s4_processing = full_df.copy()
 
     s4_indices_all = np.arange(len(df_for_s4_specialist))

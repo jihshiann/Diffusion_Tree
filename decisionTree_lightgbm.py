@@ -26,10 +26,11 @@ CONFIG = {
         'ArenaEvents_others',
         'hoilday'
     ],
-    'features_to_use': None  # 使用所有特徵的範例，取消此行註解以啟用
+    #'features_to_use': None  # 使用所有特徵的範例，取消此行註解以啟用
 }
-ENABLE_EXTERNAL_FILTER = True
-result_dir = r"C:\thesis\code\result_lgb\StdExcee_Positive_Top50"
+ENABLE_EXTERNAL_FILTER = False
+#result_dir = r"C:\thesis\code\result_lgb\StdExcee_Positive_Top50"
+result_dir = r"C:\thesis\code\result_lgb"
 # 外部檔案路徑和篩選條件 (僅在 ENABLE_EXTERNAL_FILTER 為 True 時才會使用)
 external_filter_file = r"C:\thesis\code\DIFFUSION_TREE\results_ddpm_stage3\Stage3_WeekdayLe4\analysis_error\stage3_error_analysis_4_ways.xlsx"
 filter_column = "分組(超標時數Std)"
@@ -1402,3 +1403,5 @@ for group_id in unique_group_ids:
     print(f"  組別 {group_id + 1} 的地理分佈圖已儲存至: {individual_group_plot_path}")
 print("所有處理完成。")
 
+
+# %%

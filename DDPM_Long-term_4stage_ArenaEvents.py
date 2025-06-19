@@ -66,7 +66,7 @@ CONFIG = {
     # === Stage4 特定配置 ===
     "stage4_config": {
         # --- 模式開關: 'event' 或 'feature' ---
-        "mode": "event", 
+        "mode": "feature", 
 
         # --- 活動模式參數 (mode='event' 時啟用) ---
         "event_params": {
@@ -84,14 +84,14 @@ CONFIG = {
 
         # --- 特徵模式參數 (mode='feature' 時啟用) ---
         "feature_params": {
-            "model_name": "stage4_weekend",
-            "checkpoint_path": "best_stage4_model_Weekday_le_4.pth",
+            "model_name": "Stage4_MaxGustM3_5",
+            "checkpoint_path": "best_stage4_model_max_gust_m_3_5.pth",
             # 這三個欄位用來篩選資料
-            "new_condition_feature_column": "weekday", 
-            "new_conditional_operator": "<=",
-            "new_conditional_value": 4,
+            "new_condition_feature_column": "最大陣風", 
+            "new_conditional_operator": ">",
+            "new_conditional_value": 3.5,
             # 這個欄位的值會被當作模型的條件輸入
-            "grid_feature_source_column": "weekday" 
+            "grid_feature_source_column": "最大陣風" 
         }
     },
 
@@ -102,6 +102,13 @@ CONFIG = {
         "月", 
         "date_combined"
     ],
+
+    "coordinate_filter": {
+        "enabled": True, # 設為 True 來啟用此功能
+        "file_path": r"C:\thesis\code\DIFFUSION_TREE\results_ddpm_stage3\Stage3_WeekdayLe4\analysis_error\raw_error_sum_group0_RawError_Pos_Top50.xlsx", # 包含 R 和 C 欄位的 Excel 檔案
+        "r_col": "R", # Excel 中代表「列」的欄位名
+        "c_col": "C"  # Excel 中代表「行」的欄位名
+    },
 
     # --- DDPM 擴散參數 ---
     "timesteps": 1000,          # 擴散時間步長
@@ -521,6 +528,19 @@ class DDPM3D(nn.Module):
         stacked_cond_grids = stacked_cond_grids.to(self.device)
         processed_condition = self.condition_processor(stacked_cond_grids)
         predicted_noise = self.model(x_t_noisy_target, t, processed_condition)
+        loss_tensor = (noise - predicted_noise) ** 2
+        
+        # 從 condition_args 獲取遮罩 (如果存在)
+        coord_mask = condition_args.get("coord_mask")
+        
+        if coord_mask is not None:
+            # 只計算遮罩區域為 True 的損失
+            masked_loss = loss_tensor * coord_mask
+            # 除以遮罩為 True 的元素數量來取平均
+            return masked_loss.sum() / coord_mask.sum()
+        else:
+            # 如果沒有遮罩，則正常計算平均
+            return loss_tensor.mean()
         return F.mse_loss(noise, predicted_noise)
 
     @torch.no_grad()
@@ -1358,6 +1378,7 @@ def visualize_predictions_long_term(
                         original_all_denorm_t: torch.Tensor,  # (N, C, D, H, W) 反正規化後的真實數據
                         config: Dict[str, Any],
                         sample_idx_to_plot: Optional[int] = 0, # 要繪製的特定樣本索引，None 表示繪製平均值
+                        coord_mask: Optional[np.ndarray] = None,
                         prefix: str = "test_eval" # 檔名前綴
                        ):
     """
@@ -1405,44 +1426,61 @@ def visualize_predictions_long_term(
 
     # --- 修改開始：繪製6個子圖 ---
     fig, axes = plt.subplots(2, 3, figsize=(18, 10)) # 改成 2x3 的佈局
+    cmap_generated = plt.get_cmap('viridis').copy()
+    cmap_original = plt.get_cmap('viridis').copy()
+    cmap_error = plt.get_cmap('hot').copy()
+    cmap_perc_error = plt.get_cmap('cividis').copy()
+    if coord_mask is not None:
+        cmap_generated.set_bad(color='grey', alpha=0.5)
+        cmap_original.set_bad(color='grey', alpha=0.5)
+        cmap_error.set_bad(color='grey', alpha=0.5)
+        cmap_perc_error.set_bad(color='grey', alpha=0.5)
 
     # 圖 1: Generated
-    im_gen = axes[0, 0].imshow(gen_data_to_plot, cmap='viridis')
+    generated_display = np.where(coord_mask, gen_data_to_plot, np.nan) if coord_mask is not None else gen_data_to_plot
+    im_gen = axes[0, 0].imshow(generated_display, cmap=cmap_generated)
     axes[0, 0].set_title(f'Generated ({title_suffix})')
     axes[0, 0].axis('off') # 隱藏座標軸
     fig.colorbar(im_gen, ax=axes[0, 0], fraction=0.046, pad=0.04)
 
     # 圖 2: Original
-    im_orig = axes[0, 1].imshow(orig_data_to_plot, cmap='viridis')
+    original_display = np.where(coord_mask, orig_data_to_plot, np.nan) if coord_mask is not None else orig_data_to_plot
+    im_orig = axes[0, 1].imshow(original_display, cmap=cmap_original)
     axes[0, 1].set_title(f'Original ({title_suffix})')
     axes[0, 1].axis('off')
     fig.colorbar(im_orig, ax=axes[0, 1], fraction=0.046, pad=0.04)
 
     # 圖 3: MSE
-    im_mse = axes[0, 2].imshow(mse_matrix, cmap='hot')
-    axes[0, 2].set_title(f'MSE Grid (Avg: {overall_mse:.0f})')
+    mse_display = np.where(coord_mask, mse_matrix, np.nan) if coord_mask is not None else mse_matrix
+    im_mse = axes[0, 2].imshow(mse_display, cmap=cmap_error)
+    axes[0, 2].set_title(f'MSE Grid (Avg: {overall_mse:.2f})')
     axes[0, 2].axis('off')
     fig.colorbar(im_mse, ax=axes[0, 2], fraction=0.046, pad=0.04)
 
     # 圖 4: MAE
-    im_mae = axes[1, 0].imshow(mae_matrix, cmap='hot')
-    axes[1, 0].set_title(f'MAE Grid (Avg: {overall_mae:.0f})')
+    mae_display = np.where(coord_mask, mae_matrix, np.nan) if coord_mask is not None else mae_matrix
+    im_mae = axes[1, 0].imshow(mae_display, cmap=cmap_error)
+    axes[1, 0].set_title(f'MAE Grid (Avg: {overall_mae:.2f})')
     axes[1, 0].axis('off')
     fig.colorbar(im_mae, ax=axes[1, 0], fraction=0.046, pad=0.04)
 
     # 圖 5: MAPE
     # MAPE 值可能差異很大，可以考慮使用 vmin 和 vmax 來設定顯示範圍
-    vmax_mape = np.percentile(mape_matrix[np.isfinite(mape_matrix)], 98) if np.any(np.isfinite(mape_matrix)) else 100 # 取98百分位數作為上限，避免極端值影響
-    im_mape = axes[1, 1].imshow(mape_matrix, cmap='cividis', vmin=0, vmax=vmax_mape if vmax_mape > 0 else 100)
-    axes[1, 1].set_title(f'MAPE Grid (Avg: {overall_mape:.0f})')
+    vmax_mape = np.percentile(mape_matrix[np.isfinite(mape_matrix)], 98) if np.any(np.isfinite(mape_matrix)) else 100
+    # --- [修改] 套用遮罩並使用新的 cmap ---
+    mape_display = np.where(coord_mask, mape_matrix, np.nan) if coord_mask is not None else mape_matrix
+    im_mape = axes[1, 1].imshow(mape_display, cmap=cmap_perc_error, vmin=0, vmax=vmax_mape if vmax_mape > 0 else 100)
+    axes[1, 1].set_title(f'MAPE Grid (Avg: {overall_mape:.2f})')
     axes[1, 1].axis('off')
     fig.colorbar(im_mape, ax=axes[1, 1], fraction=0.046, pad=0.04)
 
     # 圖 6: SMAPE
     # SMAPE 值通常在 0-200% 或 0-100% (取決於定義)
     vmax_smape = np.percentile(smape_matrix[np.isfinite(smape_matrix)], 98) if np.any(np.isfinite(smape_matrix)) else 100
-    im_smape = axes[1, 2].imshow(smape_matrix, cmap='cividis', vmin=0, vmax=vmax_smape if vmax_smape > 0 else 100) # SMAPE 範圍 0-100% 或 0-200%
-    axes[1, 2].set_title(f'SMAPE Grid (Avg: {overall_smape:.0f})')
+    # --- [修改] 套用遮罩並使用新的 cmap ---
+    smape_display = np.where(coord_mask, smape_matrix, np.nan) if coord_mask is not None else smape_matrix
+    im_smape = axes[1, 2].imshow(smape_display, cmap=cmap_perc_error, vmin=0, vmax=vmax_smape if vmax_smape > 0 else 100)
+    axes[1, 2].set_title(f'SMAPE Grid (Avg: {overall_smape:.2f})')
     axes[1, 2].axis('off')
     fig.colorbar(im_smape, ax=axes[1, 2], fraction=0.046, pad=0.04)
   
@@ -1611,6 +1649,7 @@ def evaluate_model(
     current_stage_target_norm_stats: Dict[str, float],
     target_grid_stds: np.ndarray,
     target_overall_std: float,
+    coord_mask: torch.Tensor,
     previous_stage_target_norm_stats: Optional[Dict[str, float]] = None,
     max_samples_for_fid: Optional[int] = None,
     prefix: str = "eval"
@@ -1806,8 +1845,11 @@ def evaluate_model(
         model_predictions_map_eval[ps_model_key_name] = (ps_generated_all_t, all_ps_generated_norm_for_fid_on_cs_data_list)
 
     for model_name, (pred_t, gen_fid_list_for_model) in model_predictions_map_eval.items():
-        mse = F.mse_loss(pred_t, cs_target_all_t).item()
-        mae = F.l1_loss(pred_t, cs_target_all_t).item()
+        mse_per_pixel = (pred_t - cs_target_all_t)**2
+        mae_per_pixel = torch.abs(pred_t - cs_target_all_t)
+
+        mse = (mse_per_pixel * coord_mask).sum() / coord_mask.sum()
+        mae = (mae_per_pixel * coord_mask).sum() / coord_mask.sum()
 
         actual_values_for_mape = torch.abs(cs_target_all_t)
         errors_for_mape = torch.abs(cs_target_all_t - pred_t)
@@ -1889,6 +1931,12 @@ def evaluate_model(
             smape_d_g = (torch.abs(target_squeezed) + torch.abs(pred_squeezed))/2.0 + epsilon
             smape_g_t = (smape_n_g / smape_d_g) * 100
             smape_g = torch.mean(smape_g_t, dim=0).cpu().numpy()
+            coord_mask_squeezed_np = coord_mask.squeeze().cpu().numpy()
+            mse_g = np.where(coord_mask_squeezed_np, mse_g, np.nan)
+            mae_g = np.where(coord_mask_squeezed_np, mae_g, np.nan)
+            mape_g = np.where(coord_mask_squeezed_np, mape_g, np.nan)
+            smape_g = np.where(coord_mask_squeezed_np, smape_g, np.nan)
+            stde_g = np.where(coord_mask_squeezed_np, stde_g, np.nan)
             error_grids_all_models[model_name] = {
                 'MSE': mse_g.flatten(), 'MAE': mae_g.flatten(),
                 'MAPE': mape_g.flatten(), 'SMAPE': smape_g.flatten(),
@@ -1909,12 +1957,14 @@ def evaluate_model(
                 generated_all_denorm_t=cs_pred_tensor_viz[0:1].clone().cpu(),
                 original_all_denorm_t=cs_target_all_t[0:1].clone().cpu(),
                 config=config, sample_idx_to_plot=0,
+                coord_mask=coord_mask.squeeze().cpu().numpy(),
                 prefix=f"{prefix}_{cs_model_key_viz}_vs_{current_stage_name}Target_sample0"
             )
             visualize_predictions_long_term(
                 generated_all_denorm_t=torch.mean(cs_pred_tensor_viz, dim=0, keepdim=True).clone().cpu(),
                 original_all_denorm_t=torch.mean(cs_target_all_t, dim=0, keepdim=True).clone().cpu(),
                 config=config, sample_idx_to_plot=None,
+                coord_mask=coord_mask.squeeze().cpu().numpy(),
                 prefix=f"{prefix}_{cs_model_key_viz}_vs_{current_stage_name}Target_avg"
             )
         if cs_model_key_viz in error_grids_all_models:
@@ -2183,6 +2233,37 @@ def evaluate_baseline_model_for_comparison(
 #%%
 if __name__ == '__main__':
     logger.info(f"===== DDPM Multi-Stage (Up to Stage4) - Training and Evaluation =====")
+    coord_filter_config = CONFIG.get("coordinate_filter", {"enabled": False})
+    coord_mask_tensor = None
+    if coord_filter_config.get("enabled", False):
+        logger.info("===== 座標過濾功能已啟用 =====")
+        file_path = coord_filter_config["file_path"]
+        r_col, c_col = coord_filter_config["r_col"], coord_filter_config["c_col"]
+        
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"找不到指定的座標檔案: {file_path}")
+            
+        coords_df = pd.read_excel(file_path)
+        if not all(col in coords_df.columns for col in [r_col, c_col]):
+            raise ValueError(f"座標檔案中缺少必要的欄位: '{r_col}' 和/或 '{c_col}'")
+
+        # 建立一個全為 False 的遮罩
+        coord_mask_np = np.zeros((CONFIG["H"], CONFIG["W"]), dtype=bool)
+        selected_coords = list(zip(coords_df[r_col], coords_df[c_col]))
+
+        for r, c in selected_coords:
+            if 0 <= r < CONFIG["H"] and 0 <= c < CONFIG["W"]:
+                coord_mask_np[r, c] = True
+        
+        num_selected = np.sum(coord_mask_np)
+        logger.info(f"已從檔案選取 {num_selected} / {CONFIG['H']*CONFIG['W']} 個座標進行運算。")
+        
+        # 將 NumPy 遮罩轉為 PyTorch Tensor，並增加維度以利廣播
+        coord_mask_tensor = torch.from_numpy(coord_mask_np).to(CONFIG["device"]).unsqueeze(0).unsqueeze(0).unsqueeze(0)
+    else:
+        logger.info("座標過濾功能未啟用，將使用所有座標。")
+        # 如果未啟用，則建立一個全為 True 的遮罩，使其在運算中不起作用
+        coord_mask_tensor = torch.ones(1, 1, 1, CONFIG["H"], CONFIG["W"], dtype=torch.bool).to(CONFIG["device"])
     config_for_log = CONFIG.copy()
     keys_to_remove_from_log = [
         "cached_basemodel_sorted_flow_columns",
@@ -2735,7 +2816,8 @@ if __name__ == '__main__':
                     
                     condition_args_s4_loss = {
                         "stage3_output_grid_batch_for_s4": s3_out_grid_b_for_s4_train,
-                        "stage4_new_condition_feature_grid_batch": s4_new_feat_grid_b_for_s4_train
+                        "stage4_new_condition_feature_grid_batch": s4_new_feat_grid_b_for_s4_train,
+                        "coord_mask": coord_mask_tensor 
                     }
                     loss_s4_batch = stage4_model.p_losses(
                         x_start_target_flow=target_s4_b, t=t_s4_b,
@@ -2765,7 +2847,8 @@ if __name__ == '__main__':
                             t_s4_val_b = torch.randint(0, stage4_model.timesteps, (target_s4_val_norm.shape[0],), device=CONFIG["device"]).long()
                             condition_args_s4_val = {
                                 "stage3_output_grid_batch_for_s4": s3_out_val_cond,
-                                "stage4_new_condition_feature_grid_batch": s4_new_feat_val_cond
+                                "stage4_new_condition_feature_grid_batch": s4_new_feat_val_cond,
+                                "coord_mask": coord_mask_tensor 
                             }
                             val_loss_b_s4 = stage4_model.p_losses(
                                 x_start_target_flow=target_s4_val_norm, t=t_s4_val_b,
@@ -2872,6 +2955,7 @@ if __name__ == '__main__':
             previous_stage_target_norm_stats=stage3_target_norm_stats_for_eval,
             target_grid_stds=global_target_grid_stds,
             target_overall_std=global_target_overall_std,
+            coord_mask=coord_mask_tensor,
             max_samples_for_fid=CONFIG.get("fid_num_samples"),
             prefix=f"final_S4_vs_S3_evaluation"
         )
@@ -2911,6 +2995,7 @@ if __name__ == '__main__':
                 target_norm_stats=chkpt_baseline['target_norm_stats'],
                 target_grid_stds=global_target_grid_stds,
                 target_overall_std=global_target_overall_std,
+                coord_mask=coord_mask_tensor,
                 prefix="final_baseline_evaluation"
             )
             final_baseline_metrics = {"baseline_model": baseline_metrics_raw}
@@ -2948,6 +3033,9 @@ if __name__ == '__main__':
             excel_rows.append({'資料來源': f"--- {model_key} (vs Stage4 Target) 逐網格誤差 ---"})
             error_grids = combined_error_grids[model_key]
             for flat_idx in range(num_grid_cells):
+                r_idx, c_idx = flat_idx // CONFIG["W"], flat_idx % CONFIG["W"]
+                if not coord_mask_np[r_idx, c_idx]:
+                    continue
                 row_data = {'資料來源': model_key, '網格座標_R': flat_idx // CONFIG["W"], '網格座標_C': flat_idx % CONFIG["W"]}
                 for metric in ['MSE', 'MAE', 'MAPE', 'SMAPE']:
                     row_data[metric] = error_grids.get(metric, [np.nan] * num_grid_cells)[flat_idx]

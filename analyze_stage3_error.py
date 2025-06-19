@@ -327,6 +327,62 @@ def plot_grid_map(
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close(fig)
     logger.info(f"已儲存地圖: {save_path}")
+
+def export_analysis_to_excel(
+    df_analysis: pd.DataFrame,
+    analysis_name: str,
+    output_columns: Dict[str, str],
+    config: Dict[str, Any],
+    grid_map_info: Dict[str, Any],
+    flow_columns: List[str]
+):
+    """將單一分析結果的 DataFrame 處理並匯出至獨立的 Excel 檔案。"""
+    logger.info(f"正在處理並匯出 '{analysis_name}' 的 Excel 報告...")
+    
+    df_copy = df_analysis.copy()
+
+    # 準備基礎地理資訊
+    base_geo_df = pd.DataFrame({'grid_idx': np.arange(config['H'] * config['W'])})
+    rc_map = grid_map_info.get("grid_idx_to_rc_map")
+    if rc_map:
+        base_geo_df['R'] = base_geo_df['grid_idx'].apply(lambda idx: rc_map.get(idx, (-1, -1))[0])
+        base_geo_df['C'] = base_geo_df['grid_idx'].apply(lambda idx: rc_map.get(idx, (-1, -1))[1])
+    else:
+        base_geo_df['R'] = -1; base_geo_df['C'] = -1
+    
+    sensor_coords_df = pd.DataFrame(grid_map_info.get("selected_sensor_info", []))[['name', 'lon', 'lat']]
+    flow_cols_df = pd.DataFrame({'name': flow_columns}).reset_index().rename(columns={'index': 'grid_idx'})
+    base_geo_df = pd.merge(base_geo_df, flow_cols_df, on='grid_idx', how='left')
+    base_geo_df = pd.merge(base_geo_df, sensor_coords_df, on='name', how='left')
+    
+    # 將分析數據與地理資訊合併
+    export_df = pd.merge(base_geo_df, df_copy, on='grid_idx', how='inner')
+
+    # 整理並重新命名最終輸出的欄位
+    final_columns = {'grid_idx': '網格ID', 'R': 'R', 'C': 'C', 'lon': '經度', 'lat': '緯度', 'name': '測站名稱'}
+    final_columns.update(output_columns)
+    
+    cols_to_export = [col for col in final_columns.keys() if col in export_df.columns]
+    excel_output = export_df[cols_to_export].rename(columns=final_columns)
+
+    # 遍歷每個群組，分別存檔
+    group_label_col = next((col for col in df_copy.columns if 'group' in col and 'label' in col), None)
+    if group_label_col:
+        for group_label in excel_output[final_columns[group_label_col]].unique():
+            group_subset_df = excel_output[excel_output[final_columns[group_label_col]] == group_label]
+            
+            safe_group_label = re.sub(r'[<>:"/\\|?*]', '_', group_label).replace(' ', '')
+            filename = f"{analysis_name}_{safe_group_label}.xlsx"
+            filepath = os.path.join(config['output_dir'], filename)
+            
+            group_subset_df.to_excel(filepath, index=False)
+            logger.info(f"已匯出檔案: {filename}")
+    else:
+        # 如果沒有分組資訊，則直接匯出整個分析
+        filename = f"{analysis_name}_full_report.xlsx"
+        filepath = os.path.join(config['output_dir'], filename)
+        excel_output.to_excel(filepath, index=False)
+        logger.info(f"已匯出檔案: {filename}")
 #%%
 # ==============================================================================
 # 主程式
@@ -460,113 +516,88 @@ accumulated_error = np.sum(normalized_error, axis=0)
 logger.info(f"累計誤差計算完成。形狀: {accumulated_error.shape}")
 logger.info(f"累計誤差統計: Min={np.min(accumulated_error):.2f}, Max={np.max(accumulated_error):.2f}, Mean={np.mean(accumulated_error):.2f}")
 
+# --- 分析流程開始 ---
+custom_colors = ['darkred', 'lightcoral', 'blue', 'lightblue']
+grid_indices = np.arange(CONFIG['H'] * CONFIG['W'])
+raw_error_full = simulated_flow_data - actual_flow_data
+
 # --- 7. 分析一: 累計正規化誤差 (Normalized Error) ---
 logger.info("="*20 + " 分析一: 累計正規化誤差 " + "="*20)
-# 7.1 計算
-error_flat = accumulated_error.flatten()
-grid_indices = np.arange(len(error_flat))
-error_df = pd.DataFrame({'grid_idx': grid_indices, 'normalized_error_sum': error_flat})
-
-# 7.2 視覺化 (連續圖)
+accumulated_error = np.sum(normalized_error, axis=0)
+error_df = pd.DataFrame({'grid_idx': grid_indices, 'normalized_error_sum': accumulated_error.flatten()})
 max_abs_norm_error = np.max(np.abs(accumulated_error))
 plot_grid_map(
-    grid_values=accumulated_error,
-    title="Accumulated Normalized Error Distribution",
-    output_filename="accumulated_normalized_error_map.png",
-    config=CONFIG, grid_map_info=grid_map_info, cmap='coolwarm',
-    cbar_label="Accumulated Normalized Error",
+    grid_values=accumulated_error, title="Accumulated Normalized Error Distribution",
+    output_filename="accumulated_normalized_error_map.png", config=CONFIG,
+    grid_map_info=grid_map_info, cmap='coolwarm', cbar_label="Accumulated Normalized Error",
     vmin=-max_abs_norm_error, vmax=max_abs_norm_error
 )
-    
-# 7.3 分組與視覺化 (分類圖)
 top_index = 50 
 pos_errors = error_df[error_df['normalized_error_sum'] >= 0].sort_values(by='normalized_error_sum', ascending=False)
 neg_errors = error_df[error_df['normalized_error_sum'] < 0].sort_values(by='normalized_error_sum', ascending=True)
 top_pos = pos_errors.head(top_index); other_pos = pos_errors.iloc[top_index:]
 top_neg = neg_errors.head(top_index); other_neg = neg_errors.iloc[top_index:]
-group_grid_norm = np.full_like(error_flat, -1, dtype=int)
+group_grid_norm = np.full(grid_indices.shape, -1, dtype=int)
 group_grid_norm[top_pos.index] = 0; group_grid_norm[other_pos.index] = 1
 group_grid_norm[top_neg.index] = 2; group_grid_norm[other_neg.index] = 3
-error_df['group_norm_error'] = group_grid_norm
+error_df['group_id'] = group_grid_norm
 group_labels_norm = {
-    0: f'Norm Error: Positive Top {top_index}', 1: 'Norm Error: Positive Others',
-    2: f'Norm Error: Negative Top {top_index}', 3: 'Norm Error: Negative Others',
+    0: f'NormError_Pos_Top{top_index}', 1: 'NormError_Pos_Others',
+    2: f'NormError_Neg_Top{top_index}', 3: 'NormError_Neg_Others',
 }
-error_df['group_norm_error_label'] = error_df['group_norm_error'].map(group_labels_norm)
-custom_colors = ['darkred', 'lightcoral', 'blue', 'lightblue']
+error_df['group_label'] = error_df['group_id'].map(group_labels_norm)
 plot_grid_map(
-    grid_values=group_grid_norm.reshape(CONFIG['H'], CONFIG['W']),
-    title="Accumulated Normalized Error Grouping Map",
-    output_filename="accumulated_normalized_error_grouping_map.png",
-    config=CONFIG, grid_map_info=grid_map_info, cmap=custom_colors,
-    is_categorical=True, cat_labels=[group_labels_norm[i] for i in sorted(group_labels_norm.keys())]
+    grid_values=group_grid_norm.reshape(CONFIG['H'], CONFIG['W']), title="Accumulated Normalized Error Grouping",
+    output_filename="accumulated_normalized_error_grouping.png", config=CONFIG,
+    grid_map_info=grid_map_info, cmap=custom_colors, is_categorical=True,
+    cat_labels=[group_labels_norm[i] for i in sorted(group_labels_norm.keys())]
 )
-
 
 # --- 8. 分析二: 標準差誤差時數 (StdDev Exceedance Hours) ---
 logger.info("="*20 + " 分析二: 標準差誤差時數 " + "="*20)
-# 8.1 計算
-pos_exceed_counts = np.sum(normalized_error > 1.0, axis=0).flatten()
-neg_exceed_counts = np.sum(normalized_error < -1.0, axis=0).flatten()
-exceed_df = pd.DataFrame({'grid_idx': grid_indices, 'pos_std_exceed_hours': pos_exceed_counts, 'neg_std_exceed_hours': neg_exceed_counts})
-dominant_type_exceed = np.where(exceed_df['pos_std_exceed_hours'] >= exceed_df['neg_std_exceed_hours'], 'pos', 'neg')
-signed_dominant_hours = np.where(dominant_type_exceed == 'pos', exceed_df['pos_std_exceed_hours'], -exceed_df['neg_std_exceed_hours'])
-exceed_df['signed_dominant_std_hours'] = signed_dominant_hours
-exceed_df['dominant_type_std_exceed'] = dominant_type_exceed
-
-# 8.2 視覺化 (連續圖)
-max_abs_exceed = np.max(np.abs(exceed_df['signed_dominant_std_hours'].values))
+pos_std_exceed = np.sum(normalized_error > 1.0, axis=0).flatten()
+neg_std_exceed = np.sum(normalized_error < -1.0, axis=0).flatten()
+exceed_df = pd.DataFrame({'grid_idx': grid_indices, 'pos_std_exceed_hours': pos_std_exceed, 'neg_std_exceed_hours': neg_std_exceed})
+dominant_type_std = np.where(exceed_df['pos_std_exceed_hours'] >= exceed_df['neg_std_exceed_hours'], 'pos', 'neg')
+exceed_df['signed_dominant_std_hours'] = np.where(dominant_type_std == 'pos', exceed_df['pos_std_exceed_hours'], -exceed_df['neg_std_exceed_hours'])
+exceed_df['dominant_type_std'] = dominant_type_std
+max_abs_std_exceed = np.max(np.abs(exceed_df['signed_dominant_std_hours'].values))
 plot_grid_map(
     grid_values=exceed_df['signed_dominant_std_hours'].values.reshape(CONFIG['H'], CONFIG['W']),
-    title="Distribution of Directional StdDev Exceedance Hours",
-    output_filename="directional_std_exceedance_hours_map.png",
-    config=CONFIG, grid_map_info=grid_map_info, cmap='coolwarm',
-    is_categorical=False, cbar_label="Directional Count of Hours Exceeding 1 StdDev",
-    vmin=-max_abs_exceed, vmax=max_abs_exceed
+    title="Directional StdDev Exceedance Hours Distribution", output_filename="directional_std_exceedance_hours_map.png",
+    config=CONFIG, grid_map_info=grid_map_info, cmap='coolwarm', is_categorical=False,
+    cbar_label="Directional Count of Hours Exceeding 1 StdDev", vmin=-max_abs_std_exceed, vmax=max_abs_std_exceed
 )
-
-# 8.3 分組與視覺化 (分類圖)
 top_n_exceed = 50
-exceed_df['dominant_std_hours_for_grouping'] = exceed_df[['pos_std_exceed_hours', 'neg_std_exceed_hours']].max(axis=1)
-pos_dom_exceed = exceed_df[exceed_df['dominant_type_std_exceed'] == 'pos'].sort_values(by='dominant_std_hours_for_grouping', ascending=False)
-neg_dom_exceed = exceed_df[exceed_df['dominant_type_std_exceed'] == 'neg'].sort_values(by='dominant_std_hours_for_grouping', ascending=False)
-top_pos_exceed = pos_dom_exceed.head(top_n_exceed); other_pos_exceed = pos_dom_exceed.iloc[top_n_exceed:]
-top_neg_exceed = neg_dom_exceed.head(top_n_exceed); other_neg_exceed = neg_dom_exceed.iloc[top_n_exceed:]
-group_grid_exceed = np.full_like(error_flat, -1, dtype=int)
-group_grid_exceed[top_pos_exceed.index] = 0; group_grid_exceed[other_pos_exceed.index] = 1
-group_grid_exceed[top_neg_exceed.index] = 2; group_grid_exceed[other_neg_exceed.index] = 3
-exceed_df['group_std_exceed_hours'] = group_grid_exceed
-group_labels_exceed = {
-    0: f'StdExceed: Positive Top {top_n_exceed}', 1: 'StdExceed: Positive Others',
-    2: f'StdExceed: Negative Top {top_n_exceed}', 3: 'StdExceed: Negative Others',
+exceed_df['dominant_hours'] = exceed_df[['pos_std_exceed_hours', 'neg_std_exceed_hours']].max(axis=1)
+pos_dom_std = exceed_df[exceed_df['dominant_type_std'] == 'pos'].sort_values(by='dominant_hours', ascending=False)
+neg_dom_std = exceed_df[exceed_df['dominant_type_std'] == 'neg'].sort_values(by='dominant_hours', ascending=False)
+top_pos_std = pos_dom_std.head(top_n_exceed); other_pos_std = pos_dom_std.iloc[top_n_exceed:]
+top_neg_std = neg_dom_std.head(top_n_exceed); other_neg_std = neg_dom_std.iloc[top_n_exceed:]
+group_grid_std = np.full(grid_indices.shape, -1, dtype=int)
+group_grid_std[top_pos_std.index] = 0; group_grid_std[other_pos_std.index] = 1
+group_grid_std[top_neg_std.index] = 2; group_grid_std[other_neg_std.index] = 3
+exceed_df['group_id'] = group_grid_std
+group_labels_std = {
+    0: f'StdExceed_Pos_Top{top_n_exceed}', 1: 'StdExceed_Pos_Others',
+    2: f'StdExceed_Neg_Top{top_n_exceed}', 3: 'StdExceed_Neg_Others',
 }
-exceed_df['group_std_exceed_hours_label'] = exceed_df['group_std_exceed_hours'].map(group_labels_exceed)
+exceed_df['group_label'] = exceed_df['group_id'].map(group_labels_std)
 plot_grid_map(
-    grid_values=group_grid_exceed.reshape(CONFIG['H'], CONFIG['W']),
-    title="StdDev Exceedance Count Grouping Map",
-    output_filename="std_dev_exceedance_map.png",
-    config=CONFIG, grid_map_info=grid_map_info, cmap=custom_colors,
-    is_categorical=True, cat_labels=[group_labels_exceed[i] for i in sorted(group_labels_exceed.keys())]
+    grid_values=group_grid_std.reshape(CONFIG['H'], CONFIG['W']), title="StdDev Exceedance Count Grouping",
+    output_filename="std_dev_exceedance_grouping.png", config=CONFIG,
+    grid_map_info=grid_map_info, cmap=custom_colors, is_categorical=True,
+    cat_labels=[group_labels_std[i] for i in sorted(group_labels_std.keys())]
 )
 
 # --- 9. 分析三: 累計原始誤差 (Raw Error) ---
-logger.info("="*20 + " 分析三: 累計原始誤差 (已排除 1% 極端值) " + "="*20)
-# 9.1 計算
-raw_error_full = simulated_flow_data - actual_flow_data
-# lower_bound = np.percentile(raw_error_full, 1); upper_bound = np.percentile(raw_error_full, 99)
-# logger.info(f"原始誤差的 1% 分位數: {lower_bound:.2f}, 99% 分位數: {upper_bound:.2f}")
-# trimmed_raw_error = np.where((raw_error_full > lower_bound) & (raw_error_full < upper_bound), raw_error_full, 0)
-# logger.info("已將超出 1%-99% 範圍的原始誤差值設為 0。")
-# pos_raw_error_sum = np.sum(np.maximum(0, trimmed_raw_error), axis=0).flatten()
-# neg_raw_error_sum = np.sum(np.minimum(0, trimmed_raw_error), axis=0).flatten()
+logger.info("="*20 + " 分析三: 累計原始誤差 " + "="*20)
 pos_raw_error_sum = np.sum(np.maximum(0, raw_error_full), axis=0).flatten()
 neg_raw_error_sum = np.sum(np.minimum(0, raw_error_full), axis=0).flatten()
 mae_df = pd.DataFrame({'grid_idx': grid_indices, 'pos_raw_error_sum': pos_raw_error_sum, 'neg_raw_error_sum': neg_raw_error_sum})
-dominant_type_mae = np.where(mae_df['pos_raw_error_sum'] >= abs(mae_df['neg_raw_error_sum']), 'pos', 'neg')
 mae_df['signed_raw_error_sum'] = mae_df['pos_raw_error_sum'] + mae_df['neg_raw_error_sum']
+dominant_type_mae = np.where(mae_df['pos_raw_error_sum'] >= abs(mae_df['neg_raw_error_sum']), 'pos', 'neg')
 mae_df['dominant_type_mae'] = dominant_type_mae
-
-# 9.2 削頂處理
 if len(mae_df) > 1:
     sorted_mae = mae_df['signed_raw_error_sum'].sort_values(ascending=False)
     highest_val = sorted_mae.iloc[0]; second_highest_val = sorted_mae.iloc[1]
@@ -574,143 +605,212 @@ if len(mae_df) > 1:
         highest_idx = sorted_mae.index[0]
         mae_df.loc[highest_idx, 'signed_raw_error_sum'] = second_highest_val
         logger.info(f"分析三: 已將最高的累計原始誤差值 {highest_val:.2f} 修改為第二高的值 {second_highest_val:.2f}。")
-
-# 9.3 視覺化 (連續圖)
 raw_error_clipped = mae_df['signed_raw_error_sum'].values
 max_abs_raw_error = np.max(np.abs(raw_error_clipped))
 plot_grid_map(
-    grid_values=raw_error_clipped.reshape(CONFIG['H'], CONFIG['W']),
-    title="Accumulated Raw Error Distribution",
-    output_filename="accumulated_raw_error_map_trimmed.png",
-    config=CONFIG, grid_map_info=grid_map_info, cmap='coolwarm',
-    is_categorical=False, cbar_label="Accumulated Raw Error (Prediction - Actual)",
-    vmin=-max_abs_raw_error, vmax=max_abs_raw_error
+    grid_values=raw_error_clipped.reshape(CONFIG['H'], CONFIG['W']), title="Accumulated Raw Error Distribution (Top Clipped)",
+    output_filename="accumulated_raw_error_map.png", config=CONFIG,
+    grid_map_info=grid_map_info, cmap='coolwarm', is_categorical=False,
+    cbar_label="Accumulated Raw Error (Prediction - Actual)", vmin=-max_abs_raw_error, vmax=max_abs_raw_error
 )
-
-# 9.4 分組與視覺化 (分類圖)
 top_n_mae = 50
 pos_dom_mae = mae_df[mae_df['dominant_type_mae'] == 'pos'].sort_values(by='signed_raw_error_sum', ascending=False)
 neg_dom_mae = mae_df[mae_df['dominant_type_mae'] == 'neg'].sort_values(by='signed_raw_error_sum', ascending=True)
 top_pos_mae = pos_dom_mae.head(top_n_mae); other_pos_mae = pos_dom_mae.iloc[top_n_mae:]
 top_neg_mae = neg_dom_mae.head(top_n_mae); other_neg_mae = neg_dom_mae.iloc[top_n_mae:]
-group_grid_mae = np.full_like(error_flat, -1, dtype=int)
+group_grid_mae = np.full(grid_indices.shape, -1, dtype=int)
 group_grid_mae[top_pos_mae.index] = 0; group_grid_mae[other_pos_mae.index] = 1
 group_grid_mae[top_neg_mae.index] = 2; group_grid_mae[other_neg_mae.index] = 3
-mae_df['group_raw_error'] = group_grid_mae
+mae_df['group_id'] = group_grid_mae
 group_labels_mae = {
-    0: f'Raw Error: Positive Top {top_n_mae}', 1: 'Raw Error: Positive Others',
-    2: f'Raw Error: Negative Top {top_n_mae}', 3: 'Raw Error: Negative Others',
+    0: f'RawError_Pos_Top{top_n_mae}', 1: 'RawError_Pos_Others',
+    2: f'RawError_Neg_Top{top_n_mae}', 3: 'RawError_Neg_Others',
 }
-mae_df['group_raw_error_label'] = mae_df['group_raw_error'].map(group_labels_mae)
+mae_df['group_label'] = mae_df['group_id'].map(group_labels_mae)
 plot_grid_map(
-    grid_values=group_grid_mae.reshape(CONFIG['H'], CONFIG['W']),
-    title="Raw Error Grouping Map (1% Trimmed)",
-    output_filename="raw_error_grouping_map_trimmed.png",
-    config=CONFIG, grid_map_info=grid_map_info, cmap=custom_colors,
-    is_categorical=True, cat_labels=[group_labels_mae[i] for i in sorted(group_labels_mae.keys())]
+    grid_values=group_grid_mae.reshape(CONFIG['H'], CONFIG['W']), title="Raw Error Grouping Map",
+    output_filename="raw_error_grouping.png", config=CONFIG,
+    grid_map_info=grid_map_info, cmap=custom_colors, is_categorical=True,
+    cat_labels=[group_labels_mae[i] for i in sorted(group_labels_mae.keys())]
 )
 
 # --- 10. 分析四: 原始誤差時數 (Raw Exceedance Hours) ---
 logger.info("="*20 + " 分析四: 原始誤差超標時數 (閾值=100) " + "="*20)
-
-# 10.1 計算
-logger.info("===== 步驟 10.1: 計算原始誤差超過 100 的時數 =====")
 raw_exceed_threshold = 100
-pos_raw_exceed_counts = np.sum(raw_error_full > raw_exceed_threshold, axis=0).flatten()
-neg_raw_exceed_counts = np.sum(raw_error_full < -raw_exceed_threshold, axis=0).flatten()
-raw_exceed_df = pd.DataFrame({
-    'grid_idx': grid_indices,
-    'pos_raw_exceed_hours': pos_raw_exceed_counts,
-    'neg_raw_exceed_hours': neg_raw_exceed_counts,
-})
+pos_raw_exceed = np.sum(raw_error_full > raw_exceed_threshold, axis=0).flatten()
+neg_raw_exceed = np.sum(raw_error_full < -raw_exceed_threshold, axis=0).flatten()
+raw_exceed_df = pd.DataFrame({'grid_idx': grid_indices, 'pos_raw_exceed_hours': pos_raw_exceed, 'neg_raw_exceed_hours': neg_raw_exceed})
 dominant_type_raw_exceed = np.where(raw_exceed_df['pos_raw_exceed_hours'] >= raw_exceed_df['neg_raw_exceed_hours'], 'pos', 'neg')
-signed_dominant_raw_exceed = np.where(dominant_type_raw_exceed == 'pos', raw_exceed_df['pos_raw_exceed_hours'], -raw_exceed_df['neg_raw_exceed_hours'])
-raw_exceed_df['signed_dominant_raw_exceed'] = signed_dominant_raw_exceed
+raw_exceed_df['signed_dominant_raw_exceed'] = np.where(dominant_type_raw_exceed == 'pos', raw_exceed_df['pos_raw_exceed_hours'], -raw_exceed_df['neg_raw_exceed_hours'])
 raw_exceed_df['dominant_type_raw_exceed'] = dominant_type_raw_exceed
-
-# 10.2 視覺化 (連續圖)
-logger.info("===== 步驟 10.2: 視覺化帶方向性的原始誤差超標時數分佈圖 =====")
 max_abs_raw_exceed = np.max(np.abs(raw_exceed_df['signed_dominant_raw_exceed'].values))
 plot_grid_map(
     grid_values=raw_exceed_df['signed_dominant_raw_exceed'].values.reshape(CONFIG['H'], CONFIG['W']),
-    title=f"Distribution of Directional Raw Error Exceedance Hours (Threshold={raw_exceed_threshold})",
-    output_filename="directional_raw_exceedance_hours_map.png",
-    config=CONFIG, grid_map_info=grid_map_info, cmap='coolwarm',
-    is_categorical=False, cbar_label=f"Directional Count of Hours |Error| > {raw_exceed_threshold}",
-    vmin=-max_abs_raw_exceed, vmax=max_abs_raw_exceed
+    title=f"Directional Raw Error Exceedance Hours (Threshold={raw_exceed_threshold})",
+    output_filename="directional_raw_exceedance_hours_map.png", config=CONFIG,
+    grid_map_info=grid_map_info, cmap='coolwarm', is_categorical=False,
+    cbar_label=f"Directional Count of Hours |Error| > {raw_exceed_threshold}", vmin=-max_abs_raw_exceed, vmax=max_abs_raw_exceed
 )
-
-# 10.3 分組與視覺化 (分類圖)
-logger.info("===== 步驟 10.3: 依原始誤差超標時數分組並視覺化 =====")
 top_n_raw_exceed = 50
-raw_exceed_df['dominant_hours_for_grouping'] = raw_exceed_df[['pos_raw_exceed_hours', 'neg_raw_exceed_hours']].max(axis=1)
-pos_dom_raw_exceed = raw_exceed_df[raw_exceed_df['dominant_type_raw_exceed'] == 'pos'].sort_values(by='dominant_hours_for_grouping', ascending=False)
-neg_dom_raw_exceed = raw_exceed_df[raw_exceed_df['dominant_type_raw_exceed'] == 'neg'].sort_values(by='dominant_hours_for_grouping', ascending=False)
-top_pos_raw_exceed = pos_dom_raw_exceed.head(top_n_raw_exceed); other_pos_raw_exceed = pos_dom_raw_exceed.iloc[top_n_raw_exceed:]
-top_neg_raw_exceed = neg_dom_raw_exceed.head(top_n_raw_exceed); other_neg_raw_exceed = neg_dom_raw_exceed.iloc[top_n_raw_exceed:]
-
-group_grid_raw_exceed = np.full_like(error_flat, -1, dtype=int)
-group_grid_raw_exceed[top_pos_raw_exceed.index] = 0; group_grid_raw_exceed[other_pos_raw_exceed.index] = 1
-group_grid_raw_exceed[top_neg_raw_exceed.index] = 2; group_grid_raw_exceed[other_neg_raw_exceed.index] = 3
-raw_exceed_df['group_raw_exceed_hours'] = group_grid_raw_exceed
-
+raw_exceed_df['dominant_hours'] = raw_exceed_df[['pos_raw_exceed_hours', 'neg_raw_exceed_hours']].max(axis=1)
+pos_dom_raw = raw_exceed_df[raw_exceed_df['dominant_type_raw_exceed'] == 'pos'].sort_values(by='dominant_hours', ascending=False)
+neg_dom_raw = raw_exceed_df[raw_exceed_df['dominant_type_raw_exceed'] == 'neg'].sort_values(by='dominant_hours', ascending=False)
+top_pos_raw = pos_dom_raw.head(top_n_raw_exceed); other_pos_raw = pos_dom_raw.iloc[top_n_raw_exceed:]
+top_neg_raw = neg_dom_raw.head(top_n_raw_exceed); other_neg_raw = neg_dom_raw.iloc[top_n_raw_exceed:]
+group_grid_raw_exceed = np.full(grid_indices.shape, -1, dtype=int)
+group_grid_raw_exceed[top_pos_raw.index] = 0; group_grid_raw_exceed[other_pos_raw.index] = 1
+group_grid_raw_exceed[top_neg_raw.index] = 2; group_grid_raw_exceed[other_neg_raw.index] = 3
+raw_exceed_df['group_id'] = group_grid_raw_exceed
 group_labels_raw_exceed = {
-    0: f'RawExceed: Positive Top {top_n_raw_exceed}', 1: 'RawExceed: Positive Others',
-    2: f'RawExceed: Negative Top {top_n_raw_exceed}', 3: 'RawExceed: Negative Others',
+    0: f'RawExceed_Pos_Top{top_n_raw_exceed}', 1: 'RawExceed_Pos_Others',
+    2: f'RawExceed_Neg_Top{top_n_raw_exceed}', 3: 'RawExceed_Neg_Others',
 }
-raw_exceed_df['group_raw_exceed_hours_label'] = raw_exceed_df['group_raw_exceed_hours'].map(group_labels_raw_exceed)
-
+raw_exceed_df['group_label'] = raw_exceed_df['group_id'].map(group_labels_raw_exceed)
 plot_grid_map(
     grid_values=group_grid_raw_exceed.reshape(CONFIG['H'], CONFIG['W']),
-    title=f"Raw Error Exceedance Count Grouping Map (Threshold={raw_exceed_threshold})",
-    output_filename="raw_exceedance_grouping_map.png",
-    config=CONFIG, grid_map_info=grid_map_info, cmap=custom_colors,
-    is_categorical=True, cat_labels=[group_labels_raw_exceed[i] for i in sorted(group_labels_raw_exceed.keys())]
+    title=f"Raw Error Exceedance Count Grouping (Threshold={raw_exceed_threshold})",
+    output_filename="raw_exceedance_grouping.png", config=CONFIG,
+    grid_map_info=grid_map_info, cmap=custom_colors, is_categorical=True,
+    cat_labels=[group_labels_raw_exceed[i] for i in sorted(group_labels_raw_exceed.keys())]
 )
+#%%
+# --- 11. 匯出所有分析結果 ---
+logger.info("="*20 + " 步驟 11: 匯出所有分析結果 " + "="*20)
 
-# --- 11. 匯出合併後的 Excel ---
-logger.info("===== 步驟 11: 匯出所有分析結果至 Excel =====")
+# --- 11.1 匯出至 16 個獨立的 Excel 檔案 ---
+logger.info("===== 步驟 11.1: 開始匯出獨立群組報告 =====")
+
+# 準備一個包含所有網格基本地理資訊的基礎 DataFrame
+base_geo_df = pd.DataFrame({'grid_idx': grid_indices})
+rc_map = grid_map_info["grid_idx_to_rc_map"]
+if rc_map:
+    base_geo_df['R'] = base_geo_df['grid_idx'].apply(lambda idx: rc_map.get(idx, (-1, -1))[0])
+    base_geo_df['C'] = base_geo_df['grid_idx'].apply(lambda idx: rc_map.get(idx, (-1, -1))[1])
+else:
+    base_geo_df['R'] = -1; base_geo_df['C'] = -1
+sensor_coords_df = pd.DataFrame(grid_map_info["selected_sensor_info"])[['name', 'lon', 'lat']]
+flow_cols_df = pd.DataFrame({'name': flow_columns}).reset_index().rename(columns={'index': 'grid_idx'})
+base_geo_df = pd.merge(base_geo_df, flow_cols_df, on='grid_idx', how='left')
+base_geo_df = pd.merge(base_geo_df, sensor_coords_df, on='name', how='left')
+
+# 建立一個包含所有分析資訊的列表
+analyses_to_export = [
+    {'name': 'norm_error', 'df': error_df, 'labels': group_labels_norm},
+    {'name': 'std_exceed', 'df': exceed_df, 'labels': group_labels_std},
+    {'name': 'raw_error_sum', 'df': mae_df, 'labels': group_labels_mae},
+    {'name': 'raw_exceed_hours', 'df': raw_exceed_df, 'labels': group_labels_raw_exceed}
+]
+
+# 遍歷所有分析和所有群組，分別儲存檔案
+for analysis in analyses_to_export:
+    df = analysis['df']
+    name = analysis['name']
+    labels = analysis['labels']
+    
+    # 這裡的 group_id 欄位在每個 df 中都叫 'group_id'
+    for group_id, group_label in labels.items():
+        group_df = df[df['group_id'] == group_id]
+
+        if group_df.empty:
+            logger.info(f"分析 '{name}', 群組 '{group_label}' 為空，跳過匯出。")
+            continue
+
+        export_df = pd.merge(base_geo_df, group_df, on='grid_idx', how='inner')
+        
+        safe_group_label = re.sub(r'[<>:"/\\|?*]', '_', group_label).replace(' ', '')
+        filename = f"{name}_group{group_id}_{safe_group_label}.xlsx"
+        filepath = os.path.join(CONFIG['output_dir'], filename)
+
+        cols_to_keep = [col for col in export_df.columns if col != 'group_id']
+        final_export_df = export_df[cols_to_keep]
+        
+        final_export_df.to_excel(filepath, index=False)
+        logger.info(f"已匯出獨立報告: {filename}")
+
+# --- 11.2 匯出單一完整合併報告 ---
+logger.info("===== 步驟 11.2: 開始匯出完整合併報告 =====")
+
 # 合併四個分析的 DataFrame
 df_list = [error_df, exceed_df, mae_df, raw_exceed_df]
 final_df = df_list[0]
 for df_to_merge in df_list[1:]:
-    # 避免重複的 'grid_idx' 欄位
-    final_df = pd.merge(final_df, df_to_merge.drop(columns=[col for col in df_to_merge.columns if col in final_df.columns and col != 'grid_idx']), on='grid_idx', how='left')
+    # 避免重複的 'grid_idx' 和其他可能重複的輔助欄位
+    cols_to_drop = [col for col in df_to_merge.columns if col in final_df.columns and col != 'grid_idx']
+    final_df = pd.merge(final_df, df_to_merge.drop(columns=cols_to_drop), on='grid_idx', how='left')
 
-# 附加地理資訊
-rc_map = grid_map_info["grid_idx_to_rc_map"]
-if rc_map:
-    final_df['R'] = final_df['grid_idx'].apply(lambda idx: rc_map.get(idx, (-1, -1))[0])
-    final_df['C'] = final_df['grid_idx'].apply(lambda idx: rc_map.get(idx, (-1, -1))[1])
-else:
-    final_df['R'] = -1; final_df['C'] = -1
-
-sensor_coords_df = pd.DataFrame(grid_map_info["selected_sensor_info"])[['name', 'lon', 'lat']]
-flow_cols_df = pd.DataFrame({'name': flow_columns}).reset_index().rename(columns={'index': 'grid_idx'})
-excel_df = pd.merge(final_df, flow_cols_df, on='grid_idx', how='left')
-excel_df = pd.merge(excel_df, sensor_coords_df, on='name', how='left')
+# 與地理資訊合併
+excel_df_all = pd.merge(base_geo_df, final_df, on='grid_idx', how='inner')
 
 # 整理最終輸出的欄位
 output_columns = {
-    'grid_idx': '網格ID', 'R': 'R', 'C': 'C', 'lon': '經度', 'lat': '緯度',
+    'grid_idx': '網格ID', 'R': 'R', 'C': 'C', 'lon': '經度', 'lat': '緯度', 'name':'測站名稱',
     # 分析一
     'normalized_error_sum': '累計正規化誤差',
-    'group_norm_error_label': '分組(正規化誤差)',
+    'group_label_x': '分組(正規化誤差)', # Pandas merge 後可能會自動加後綴 _x, _y
     # 分析二
     'signed_dominant_std_hours': '方向性主要超標時數(Std)',
-    'group_std_exceed_hours_label': '分組(超標時數Std)',
+    'group_label_y': '分組(超標時數Std)',
     # 分析三
-    'signed_raw_error_sum': '累計原始誤差(1%修剪&削頂)',
-    'group_raw_error_label': '分組(原始誤差)',
+    'signed_raw_error_sum': '累計原始誤差(削頂)',
+    'group_label_x': '分組(原始誤差)',
     # 分析四
     'signed_dominant_raw_exceed': '方向性主要超標時數(Raw)',
-    'group_raw_exceed_hours_label': '分組(超標時數Raw)'
+    'group_label_y': '分組(超標時數Raw)'
 }
-excel_output = excel_df[[col for col in output_columns.keys() if col in excel_df.columns]].rename(columns=output_columns)
 
-excel_path = os.path.join(CONFIG['output_dir'], 'stage3_error_analysis_4_ways.xlsx')
-excel_output.to_excel(excel_path, index=False)
-logger.info(f"四種分析方法的合併結果已成功匯出至: {excel_path}")
+# 為了處理 merge 後可能產生的欄位名稱衝突 (_x, _y)，我們需要動態調整
+final_df_cols = excel_df_all.columns.tolist()
+final_output_cols_map = {
+    'grid_idx': '網格ID', 'R': 'R', 'C': 'C', 'lon': '經度', 'lat': '緯度', 'name': '測站名稱',
+    'normalized_error_sum': '累計正規化誤差',
+    'group_label_x': '分組(正規化誤差)',
+    'signed_dominant_std_hours': '方向性主要超標時數(Std)',
+    'group_label_y': '分組(超標時數Std)',
+    'signed_raw_error_sum': '累計原始誤差(削頂)',
+    'group_label_x': '分組(原始誤差)',
+    'signed_dominant_raw_exceed': '方向性主要超標時數(Raw)',
+    'group_label_y': '分組(超標時數Raw)',
+}
+
+# 根據實際存在的欄位來建立最終 DataFrame
+actual_cols_to_export = {}
+# 重新命名 group_label
+excel_df_all = excel_df_all.rename(columns={
+    'group_label_x': 'group_label_norm', 
+    'group_label_y': 'group_label_std',
+    # 假設 merge 後 mae_df 和 raw_exceed_df 的 group_label 會變成 _x 和 _y
+})
+# mae_df 和 raw_exceed_df 的 'group_label' 會再被 merge，需要處理
+if 'group_label_x' in excel_df_all.columns and 'group_label_y' in excel_df_all.columns:
+     excel_df_all = excel_df_all.rename(columns={'group_label_x': 'group_label_mae', 'group_label_y': 'group_label_raw_exceed'})
+elif 'group_label' in excel_df_all.columns: # 如果沒有衝突
+     # 找到是哪個 df 的 group_label
+     if 'dominant_hours_for_grouping' in excel_df_all.columns: # 來自 raw_exceed_df
+         excel_df_all = excel_df_all.rename(columns={'group_label': 'group_label_raw_exceed'})
+     else: # 來自 mae_df
+         excel_df_all = excel_df_all.rename(columns={'group_label': 'group_label_mae'})
+
+
+final_cols_map = {
+    'grid_idx': '網格ID', 'R': 'R', 'C': 'C', 'lon': '經度', 'lat': '緯度', 'name': '測站名稱',
+    'normalized_error_sum': '累計正規化誤差',
+    'group_label_norm': '分組(正規化誤差)',
+    'signed_dominant_std_hours': '方向性主要超標時數(Std)',
+    'group_label_std': '分組(超標時數Std)',
+    'signed_raw_error_sum': '累計原始誤差(削頂)',
+    'group_label_mae': '分組(原始誤差)',
+    'signed_dominant_raw_exceed': '方向性主要超標時數(Raw)',
+    'group_label_raw_exceed': '分組(超標時數Raw)'
+}
+
+final_cols_to_use = [col for col in final_cols_map.keys() if col in excel_df_all.columns]
+excel_output_all = excel_df_all[final_cols_to_use].rename(columns=final_cols_map)
+
+
+excel_path_all = os.path.join(CONFIG['output_dir'], 'analysis_summary_all_in_one.xlsx')
+excel_output_all.to_excel(excel_path_all, index=False)
+logger.info(f"完整的合併報告已成功匯出至: {excel_path_all}")
+
 
 logger.info("===== 全部分析流程結束 =====")
 # %%

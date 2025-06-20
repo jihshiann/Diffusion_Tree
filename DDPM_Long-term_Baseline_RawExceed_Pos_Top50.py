@@ -50,14 +50,14 @@ CONFIG = {
         "時", 
         "holiday", 
         "weekday", 
-        "相對溼度", 
+        "總雲量", 
         "時"
     ],
     "condition_input_channels": 5, 
     
     # === Baseline 專家模型配置 ===
-    "model_name": "Baseline_RelativeHumidityLe67_5",
-    "checkpoint_path": "best_baseline_model_relative_humidity_le_67_5.pth",
+    "model_name": "Baseline_TotalCloudCoverLe0",
+    "checkpoint_path": "best_baseline_model_total_cloud_cover_le_0.pth",
 
     # === Stage2 特定配置 ===
     "stage2_new_condition_feature_column": "時", # Stage2 新條件的欄位名
@@ -89,13 +89,13 @@ CONFIG = {
         # --- "feature" 模式配置 (新邏輯) ---
         # 範例：篩選出所有假日的資料 (holiday == 1)
         "feature_filter": {
-            "column": "相對溼度",      # 要過濾的特徵欄位
+            "column": "總雲量",      # 要過濾的特徵欄位
             "operator": "<=",         # 運算符 (e.g., "==", ">", "<=")
-            "value": 67.5                # 閾值
+            "value": 0                # 閾值
         },
         
         # 指定用於【模型條件輸入】的組合特徵欄位名稱 (此設定不變)
-        "grid_feature_source_column": "相對溼度"
+        "grid_feature_source_column": "總雲量"
     },
     
     # --- DDPM 擴散參數 ---

@@ -26,15 +26,15 @@ CONFIG = {
         'ArenaEvents_others',
         'hoilday'
     ],
-    #'features_to_use': None  # 使用所有特徵的範例，取消此行註解以啟用
+    'features_to_use': None  # 使用所有特徵的範例，取消此行註解以啟用
 }
-ENABLE_EXTERNAL_FILTER = False
-#result_dir = r"C:\thesis\code\result_lgb\StdExcee_Positive_Top50"
-result_dir = r"C:\thesis\code\result_lgb"
+ENABLE_EXTERNAL_FILTER = True
+result_dir = r"C:\thesis\code\result_lgb\Raw_Exceed_Positive_Top50"
+#result_dir = r"C:\thesis\code\result_lgb"
 # 外部檔案路徑和篩選條件 (僅在 ENABLE_EXTERNAL_FILTER 為 True 時才會使用)
 external_filter_file = r"C:\thesis\code\DIFFUSION_TREE\results_ddpm_stage3\Stage3_WeekdayLe4\analysis_error\stage3_error_analysis_4_ways.xlsx"
-filter_column = "分組(超標時數Std)"
-filter_value = "StdExceed: Positive Top 50"
+filter_column = "分組(超標時數Raw)"
+filter_value = "RawExceed: Positive Top 50"
 # LightGBM 參數
 ind_tree_params = {
             'objective': 'regression',
@@ -392,141 +392,142 @@ target_mae = {}
 target_mse = {}
 target_models = {}
 target_best_tree_index = {}
-print(f"訓練單獨模型...")
-individual_models_dir = os.path.join(result_dir, "individual_target_models") 
 
-for target in target_columns: # 此迴圈現在只會遍歷篩選後的 target_columns
-    print(f"\n處理目標網格: {target}")
-    # 產生模型檔案路徑 (確保檔案名稱合法)
-    safe_target_filename = "".join(c if c.isalnum() else "_" for c in target)
-    model_path = os.path.join(individual_models_dir, f"model_{safe_target_filename}.txt")
+# print(f"訓練單獨模型...")
+# individual_models_dir = os.path.join(result_dir, "individual_target_models") 
 
-    if os.path.exists(model_path):
-        print(f"  載入已存在的模型: {model_path}")
-        lgb_model = lgb.Booster(model_file=model_path)
-        # 載入模型後，重新預測以計算評估指標
-        y_pred = lgb_model.predict(X_test_tree, num_iteration=lgb_model.current_iteration()) # 使用 current_iteration() 或 best_iteration (如果可用)
+# for target in target_columns: # 此迴圈現在只會遍歷篩選後的 target_columns
+#     print(f"\n處理目標網格: {target}")
+#     # 產生模型檔案路徑 (確保檔案名稱合法)
+#     safe_target_filename = "".join(c if c.isalnum() else "_" for c in target)
+#     model_path = os.path.join(individual_models_dir, f"model_{safe_target_filename}.txt")
+
+#     if os.path.exists(model_path):
+#         print(f"  載入已存在的模型: {model_path}")
+#         lgb_model = lgb.Booster(model_file=model_path)
+#         # 載入模型後，重新預測以計算評估指標
+#         y_pred = lgb_model.predict(X_test_tree, num_iteration=lgb_model.current_iteration()) # 使用 current_iteration() 或 best_iteration (如果可用)
         
-        # 更新相關字典
-        target_models[target] = lgb_model
-        target_mae[target] = mean_absolute_error(y_test[target], y_pred)
-        target_mse[target] = mean_squared_error(y_test[target], y_pred)
+#         # 更新相關字典
+#         target_models[target] = lgb_model
+#         target_mae[target] = mean_absolute_error(y_test[target], y_pred)
+#         target_mse[target] = mean_squared_error(y_test[target], y_pred)
         
-        model_dict_loaded = lgb_model.dump_model()
-        tree_info_loaded = model_dict_loaded["tree_info"]
-        # 假設最佳樹是基於 split_gain 最高的 (通常 LightGBM 會儲存所有樹)
-        # 如果只存了 best_iteration 對應的樹，則 tree_info 可能只有一個元素
-        # 這裡我們假設需要從多棵樹中選 split_gain 最高的
-        split_gains_loaded = [tree_info_loaded[i]["tree_structure"].get("split_gain", 0) for i in range(len(tree_info_loaded))]
-        if not split_gains_loaded: # 以防萬一 tree_info 為空或沒有 split_gain
-            print(f"警告: 載入的模型 {target} 沒有有效的 split_gain。將使用索引 0。")
-            target_best_tree_index[target] = 0
-        else:
-            target_best_tree_index[target] = np.argmax(split_gains_loaded)
+#         model_dict_loaded = lgb_model.dump_model()
+#         tree_info_loaded = model_dict_loaded["tree_info"]
+#         # 假設最佳樹是基於 split_gain 最高的 (通常 LightGBM 會儲存所有樹)
+#         # 如果只存了 best_iteration 對應的樹，則 tree_info 可能只有一個元素
+#         # 這裡我們假設需要從多棵樹中選 split_gain 最高的
+#         split_gains_loaded = [tree_info_loaded[i]["tree_structure"].get("split_gain", 0) for i in range(len(tree_info_loaded))]
+#         if not split_gains_loaded: # 以防萬一 tree_info 為空或沒有 split_gain
+#             print(f"警告: 載入的模型 {target} 沒有有效的 split_gain。將使用索引 0。")
+#             target_best_tree_index[target] = 0
+#         else:
+#             target_best_tree_index[target] = np.argmax(split_gains_loaded)
         
-        print(f"  模型 {target} MAE: {target_mae[target]:.4f}, MSE: {target_mse[target]:.4f}")
-        # 不需要繪製學習曲線，因為模型已訓練
-        # SHAP 和 tree plot 仍可基於載入模型生成
+#         print(f"  模型 {target} MAE: {target_mae[target]:.4f}, MSE: {target_mse[target]:.4f}")
+#         # 不需要繪製學習曲線，因為模型已訓練
+#         # SHAP 和 tree plot 仍可基於載入模型生成
 
-    else:
-        print(f"  為 {target} 訓練新模型...")
-        train_data = lgb.Dataset(X_train_tree, label=y_train[target], categorical_feature=cat_features)
-        test_data = lgb.Dataset(X_test_tree, label=y_test[target], reference=train_data, categorical_feature=cat_features)
+#     else:
+#         print(f"  為 {target} 訓練新模型...")
+#         train_data = lgb.Dataset(X_train_tree, label=y_train[target], categorical_feature=cat_features)
+#         test_data = lgb.Dataset(X_test_tree, label=y_test[target], reference=train_data, categorical_feature=cat_features)
         
-        evals_result = {}
-        lgb_model = lgb.train(
-            ind_tree_params,
-            train_data,
-            num_boost_round=10000,
-            valid_sets=[test_data],
-            valid_names=["valid_0"],
-            callbacks=[lgb.early_stopping(stopping_rounds=10, verbose=-1), 
-                       lgb.record_evaluation(evals_result),
-                       lgb.log_evaluation(100)]
-        )
-        y_pred = lgb_model.predict(X_test_tree, num_iteration=lgb_model.best_iteration)
+#         evals_result = {}
+#         lgb_model = lgb.train(
+#             ind_tree_params,
+#             train_data,
+#             num_boost_round=10000,
+#             valid_sets=[test_data],
+#             valid_names=["valid_0"],
+#             callbacks=[lgb.early_stopping(stopping_rounds=10, verbose=-1), 
+#                        lgb.record_evaluation(evals_result),
+#                        lgb.log_evaluation(100)]
+#         )
+#         y_pred = lgb_model.predict(X_test_tree, num_iteration=lgb_model.best_iteration)
         
-        # 儲存模型
-        lgb_model.save_model(model_path)
-        print(f"  模型已儲存至: {model_path}")
+#         # 儲存模型
+#         lgb_model.save_model(model_path)
+#         print(f"  模型已儲存至: {model_path}")
 
-        predictions[target] = y_pred # predictions 字典似乎沒有在後續使用，但保留以防萬一
-        target_models[target] = lgb_model
-        target_mae[target] = mean_absolute_error(y_test[target], y_pred)
-        target_mse[target] = mean_squared_error(y_test[target], y_pred)
+#         predictions[target] = y_pred # predictions 字典似乎沒有在後續使用，但保留以防萬一
+#         target_models[target] = lgb_model
+#         target_mae[target] = mean_absolute_error(y_test[target], y_pred)
+#         target_mse[target] = mean_squared_error(y_test[target], y_pred)
 
-        model_dict_trained = lgb_model.dump_model()
-        tree_info_trained = model_dict_trained["tree_info"]
-        split_gains_trained = [tree_info_trained[i]["tree_structure"].get("split_gain", 0) for i in range(len(tree_info_trained))]
-        if not split_gains_trained:
-             print(f"警告: 新訓練的模型 {target} 沒有有效的 split_gain。將使用索引 0。")
-             target_best_tree_index[target] = 0
-        else:
-            target_best_tree_index[target] = np.argmax(split_gains_trained)
+#         model_dict_trained = lgb_model.dump_model()
+#         tree_info_trained = model_dict_trained["tree_info"]
+#         split_gains_trained = [tree_info_trained[i]["tree_structure"].get("split_gain", 0) for i in range(len(tree_info_trained))]
+#         if not split_gains_trained:
+#              print(f"警告: 新訓練的模型 {target} 沒有有效的 split_gain。將使用索引 0。")
+#              target_best_tree_index[target] = 0
+#         else:
+#             target_best_tree_index[target] = np.argmax(split_gains_trained)
 
-        if "valid_0" in evals_result and "l2" in evals_result["valid_0"]:
-            plt.figure(figsize=(8, 5))
-            plt.plot(evals_result['valid_0']['l2'], label="Validation MSE", color="blue")
-            plt.xlabel("Iterations")
-            plt.ylabel("Error")
-            plt.title(f"Learning Curve ({target})")
-            plt.legend()
-            learning_curve_path = os.path.join(result_dir, "learning_curve", f"{safe_target_filename}.png")
-            plt.savefig(learning_curve_path, dpi=300, bbox_inches="tight")
-            plt.close()
-        else:
-            print(f"無法繪製 {target} 的學習曲線。")
+#         if "valid_0" in evals_result and "l2" in evals_result["valid_0"]:
+#             plt.figure(figsize=(8, 5))
+#             plt.plot(evals_result['valid_0']['l2'], label="Validation MSE", color="blue")
+#             plt.xlabel("Iterations")
+#             plt.ylabel("Error")
+#             plt.title(f"Learning Curve ({target})")
+#             plt.legend()
+#             learning_curve_path = os.path.join(result_dir, "learning_curve", f"{safe_target_filename}.png")
+#             plt.savefig(learning_curve_path, dpi=300, bbox_inches="tight")
+#             plt.close()
+#         else:
+#             print(f"無法繪製 {target} 的學習曲線。")
 
-    # 以下部分對載入或新訓練的模型都執行
-    # 檢查 target_models 是否包含當前 target，以防在篩選後某些 target 沒有模型被載入或訓練
-    if target not in target_models:
-        print(f"警告: 目標 {target} 未在 target_models 中找到，可能在之前的步驟中被跳過。跳過此目標的後續處理。")
-        # 確保 geo_coords 和 grid_ids 即使在跳過時也可能需要更新，取決於它們的用途
-        # 如果它們嚴格對應已處理的模型，則此處不應添加
-        # all_target_rules_info 的填充邏輯在後續會處理這種情況
-        continue # 跳到下一個 target
+#     # 以下部分對載入或新訓練的模型都執行
+#     # 檢查 target_models 是否包含當前 target，以防在篩選後某些 target 沒有模型被載入或訓練
+#     if target not in target_models:
+#         print(f"警告: 目標 {target} 未在 target_models 中找到，可能在之前的步驟中被跳過。跳過此目標的後續處理。")
+#         # 確保 geo_coords 和 grid_ids 即使在跳過時也可能需要更新，取決於它們的用途
+#         # 如果它們嚴格對應已處理的模型，則此處不應添加
+#         # all_target_rules_info 的填充邏輯在後續會處理這種情況
+#         continue # 跳到下一個 target
 
-    current_model_dict = target_models[target].dump_model()
-    current_tree_info = current_model_dict["tree_info"]
-    current_best_tree_idx = target_best_tree_index[target]
+#     current_model_dict = target_models[target].dump_model()
+#     current_tree_info = current_model_dict["tree_info"]
+#     current_best_tree_idx = target_best_tree_index[target]
 
-    # 確保 current_best_tree_idx 在 current_tree_info 的有效範圍內
-    if current_best_tree_idx >= len(current_tree_info):
-        print(f"警告: 目標 {target} 的 best_tree_index ({current_best_tree_idx}) 超出 tree_info 範圍 ({len(current_tree_info)})。將使用索引 0。")
-        current_best_tree_idx = 0
-        target_best_tree_index[target] = 0 # 更新儲存的索引
-        if not current_tree_info: # 如果 tree_info 為空，則無法繼續繪圖或分析
-            print(f"錯誤: 目標 {target} 的 tree_info 為空，跳過此目標的後續處理。")
-            geo_coords.append(target) 
-            grid_ids.append(target)
-            # 為 all_target_rules_info 設置預設值 -> 這部分由後續的 all_target_rules_info 填充邏輯處理
-            continue
+#     # 確保 current_best_tree_idx 在 current_tree_info 的有效範圍內
+#     if current_best_tree_idx >= len(current_tree_info):
+#         print(f"警告: 目標 {target} 的 best_tree_index ({current_best_tree_idx}) 超出 tree_info 範圍 ({len(current_tree_info)})。將使用索引 0。")
+#         current_best_tree_idx = 0
+#         target_best_tree_index[target] = 0 # 更新儲存的索引
+#         if not current_tree_info: # 如果 tree_info 為空，則無法繼續繪圖或分析
+#             print(f"錯誤: 目標 {target} 的 tree_info 為空，跳過此目標的後續處理。")
+#             geo_coords.append(target) 
+#             grid_ids.append(target)
+#             # 為 all_target_rules_info 設置預設值 -> 這部分由後續的 all_target_rules_info 填充邏輯處理
+#             continue
 
 
-    plt.figure(figsize=(30, 18))
-    lgb.plot_tree(target_models[target], tree_index=current_best_tree_idx, show_info=['split_gain', 'data_count'])
-    plt.title(f"Best Decision Tree for {target} (Highest split_gain)")
-    tree_plot_path = os.path.join(result_dir, "tree", f"{safe_target_filename}.png")
-    plt.savefig(tree_plot_path, dpi=900, bbox_inches="tight")
-    plt.close()
+#     plt.figure(figsize=(30, 18))
+#     lgb.plot_tree(target_models[target], tree_index=current_best_tree_idx, show_info=['split_gain', 'data_count'])
+#     plt.title(f"Best Decision Tree for {target} (Highest split_gain)")
+#     tree_plot_path = os.path.join(result_dir, "tree", f"{safe_target_filename}.png")
+#     plt.savefig(tree_plot_path, dpi=900, bbox_inches="tight")
+#     plt.close()
 
-    explainer = shap.TreeExplainer(target_models[target])
-    shap_values = explainer.shap_values(X_test_tree) # 注意：SHAP 值應基於 X_test_tree (英文特徵名)
-    shap_summary_path = os.path.join(result_dir, "shap_summary", f"{safe_target_filename}.png")
-    plt.figure(figsize=(10, 6))
-    shap.summary_plot(shap_values, X_test_tree, show=False) # X_test_tree
-    plt.savefig(shap_summary_path, dpi=300, bbox_inches="tight")
-    plt.close()
+#     explainer = shap.TreeExplainer(target_models[target])
+#     shap_values = explainer.shap_values(X_test_tree) # 注意：SHAP 值應基於 X_test_tree (英文特徵名)
+#     shap_summary_path = os.path.join(result_dir, "shap_summary", f"{safe_target_filename}.png")
+#     plt.figure(figsize=(10, 6))
+#     shap.summary_plot(shap_values, X_test_tree, show=False) # X_test_tree
+#     plt.savefig(shap_summary_path, dpi=300, bbox_inches="tight")
+#     plt.close()
 
-    shap_bar_path = os.path.join(result_dir, "shap_bar", f"{safe_target_filename}.png")
-    plt.figure(figsize=(10, 6))
-    shap.summary_plot(shap_values, X_test_tree, plot_type="bar", show=False) # X_test_tree
-    plt.savefig(shap_bar_path, dpi=300, bbox_inches="tight")
-    plt.close()
+#     shap_bar_path = os.path.join(result_dir, "shap_bar", f"{safe_target_filename}.png")
+#     plt.figure(figsize=(10, 6))
+#     shap.summary_plot(shap_values, X_test_tree, plot_type="bar", show=False) # X_test_tree
+#     plt.savefig(shap_bar_path, dpi=300, bbox_inches="tight")
+#     plt.close()
 
-    # 提取規則的部分依賴於 target_models 和 target_best_tree_index，這些已經被正確設定
-    geo_coords.append(target) 
-    grid_ids.append(target)
+#     # 提取規則的部分依賴於 target_models 和 target_best_tree_index，這些已經被正確設定
+#     geo_coords.append(target) 
+#     grid_ids.append(target)
     
 shared_result_dir = os.path.join(result_dir, "shared_model")
 
@@ -603,7 +604,7 @@ shared_model = lgb.train(shared_params, train_data_shared, valid_sets=[valid_dat
 # 儲存模型
 shared_model.save_model(model_file_path)
 print(f"模型已儲存至: {model_file_path}")
-
+#%%
 # 預測
 y_pred_expanded = shared_model.predict(X_test_expanded)
 
@@ -619,51 +620,144 @@ plt.title('共享模型的學習曲線')
 plt.legend()
 plt.savefig(os.path.join(shared_result_dir, 'learning_curve', 'shared_model.png'), dpi=300)
 plt.close()
+#%%
+# --- SHAP 分析與自動化洞察 (最終修正版) ---
 
-# --- SHAP 分析 ---
-explainer = shap.TreeExplainer(shared_model)
-shap_values = explainer.shap_values(X_test_expanded) # X_test_expanded 的特徵名應為英文
+# 檢查必要的變數是否存在
+if 'shared_model' in locals() and 'X_test_expanded' in locals() and 'feature_mapping' in locals():
 
-# 為每個網格生成 SHAP 圖
-for i, target in enumerate(target_columns): # target_columns 已更新
-    safe_target = target.replace("(", "").replace(")", "").replace(",", "_").replace(" ", "")
-    # idx 的計算需要基於更新後的 n_targets (即 len(target_columns))
-    # n_samples_test 保持不變
-    idx_start = i * n_samples_test
-    idx_end = (i + 1) * n_samples_test
-    
-    # SHAP 摘要圖（點圖）
-    plt.figure(figsize=(10, 8))
-    # 使用 X_test_expanded.iloc[idx_start:idx_end] 確保特徵名一致
-    shap.summary_plot(shap_values[idx_start:idx_end], X_test_expanded.iloc[idx_start:idx_end], plot_type='dot', show=False)
-    plt.title(f'共享模型 SHAP 摘要圖 ({target})')
-    plt.savefig(os.path.join(shared_result_dir, 'shap_summary', f'shared_model_{safe_target}.png'), dpi=300)
-    plt.close()
-    
-    # SHAP 特徵重要性圖（條形圖）
-    plt.figure(figsize=(10, 8))
-    shap.summary_plot(shap_values[idx_start:idx_end], X_test_expanded.iloc[idx_start:idx_end], plot_type='bar', show=False)
-    plt.title(f'共享模型 SHAP 特徵重要性 ({target})')
-    plt.savefig(os.path.join(shared_result_dir, 'shap_bar', f'shared_model_{safe_target}.png'), dpi=300)
-    plt.close()
+    # === 步驟 1: 建立 SHAP 分析所需的英文欄位 DataFrame ===
+    # 這是解決所有 ValueError 的核心步驟
+    print("\n--- 自動化分析開始 ---")
+    print("步驟 1: 正在建立 SHAP 分析所需的英文欄位 DataFrame...")
+    try:
+        X_test_expanded_eng = X_test_expanded.rename(columns=feature_mapping)
+        print("建立完成。")
+    except Exception as e:
+        print(f"錯誤：在將 DataFrame 欄位從中文轉換為英文時失敗: {e}")
+        # 如果這裡失敗，後續分析無法進行，可以選擇退出或跳過
+        X_test_expanded_eng = None # 設為 None 以安全跳過後續步驟
 
-# 生成平均 SHAP 圖
-# mean_shap_values 的 reshape 也需要使用更新後的 n_targets
-mean_shap_values = np.mean(shap_values.reshape(n_targets, n_samples_test, -1), axis=0)
-X_test_for_shap = X_test_expanded.iloc[:n_samples_test] # 保持不變，取第一批樣本的特徵
+    if X_test_expanded_eng is not None:
+        # === 步驟 2: 計算 SHAP 值 ===
+        # 在計算 SHAP 值時，傳入英文欄位的 DataFrame，確保 explainer 和資料的一致性
+        print("步驟 2: 正在計算 SHAP values...")
+        explainer = shap.TreeExplainer(shared_model)
+        # << 關鍵修正點 >>: 傳入英文欄位的 DataFrame
+        shap_values = explainer.shap_values(X_test_expanded_eng)
+        print("SHAP values 計算完成。")
 
-plt.figure(figsize=(10, 8))
-shap.summary_plot(mean_shap_values, X_test_for_shap, plot_type='dot', show=False)
-plt.title('共享模型平均 SHAP 摘要圖')
-plt.savefig(os.path.join(shared_result_dir, 'shap_summary', 'shared_model_average.png'), dpi=300)
-plt.close()
+        # === 步驟 3: 分析與視覺化 ===
 
-plt.figure(figsize=(10, 8))
-shap.summary_plot(mean_shap_values, X_test_for_shap, plot_type='bar', show=False)
-plt.title('共享模型平均 SHAP 特徵重要性')
-plt.savefig(os.path.join(shared_result_dir, 'shap_bar', 'shared_model_average.png'), dpi=300)
-plt.close()
+        # --- 3.1 為每個網格生成 SHAP 圖 ---
+        # (此部分邏輯較耗時，若不需要可整個 for 迴圈註解掉)
+        print("步驟 3.1: 開始為每個目標網格生成獨立 SHAP 圖...")
+        for i, target in enumerate(target_columns):
+            safe_target = "".join(c if c.isalnum() else "_" for c in target)
+            idx_start = i * n_samples_test
+            idx_end = (i + 1) * n_samples_test
+            
+            plt.figure(figsize=(10, 8))
+            # << 關鍵修正點 >>: 使用 X_test_expanded_eng
+            shap.summary_plot(shap_values[idx_start:idx_end], X_test_expanded_eng.iloc[idx_start:idx_end], plot_type='dot', show=False)
+            plt.title(f'共享模型 SHAP 摘要圖 ({target})', fontproperties='Microsoft JhengHei')
+            plt.savefig(os.path.join(shared_result_dir, 'shap_summary', f'shared_model_{safe_target}.png'), dpi=300, bbox_inches='tight')
+            plt.close()
 
+            plt.figure(figsize=(10, 8))
+            # << 關鍵修正點 >>: 使用 X_test_expanded_eng
+            shap.summary_plot(shap_values[idx_start:idx_end], X_test_expanded_eng.iloc[idx_start:idx_end], plot_type='bar', show=False)
+            plt.title(f'共享模型 SHAP 特徵重要性 ({target})', fontproperties='Microsoft JhengHei')
+            plt.savefig(os.path.join(shared_result_dir, 'shap_bar', f'shared_model_{safe_target}.png'), dpi=300, bbox_inches='tight')
+            plt.close()
+        print("所有獨立 SHAP 圖生成完畢。")
+
+        # --- 3.2 生成平均 SHAP 圖 ---
+        print("步驟 3.2: 正在生成模型整體的平均 SHAP 圖...")
+        mean_shap_values = np.mean(shap_values.reshape(n_targets, n_samples_test, -1), axis=0)
+        X_test_for_shap_eng = X_test_expanded_eng.iloc[:n_samples_test]
+
+        plt.figure(figsize=(10, 8))
+        # << 關鍵修正點 >>: 使用 X_test_for_shap_eng
+        shap.summary_plot(mean_shap_values, X_test_for_shap_eng, plot_type='dot', show=False)
+        plt.title('共享模型平均 SHAP 摘要圖', fontproperties='Microsoft JhengHei')
+        plt.savefig(os.path.join(shared_result_dir, 'shap_summary', 'shared_model_average.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+
+        plt.figure(figsize=(10, 8))
+        # << 關鍵修正點 >>: 使用 X_test_for_shap_eng
+        shap.summary_plot(mean_shap_values, X_test_for_shap_eng, plot_type='bar', show=False)
+        plt.title('共享模型平均 SHAP 特徵重要性', fontproperties='Microsoft JhengHei')
+        plt.savefig(os.path.join(shared_result_dir, 'shap_bar', 'shared_model_average.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+        print("平均 SHAP 圖生成完畢。")
+
+        # --- 3.3 自動找出 SHAP 最高特徵，繪製依賴圖並找出其最高 Split Gain ---
+        print("步驟 3.3: 正在自動分析 SHAP 最高特徵...")
+
+        # 找出 SHAP 平均絕對值最高的特徵
+        mean_abs_shap = np.abs(mean_shap_values).mean(axis=0)
+        top_feature_index = np.argmax(mean_abs_shap)
+
+        # 從「英文欄位」的 DataFrame 中獲取最重要的特徵的「英文名稱」
+        top_feature_name_eng = X_test_expanded_eng.columns[top_feature_index]
+        # 為了方便顯示，用反向字典查回其「中文名稱」
+        top_feature_name_chi = reverse_mapping.get(top_feature_name_eng, top_feature_name_eng)
+        print(f"分析完成：SHAP 值最高的特徵是 '{top_feature_name_chi}' (英文名: {top_feature_name_eng})。")
+
+        # 為該特徵繪製 SHAP 依賴圖
+        plt.figure(figsize=(12, 8))
+        # **關鍵**：第三個參數現在傳入英文欄位的 DataFrame
+        shap.dependence_plot(
+            top_feature_name_eng,
+            mean_shap_values,          # 使用平均 SHAP 值
+            X_test_for_shap_eng,       # << 使用英文欄位的 DataFrame
+            interaction_index="auto",
+            show=False
+        )
+        plt.title(f'共享模型 - 最重要特徵 SHAP 依賴圖: {top_feature_name_chi}', fontproperties='Microsoft JhengHei', fontsize=16)
+        plt.xlabel(f'特徵 "{top_feature_name_chi}" 的數值', fontproperties='Microsoft JhengHei', fontsize=12)
+        plt.ylabel('對應的 SHAP 值', fontproperties='Microsoft JhengHei', fontsize=12)
+        top_feature_dependence_plot_path = os.path.join(shared_result_dir, 'shap_summary', 'shared_model_top_feature_dependence.png')
+        plt.savefig(top_feature_dependence_plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"最重要特徵的 SHAP 依賴圖已儲存。")
+
+        # 搜尋該特徵產生的最高 Split Gain
+        print(f"正在搜尋特徵 '{top_feature_name_chi}' 的最高 Split Gain...")
+        model_feature_names = shared_model.feature_name()
+        try:
+            feature_index_to_search = model_feature_names.index(top_feature_name_eng)
+        except ValueError:
+            print(f"錯誤：在模型中找不到特徵 '{top_feature_name_eng}'。")
+        else:
+            model_dump = shared_model.dump_model()
+            max_gain_found = -1.0
+            best_split_info = None
+            tree_index_with_max_gain = -1
+            for i, tree_info_item in enumerate(model_dump['tree_info']):
+                q = deque([tree_info_item['tree_structure']])
+                while q:
+                    node = q.popleft()
+                    if "split_feature" in node and node.get("split_feature") == feature_index_to_search:
+                        current_gain = node.get("split_gain", 0)
+                        if current_gain > max_gain_found:
+                            max_gain_found = current_gain
+                            best_split_info = node
+                            tree_index_with_max_gain = i
+                    if "left_child" in node: q.append(node["left_child"])
+                    if "right_child" in node: q.append(node["right_child"])
+
+            if best_split_info:
+                threshold = best_split_info['threshold']
+                print(f"搜尋結果：特徵 '{top_feature_name_chi}' 產生最高 Split Gain 的規則是 '{top_feature_name_chi} <= {threshold:.4f}' (Gain: {max_gain_found:.2f})，出現在第 {tree_index_with_max_gain} 棵樹中。")
+            else:
+                print(f"搜尋結果：在整個模型中未找到任何使用 '{top_feature_name_chi}' 的分裂。")
+        print("--- 自動化分析結束 ---\n")
+
+else:
+    print("錯誤：找不到 'shared_model' 或 'X_test_expanded' 等必要變數。請先完整執行共享模型的訓練區塊。")
+#%%
 # --- 評估指標 ---
 shared_mse = {}
 shared_mae = {}
@@ -709,7 +803,7 @@ tree_plot_path = os.path.join(shared_result_dir, 'tree', 'best_tree.png')
 plt.savefig(tree_plot_path, dpi=900, bbox_inches="tight")
 plt.close()
 print(f"最佳決策樹圖已儲存至: {tree_plot_path}")
-#%%
+
 # --- 儲存決策樹規則 ---
 def get_breadth_first_path(tree_structure):
     """以廣度優先順序遍歷樹，返回所有節點的 (split_feature, threshold) 規則"""

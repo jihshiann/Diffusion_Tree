@@ -411,3 +411,7 @@ FodyWeavers.xsd
 /results_ddpm_stage4/stage4_ArenaEvents
 /results_ddpm_stage4/stage4_arenaEvents_concert
 /results_ddpm_stage4/stage4_arenaEvents_others
+/results_ddpm_baseline/Baseline_MaxGustM3_5
+/results_ddpm_baseline/Baseline_RelativeHumidityLe67_5
+/results_ddpm_baseline/Baseline_TotalCloudCoverLe0
+/results_ddpm_stage4/Stage4_RelativeHumidityLe67_5

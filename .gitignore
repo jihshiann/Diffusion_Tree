@@ -415,3 +415,6 @@ FodyWeavers.xsd
 /results_ddpm_baseline/Baseline_RelativeHumidityLe67_5
 /results_ddpm_baseline/Baseline_TotalCloudCoverLe0
 /results_ddpm_stage4/Stage4_RelativeHumidityLe67_5
+/results_ddpm_baseline/Baseline_RelativeHumidityM67_5
+/results_ddpm_baseline/Baseline_TotalCloudCoverM0
+/results_ddpm_stage4/Stage4_TotalCloudCoverM0

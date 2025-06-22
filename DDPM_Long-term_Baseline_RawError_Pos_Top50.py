@@ -24,7 +24,7 @@ from tqdm import tqdm
 from enum import Enum
 
 # ==============================================================================
-# 組態設定 (專為 5-Channel Baseline 模型設計)
+# 組態設定 
 # ==============================================================================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -40,9 +40,9 @@ CONFIG = {
 
     # --- 模型架構參數 ---
     "image_channels": 1,      # 主要資料(流量圖)的通道數
-    "base_channels_unet": 64,   # UNet3D 的基礎通道數
+    "base_channels_unet": 16,   # UNet3D 的基礎通道數
     "unet_dropout_rate": 0.1,
-    "time_emb_dim": 256,        # 時間嵌入維度
+    "time_emb_dim": 64,        # 時間嵌入維度
     "condition_encode_dim": 16, # 條件處理器輸出的特徵維度 / UNet中與x_t合併的維度
     
     # --- Baseline 模型要使用的條件特徵 ---
@@ -50,14 +50,13 @@ CONFIG = {
         "時", 
         "holiday", 
         "weekday", 
-        "相對溼度", 
-        "時"
+        "相對溼度"
     ],
-    "condition_input_channels": 5, 
+    "condition_input_channels": 4, 
     
     # === Baseline 專家模型配置 ===
-    "model_name": "Baseline_RelativeHumidityLe67_5",
-    "checkpoint_path": "best_baseline_model_relative_humidity_le_67_5.pth",
+    "model_name": "Baseline_RelativeHumidityM67_5",
+    "checkpoint_path": "best_baseline_model_relative_humidity_m_67_5.pth",
 
     # === Stage2 特定配置 ===
     "stage2_new_condition_feature_column": "時", # Stage2 新條件的欄位名
@@ -90,7 +89,7 @@ CONFIG = {
         # 範例：篩選出所有假日的資料 (holiday == 1)
         "feature_filter": {
             "column": "相對溼度",      # 要過濾的特徵欄位
-            "operator": "<=",         # 運算符 (e.g., "==", ">", "<=")
+            "operator": ">",         # 運算符 (e.g., "==", ">", "<=")
             "value": 67.5                # 閾值
         },
         
@@ -112,13 +111,13 @@ CONFIG = {
     "seed": 42,
     "weight_decay": 1e-5,
     "lr_scheduler_factor": 0.5,
-    "lr_scheduler_patience": 8,
+    "lr_scheduler_patience": 4,
     "lr_scheduler_min_lr": 1e-7,
-    "early_stopping_patience": 16,
+    "early_stopping_patience": 8,
 
     # --- 評估參數 ---
-    "eval_batch_size": 128,
-    "fid_batch_size": 64,
+    "eval_batch_size": 256,
+    "fid_batch_size": 256,
     "fid_num_samples": 128,
     "mape_threshold": 1.0,
 

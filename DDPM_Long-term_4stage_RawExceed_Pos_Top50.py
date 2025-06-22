@@ -84,27 +84,27 @@ CONFIG = {
 
         # --- 特徵模式參數 (mode='feature' 時啟用) ---
         "feature_params": {
-            "model_name": "Stage4_RelativeHumidityM67_5",
-            "checkpoint_path": "best_stage4_model_relative_humidity_m_67_5.pth",
+            "model_name": "Stage4_TotalCloudCoverM0",
+            "checkpoint_path": "best_stage4_model_total_cloud_m_0.pth",
             # 這三個欄位用來篩選資料
-            "new_condition_feature_column": "相對溼度", 
+            "new_condition_feature_column": "總雲量", 
             "new_conditional_operator": ">",
-            "new_conditional_value": 67.5,
+            "new_conditional_value": 0,
             # 這個欄位的值會被當作模型的條件輸入
-            "grid_feature_source_column": "相對溼度" 
+            "grid_feature_source_column": "總雲量" 
         }
     },
-    "baseline_model_path" : r"C:\thesis\code\DIFFUSION_TREE\results_ddpm_baseline\Baseline_RelativeHumidityM67_5\best_baseline_model_relative_humidity_m_67_5.pth",
+    "baseline_model_path" : r"C:\thesis\code\DIFFUSION_TREE\results_ddpm_baseline\Baseline_TotalCloudCoverM0\best_baseline_model_total_cloud_m_0.pth",
     "baseline_feature_columns": [
         "時", 
         "holiday", 
         "weekday", 
-        "相對溼度", 
+        "總雲量", 
     ],
 
     "coordinate_filter": {
         "enabled": True, # 設為 True 來啟用此功能
-        "file_path": r"C:\thesis\code\DIFFUSION_TREE\results_ddpm_stage3\Stage3_WeekdayLe4\analysis_error\raw_error_sum_group0_RawError_Pos_Top50.xlsx", # 包含 R 和 C 欄位的 Excel 檔案
+        "file_path": r"C:\thesis\code\DIFFUSION_TREE\results_ddpm_stage3\Stage3_WeekdayLe4\analysis_error\raw_exceed_hours_group0_RawExceed_Pos_Top50.xlsx", # 包含 R 和 C 欄位的 Excel 檔案
         "r_col": "R", # Excel 中代表「列」的欄位名
         "c_col": "C"  # Excel 中代表「行」的欄位名
     },

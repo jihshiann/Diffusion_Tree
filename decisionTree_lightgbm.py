@@ -29,12 +29,12 @@ CONFIG = {
     'features_to_use': None  # 使用所有特徵的範例，取消此行註解以啟用
 }
 ENABLE_EXTERNAL_FILTER = True
-result_dir = r"C:\thesis\code\result_lgb\Raw_Exceed_Positive_Top50"
+result_dir = r"C:\thesis\code\result_lgb\Std_Exceed_Negative_Top50"
 #result_dir = r"C:\thesis\code\result_lgb"
 # 外部檔案路徑和篩選條件 (僅在 ENABLE_EXTERNAL_FILTER 為 True 時才會使用)
 external_filter_file = r"C:\thesis\code\DIFFUSION_TREE\results_ddpm_stage3\Stage3_WeekdayLe4\analysis_error\stage3_error_analysis_4_ways.xlsx"
-filter_column = "分組(超標時數Raw)"
-filter_value = "RawExceed: Positive Top 50"
+filter_column = "分組(超標時數Std)"
+filter_value = "StdExceed: Negative Top 50"
 # LightGBM 參數
 ind_tree_params = {
             'objective': 'regression',
@@ -268,7 +268,7 @@ X_test_tree = X_test.rename(columns=feature_mapping)
 
 # 動態定義類別特徵列表 (cat_features)
 # 首先定義所有可能的類別特徵（中文名）
-all_possible_cat_features_chinese = ['hoilday', 'ArenaEvents', 'ArenaEvents_concert', 'ArenaEvents_others', 'TombSweeping'] # 根據您的 feature_mapping 調整
+all_possible_cat_features_chinese = ['hoilday', 'ArenaEvents', 'ArenaEvents_concert', 'ArenaEvents_others', 'TombSweeping', '月', '日'] # 根據您的 feature_mapping 調整
 # 從最終使用的特徵中，篩選出哪些是類別特徵
 selected_cat_features_chinese = [f for f in X.columns if f in all_possible_cat_features_chinese]
 # 將它們轉換為英文名，供 LightGBM 使用
@@ -803,7 +803,7 @@ tree_plot_path = os.path.join(shared_result_dir, 'tree', 'best_tree.png')
 plt.savefig(tree_plot_path, dpi=900, bbox_inches="tight")
 plt.close()
 print(f"最佳決策樹圖已儲存至: {tree_plot_path}")
-
+#%%
 # --- 儲存決策樹規則 ---
 def get_breadth_first_path(tree_structure):
     """以廣度優先順序遍歷樹，返回所有節點的 (split_feature, threshold) 規則"""

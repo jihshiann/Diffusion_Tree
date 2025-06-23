@@ -57,7 +57,7 @@ CONFIG = {
     "D": 1,
     "image_channels": 1,
     "base_channels_unet": 64,
-    "time_emb_dim": 256,
+    "time_emb_dim": 64,
     "condition_encode_dim": 16,
     "condition_input_channels": 2, # Stage2/3 使用2個網格作為條件
     "timesteps": 1000,

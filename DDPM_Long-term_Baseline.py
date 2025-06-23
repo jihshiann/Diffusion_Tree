@@ -40,7 +40,7 @@ CONFIG = {
 
     # --- 模型架構參數 ---
     "image_channels": 1,      # 主要資料(流量圖)的通道數
-    "base_channels_unet": 16,   # UNet3D 的基礎通道數
+    "base_channels_unet": 64,   # UNet3D 的基礎通道數
     "unet_dropout_rate": 0.1,
     "time_emb_dim": 64,        # 時間嵌入維度
     "condition_encode_dim": 16, # 條件處理器輸出的特徵維度 / UNet中與x_t合併的維度
@@ -56,7 +56,7 @@ CONFIG = {
     
     # === Baseline 專家模型配置 ===
     "model_name": "Baseline_TotalCloudCoverM0",
-    "checkpoint_path": "best_baseline_model_total_cloud_m_0.pth",
+    "checkpoint_path": "best_baseline_model_total_cloud_cover_m_0.pth",
 
     # === Stage2 特定配置 ===
     "stage2_new_condition_feature_column": "時", # Stage2 新條件的欄位名
@@ -103,7 +103,7 @@ CONFIG = {
     "beta_end": 0.02,
 
     # --- 訓練參數 ---
-    "epochs": 128,
+    "epochs": 64,
     "batch_size": 256,
     "lr": 1e-3,      
     "num_workers": 0,
@@ -118,7 +118,7 @@ CONFIG = {
     # --- 評估參數 ---
     "eval_batch_size": 256,
     "fid_batch_size": 256,
-    "fid_num_samples": 128,
+    "fid_num_samples": 256,
     "mape_threshold": 1.0,
 
     # --- 路徑與儲存 ---
@@ -1140,11 +1140,42 @@ if __name__ == '__main__':
         scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=CONFIG["lr_scheduler_factor"], 
                                       patience=CONFIG["lr_scheduler_patience"], min_lr=CONFIG["lr_scheduler_min_lr"])
         
+        # --- [修改] 檢查並載入已存在的檢查點 ---
         best_val_loss = float('inf')
         early_stopping_counter = 0
         start_epoch = 1
-        
         model_checkpoint_path = CONFIG["checkpoint_full_path"]
+
+        if os.path.exists(model_checkpoint_path):
+            logger.info(f"發現已存在的檢查點檔案: {model_checkpoint_path}，將載入並繼續訓練。")
+            try:
+                # 載入檢查點
+                checkpoint = torch.load(model_checkpoint_path, map_location=CONFIG["device"], weights_only=False)
+                
+                # 還原模型、優化器、學習率排程器的狀態
+                baseline_model.load_state_dict(checkpoint['ddpm_state_dict'])
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                
+                # 更新訓練進度變數
+                start_epoch = checkpoint['epoch'] + 1
+                best_val_loss = checkpoint['best_val_loss']
+                
+                # 重置早停計數器，給予模型新的機會來改善
+                early_stopping_counter = 0
+                
+                logger.info(f"成功載入檢查點。將從 Epoch {start_epoch} 開始訓練，目前最佳驗證損失為: {best_val_loss:.5f}")
+                
+            except Exception as e:
+                logger.error(f"載入檢查點失敗: {e}。將刪除毀損檔案並重新開始訓練。")
+                os.remove(model_checkpoint_path) # 刪除可能已毀損的檔案
+                # 如果載入失敗，則重置為初始狀態
+                best_val_loss = float('inf')
+                early_stopping_counter = 0
+                start_epoch = 1
+        else:
+            logger.info(f"未發現檢查點檔案於 {model_checkpoint_path}，將從頭開始訓練。")
+        # --- 修改結束 ---
 
         for epoch in range(start_epoch, CONFIG["epochs"] + 1):
             baseline_model.train()

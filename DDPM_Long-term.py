@@ -42,7 +42,7 @@ CONFIG = {
     "condition_encode_dim": 16, # 條件處理器輸出的特徵維度 (可調)
     "base_channels_unet": 64,   # UNet3D 的基礎通道數
     "unet_dropout_rate": 0.1,
-    "time_emb_dim": 256,        # 時間嵌入維度
+    "time_emb_dim": 64,        # 時間嵌入維度
 
     # --- DDPM 參數 ---
     "timesteps": 1000,          # 擴散時間步長
@@ -50,7 +50,7 @@ CONFIG = {
     "beta_end": 0.02,
 
     # --- 訓練參數 ---
-    "epochs": 128, # 可調整
+    "epochs": 64, # 可調整
     "batch_size": 256, # 依 GPU 記憶體調整
     "lr": 1e-3, # 學習率
     "num_workers": 0, # DataLoader 工作執行緒 (Windows 建議 0, Linux 可 >0)

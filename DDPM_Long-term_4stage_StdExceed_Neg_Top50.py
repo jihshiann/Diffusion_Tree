@@ -39,7 +39,7 @@ CONFIG = {
 
     # --- 模型架構參數 (basemodel, stage2_model, stage3_model 共用) ---
     "image_channels": 1,      # 主要資料(流量圖)的通道數
-    "base_channels_unet": 16,   # UNet3D 的基礎通道數
+    "base_channels_unet": 64,   # UNet3D 的基礎通道數
     "unet_dropout_rate": 0.1,
     "time_emb_dim": 64,        # 時間嵌入維度
     "condition_encode_dim": 16, # 條件處理器輸出的特徵維度 / UNet中與x_t合併的維度
@@ -84,27 +84,27 @@ CONFIG = {
 
         # --- 特徵模式參數 (mode='feature' 時啟用) ---
         "feature_params": {
-            "model_name": "Stage4_TotalCloudCoverM0",
-            "checkpoint_path": "best_stage4_model_total_cloud_m_0.pth",
+            "model_name": "Stage4_MonthMe10",
+            "checkpoint_path": "best_stage4_model_month_me_10.pth",
             # 這三個欄位用來篩選資料
-            "new_condition_feature_column": "總雲量", 
-            "new_conditional_operator": ">",
-            "new_conditional_value": 0,
+            "new_condition_feature_column": "月", 
+            "new_conditional_operator": ">=",
+            "new_conditional_value": 10,
             # 這個欄位的值會被當作模型的條件輸入
-            "grid_feature_source_column": "總雲量" 
+            "grid_feature_source_column": "月" 
         }
     },
-    "baseline_model_path" : r"C:\thesis\code\DIFFUSION_TREE\results_ddpm_baseline\Baseline_TotalCloudCoverM0\best_baseline_model_total_cloud_m_0.pth",
+    "baseline_model_path" : r"C:\thesis\code\DIFFUSION_TREE\results_ddpm_baseline\Baseline_MonthMe10\best_baseline_model_month_me_10.pth",
     "baseline_feature_columns": [
         "時", 
         "holiday", 
         "weekday", 
-        "總雲量", 
+        "月", 
     ],
 
     "coordinate_filter": {
         "enabled": True, # 設為 True 來啟用此功能
-        "file_path": r"C:\thesis\code\DIFFUSION_TREE\results_ddpm_stage3\Stage3_WeekdayLe4\analysis_error\raw_exceed_hours_group0_RawExceed_Pos_Top50.xlsx", # 包含 R 和 C 欄位的 Excel 檔案
+        "file_path": r"C:\thesis\code\DIFFUSION_TREE\results_ddpm_stage3\Stage3_WeekdayLe4\analysis_error\std_exceed_group2_StdExceed_Neg_Top50.xlsx", # 包含 R 和 C 欄位的 Excel 檔案
         "r_col": "R", # Excel 中代表「列」的欄位名
         "c_col": "C"  # Excel 中代表「行」的欄位名
     },
@@ -115,7 +115,7 @@ CONFIG = {
     "beta_end": 0.02,
 
     # --- 訓練參數 ---
-    "epochs": 128,
+    "epochs": 64,
     "batch_size": 256,
     "lr": 1e-3,
 
@@ -3112,6 +3112,7 @@ if __name__ == '__main__':
 
         # --- STAGE 4B: 迴圈評估與報告產出 ---
         # 現在我們有了權威結果，進入迴圈來分別產生「全地圖」和「篩選後」的報告。
+#%%
         logger.info(f"===== STAGE 4B: 開始基於已評估結果產出報告 =====")
         # 迴圈的意義: i=0 (全地圖), i=1 (原始篩選), i=2 (擴散篩選)
         for eval_mode in ['full_map', 'filtered', 'filtered_expanded']:
@@ -3292,7 +3293,7 @@ if __name__ == '__main__':
                 s4_err = combined_error_grids['stage4_model']
                 bl_err = combined_error_grids['baseline_model']
                 diff_s4_bl_grids = {}
-                for metric in ['MSE', 'MAE', 'MAPE', 'SMAPE']:
+                for metric in ['MSE', 'MAE', 'MAPE', 'SMAPE', 'STDE_AvgGrid']:
                     if s4_err.get(metric) is not None and bl_err.get(metric) is not None:
                         diff_s4_bl_grids[f"Diff_{metric}_(Stage4-Baseline)"] = s4_err[metric] - bl_err[metric]
                 
@@ -3302,6 +3303,25 @@ if __name__ == '__main__':
                         error_metrics_grids=diff_s4_bl_grids,
                         config=CONFIG,
                         prefix=f"{current_prefix}_diff_S4_minus_Baseline",
+                        grid_mask_flat_indices=current_mask_flat
+                    )
+            # 繪製 Stage4 vs Stage3 的誤差差異地理圖
+            if 'stage4_model' in combined_error_grids and 'stage3_model_on_stage4_data' in combined_error_grids and \
+               combined_error_grids['stage4_model'] and combined_error_grids['stage3_model_on_stage4_data']:
+                s4_err = combined_error_grids['stage4_model']
+                s3_err = combined_error_grids['stage3_model_on_stage4_data']
+                diff_s4_s3_grids = {}
+                for metric in ['MSE', 'MAE', 'MAPE', 'SMAPE', 'STDE_AvgGrid']:
+                    if s4_err.get(metric) is not None and s3_err.get(metric) is not None:
+                        diff_s4_s3_grids[f"Diff_{metric}_(Stage4-Stage3)"] = s4_err.get(metric) - s3_err.get(metric)
+                
+                if diff_s4_s3_grids:
+                    logger.info(f"正在為 '{eval_mode}' 模式產生 Stage4 vs Stage3 的差異地理圖...")
+                    plot_grid_with_error_long_term(
+                        dataset_for_coords=test_loader_s4_final.dataset,
+                        error_metrics_grids=diff_s4_s3_grids,
+                        config=CONFIG,
+                        prefix=f"{current_prefix}_diff_S4_minus_S3",
                         grid_mask_flat_indices=current_mask_flat
                     )
 
@@ -3315,7 +3335,7 @@ if __name__ == '__main__':
                 if model_key not in combined_error_grids or not combined_error_grids[model_key]: continue
                 excel_rows.append({'資料來源': f"--- {model_key} (vs Stage4 Target) 逐網格誤差 ---"})
                 error_grids = combined_error_grids[model_key]
-                indices_to_loop = current_mask_flat if is_filtered_eval and current_mask_flat is not None else range(num_grid_cells)
+                indices_to_loop = current_mask_flat if eval_mode != 'full_map' and current_mask_flat is not None else range(num_grid_cells)
                 for flat_idx in indices_to_loop:
                     row_data = {'資料來源': model_key, '網格座標_R': flat_idx // CONFIG["W"], '網格座標_C': flat_idx % CONFIG["W"]}
                     for metric in ['MSE', 'MAE', 'MAPE', 'SMAPE']:
@@ -3340,7 +3360,7 @@ if __name__ == '__main__':
                     if metric in s4_err and metric in s3_err and s4_err[metric] is not None and s3_err[metric] is not None:
                         s4_s3_diff_grids[metric] = s4_err[metric] - s3_err[metric]
 
-                indices_to_loop = current_mask_flat if is_filtered_eval and current_mask_flat is not None else range(num_grid_cells)
+                indices_to_loop = current_mask_flat if eval_mode != 'full_map' and current_mask_flat is not None else range(num_grid_cells)
                 for flat_idx in indices_to_loop:
                     row_data = {'資料來源': "Diff(S4-S3)", '網格座標_R': flat_idx // CONFIG["W"], '網格座標_C': flat_idx % CONFIG["W"]}
                     for metric in ['MSE', 'MAE', 'MAPE', 'SMAPE', 'STDE_AvgGrid']:
@@ -3355,7 +3375,7 @@ if __name__ == '__main__':
                 excel_rows.append({'資料來源': "--- Difference (Stage4 - Baseline) 逐網格誤差 ---"})
                 s4_err = combined_error_grids['stage4_model']
                 bl_err = combined_error_grids['baseline_model']
-                indices_to_loop = current_mask_flat if is_filtered_eval and current_mask_flat is not None else range(num_grid_cells)
+                indices_to_loop = current_mask_flat if eval_mode != 'full_map' and current_mask_flat is not None else range(num_grid_cells)
                 for flat_idx in indices_to_loop:
                     row_data = {'資料來源': "Diff(S4-Baseline)", '網格座標_R': flat_idx // CONFIG["W"], '網格座標_C': flat_idx % CONFIG["W"]}
                     for metric in ['MSE', 'MAE', 'MAPE', 'SMAPE', 'STDE_AvgGrid']:

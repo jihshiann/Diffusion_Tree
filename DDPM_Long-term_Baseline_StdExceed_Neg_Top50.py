@@ -24,7 +24,7 @@ from tqdm import tqdm
 from enum import Enum
 
 # ==============================================================================
-# 組態設定 (專為 5-Channel Baseline 模型設計)
+# 組態設定 
 # ==============================================================================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -42,7 +42,7 @@ CONFIG = {
     "image_channels": 1,      # 主要資料(流量圖)的通道數
     "base_channels_unet": 64,   # UNet3D 的基礎通道數
     "unet_dropout_rate": 0.1,
-    "time_emb_dim": 256,        # 時間嵌入維度
+    "time_emb_dim": 64,        # 時間嵌入維度
     "condition_encode_dim": 16, # 條件處理器輸出的特徵維度 / UNet中與x_t合併的維度
     
     # --- Baseline 模型要使用的條件特徵 ---
@@ -50,14 +50,13 @@ CONFIG = {
         "時", 
         "holiday", 
         "weekday", 
-        "月", 
-        "date_combined"
+        "月"
     ],
-    "condition_input_channels": 5, 
+    "condition_input_channels": 4, 
     
     # === Baseline 專家模型配置 ===
-    "model_name": "Baseline_ArenaEvents",
-    "checkpoint_path": "best_baseline_model_arenaEvents.pth",
+    "model_name": "Baseline_MonthMe10",
+    "checkpoint_path": "best_baseline_model_month_me_10.pth",
 
     # === Stage2 特定配置 ===
     "stage2_new_condition_feature_column": "時", # Stage2 新條件的欄位名
@@ -73,12 +72,12 @@ CONFIG = {
     "stage3_model_name": "Stage3_WeekdayLe4",    # 第三階段模型的名稱
     "stage3_checkpoint_path": "best_stage3_model_Weekday_le_4.pth", # Stage3 模型的檢查點檔名 (相對路徑)
 
-    # === 過濾規則：基於外部 Excel 檔案 ===
+    # === 過濾規則：STAGE4 專家模型 ===
     "stage4_config": {
-        "model_name": "stage4_arenaEvents", # 第四階段模型的名稱
-        "checkpoint_path": "best_stage4_model_arena_events.pth",
+        # --- 模式選擇: "event" 或 "feature" ---
+        "mode": "feature",  # <--- 在此切換模式: "event" (依日期) 或 "feature" (依特徵)
         
-        # 1. 定義基於事件的過濾規則
+        # --- "event" 模式配置 (原邏輯) ---
         "event_filter": {
             "file_path": r"C:\thesis\code\Taipei_CF\ArenaEvents.xlsx",
             "year_col": "年",
@@ -86,8 +85,16 @@ CONFIG = {
             "day_col": "日"
         },
         
-        # 2. 指定用於【模型條件輸入】的組合特徵欄位名稱
-        "grid_feature_source_column": "date_combined"
+        # --- "feature" 模式配置 (新邏輯) ---
+        # 範例：篩選出所有假日的資料 (holiday == 1)
+        "feature_filter": {
+            "column": "月",      # 要過濾的特徵欄位
+            "operator": ">=",         # 運算符 (e.g., "==", ">", "<=")
+            "value": 10                # 閾值
+        },
+        
+        # 指定用於【模型條件輸入】的組合特徵欄位名稱 (此設定不變)
+        "grid_feature_source_column": "月"
     },
     
     # --- DDPM 擴散參數 ---
@@ -96,7 +103,7 @@ CONFIG = {
     "beta_end": 0.02,
 
     # --- 訓練參數 ---
-    "epochs": 128,
+    "epochs": 64,
     "batch_size": 256,
     "lr": 1e-3,      
     "num_workers": 0,
@@ -104,13 +111,13 @@ CONFIG = {
     "seed": 42,
     "weight_decay": 1e-5,
     "lr_scheduler_factor": 0.5,
-    "lr_scheduler_patience": 8,
+    "lr_scheduler_patience": 4,
     "lr_scheduler_min_lr": 1e-7,
-    "early_stopping_patience": 16,
+    "early_stopping_patience": 8,
 
     # --- 評估參數 ---
-    "eval_batch_size": 128,
-    "fid_batch_size": 64,
+    "eval_batch_size": 256,
+    "fid_batch_size": 256,
     "fid_num_samples": 128,
     "mape_threshold": 1.0,
 
@@ -469,7 +476,20 @@ class BaselineDataset(Dataset):
 
         # 4. 處理 Stage4/Baseline 自身條件
         self.s4_cond_category_for_target_np = np.zeros(len(self.df_processed), dtype=int)
-        self.grouping_key_descriptions['s4_cond_category'] = "0: 專家模型(小巨蛋活動日)" # [新增] 說明
+        
+        # [修改] 讓日誌說明更有彈性，以反映當前的 STAGE4 模式
+        stage4_mode = self.config["stage4_config"].get("mode", "unknown")
+        if stage4_mode == 'event':
+            s4_desc = "0: 專家模型 (篩選模式: 事件日)"
+        elif stage4_mode == 'feature':
+            s4_filter_cfg = self.config["stage4_config"].get("feature_filter", {})
+            col = s4_filter_cfg.get('column', 'N/A')
+            op = s4_filter_cfg.get('operator', 'N/A')
+            val = s4_filter_cfg.get('value', 'N/A')
+            s4_desc = f"0: 專家模型 (篩選模式: {col} {op} {val})"
+        else:
+            s4_desc = "0: 專家模型 (篩選模式: 未知)"
+        self.grouping_key_descriptions['s4_cond_category'] = s4_desc
         
         # --- 後續邏輯不變 ---
         if self.mode == 'train':
@@ -1000,31 +1020,56 @@ if __name__ == '__main__':
 
 
     # --- 根據 CONFIG 中的規則過濾數據 ---
-    logger.info(f"===== Baseline Model: 根據規則過濾數據 =====")
-    event_filter_config = CONFIG["stage4_config"]["event_filter"] # 從 stage4_config 獲取
-    event_file_path = event_filter_config["file_path"]
-    year_col = event_filter_config["year_col"]
-    month_col = event_filter_config["month_col"]
-    day_col = event_filter_config["day_col"]
-    
-    if not os.path.exists(event_file_path):
-        raise FileNotFoundError(f"找不到活動日期 Excel 檔案: {event_file_path}")
-    
-    logger.info(f"正在從 {event_file_path} 讀取活動日期...")
-    events_df = pd.read_excel(event_file_path)
+    logger.info(f"===== Baseline Model: 根據 STAGE4 規則過濾數據 =====")
+    stage4_cfg = CONFIG["stage4_config"]
+    mode = stage4_cfg.get("mode")
+    final_mask = None
 
-    required_cols = [year_col, month_col, day_col]
-    if not all(col in events_df.columns for col in required_cols):
-        raise ValueError(f"Excel 檔案 '{event_file_path}' 中缺少必要的欄位，需要: {required_cols}")
+    if mode == "event":
+        logger.info("STAGE4 模式: 'event'。根據 Excel 事件列表進行過濾。")
+        event_filter_config = stage4_cfg.get("event_filter")
+        if not event_filter_config:
+            raise ValueError("STAGE4 'event' 模式下，缺少 'event_filter' 的配置。")
 
-    event_date_set = set(zip(events_df[year_col], events_df[month_col], events_df[day_col]))
-    #event_date_set = set(zip(events_df[month_col], events_df[day_col]))
-    logger.info(f"從檔案中提取了 {len(event_date_set)} 個不重複的活動日期 (年, 月, 日)。")
+        event_file_path = event_filter_config["file_path"]
+        if not os.path.exists(event_file_path):
+            raise FileNotFoundError(f"找不到事件日期 Excel 檔案: {event_file_path}")
 
-    final_mask = full_df.apply(lambda row: (row['年'], row['月'], row['日']) in event_date_set, axis=1)
-    #final_mask = full_df.apply(lambda row: (row['月'], row['日']) in event_date_set, axis=1)
+        logger.info(f"正在從 {event_file_path} 讀取活動日期...")
+        events_df = pd.read_excel(event_file_path)
+        
+        required_cols = [event_filter_config["year_col"], event_filter_config["month_col"], event_filter_config["day_col"]]
+        if not all(col in events_df.columns for col in required_cols):
+            raise ValueError(f"Excel 檔案中缺少必要的欄位，需要: {required_cols}")
 
+        event_date_set = set(zip(events_df[event_filter_config["year_col"]], events_df[event_filter_config["month_col"]], events_df[event_filter_config["day_col"]]))
+        logger.info(f"從檔案中提取了 {len(event_date_set)} 個不重複的活動日期。")
+
+        final_mask = full_df.apply(lambda row: (row['年'], row['月'], row['日']) in event_date_set, axis=1)
+
+    elif mode == "feature":
+        logger.info("STAGE4 模式: 'feature'。根據特徵條件進行單向過濾。")
+        feature_filter_config = stage4_cfg.get("feature_filter")
+        if not feature_filter_config:
+            raise ValueError("STAGE4 'feature' 模式下，缺少 'feature_filter' 的配置。")
+        
+        col = feature_filter_config["column"]
+        op = feature_filter_config["operator"]
+        val = feature_filter_config["value"]
+        logger.info(f"STAGE4 過濾條件為: {col} {op} {val}")
+        
+        # 直接使用現有的輔助函數來創建遮罩
+        final_mask = create_condition_mask(full_df, col, op, val)
+
+    else:
+        raise ValueError(f"不支援的 STAGE4 模式: '{mode}'。請在 CONFIG 中選擇 'event' 或 'feature'。")
+
+    # 應用遮罩，只保留符合條件的數據
     df_for_baseline = full_df[final_mask].copy()
+    
+    if len(df_for_baseline) == 0:
+        logger.warning("STAGE4 過濾後沒有剩下任何數據，請檢查您的過濾條件。程式將繼續執行，但可能在後續步驟中出錯。")
+    
     logger.info(f"數據過濾完成。將使用 {len(df_for_baseline)} 筆資料進行訓練和評估。")
     
     # --- 數據準備與 DataLoader 創建 ---
@@ -1095,11 +1140,42 @@ if __name__ == '__main__':
         scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=CONFIG["lr_scheduler_factor"], 
                                       patience=CONFIG["lr_scheduler_patience"], min_lr=CONFIG["lr_scheduler_min_lr"])
         
+        # --- [修改] 檢查並載入已存在的檢查點 ---
         best_val_loss = float('inf')
         early_stopping_counter = 0
         start_epoch = 1
-        
         model_checkpoint_path = CONFIG["checkpoint_full_path"]
+
+        if os.path.exists(model_checkpoint_path):
+            logger.info(f"發現已存在的檢查點檔案: {model_checkpoint_path}，將載入並繼續訓練。")
+            try:
+                # 載入檢查點
+                checkpoint = torch.load(model_checkpoint_path, map_location=CONFIG["device"], weights_only=False)
+                
+                # 還原模型、優化器、學習率排程器的狀態
+                baseline_model.load_state_dict(checkpoint['ddpm_state_dict'])
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                
+                # 更新訓練進度變數
+                start_epoch = checkpoint['epoch'] + 1
+                best_val_loss = checkpoint['best_val_loss']
+                
+                # 重置早停計數器，給予模型新的機會來改善
+                early_stopping_counter = 0
+                
+                logger.info(f"成功載入檢查點。將從 Epoch {start_epoch} 開始訓練，目前最佳驗證損失為: {best_val_loss:.5f}")
+                
+            except Exception as e:
+                logger.error(f"載入檢查點失敗: {e}。將刪除毀損檔案並重新開始訓練。")
+                os.remove(model_checkpoint_path) # 刪除可能已毀損的檔案
+                # 如果載入失敗，則重置為初始狀態
+                best_val_loss = float('inf')
+                early_stopping_counter = 0
+                start_epoch = 1
+        else:
+            logger.info(f"未發現檢查點檔案於 {model_checkpoint_path}，將從頭開始訓練。")
+        # --- 修改結束 ---
 
         for epoch in range(start_epoch, CONFIG["epochs"] + 1):
             baseline_model.train()

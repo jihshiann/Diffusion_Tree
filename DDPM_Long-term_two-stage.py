@@ -40,7 +40,7 @@ CONFIG = {
     "image_channels": 1,      # 主要資料(流量圖)的通道數
     "base_channels_unet": 64,   # UNet3D 的基礎通道數
     "unet_dropout_rate": 0.1,
-    "time_emb_dim": 256,        # 時間嵌入維度
+    "time_emb_dim": 64,        # 時間嵌入維度
     "condition_encode_dim": 16, # 條件處理器輸出的特徵維度 / UNet中與x_t合併的維度
 
     # === Basemodel 相關 (用於載入並決定其原始條件處理方式) ===
@@ -62,7 +62,7 @@ CONFIG = {
     "beta_end": 0.02,
 
     # --- 訓練參數 ---
-    "epochs": 128, 
+    "epochs": 64, 
     "batch_size": 256,
     "lr": 1e-3, 
 

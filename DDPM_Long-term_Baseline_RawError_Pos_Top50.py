@@ -55,8 +55,8 @@ CONFIG = {
     "condition_input_channels": 4, 
     
     # === Baseline 專家模型配置 ===
-    "model_name": "Baseline_RelativeHumidityM67_5",
-    "checkpoint_path": "best_baseline_model_relative_humidity_m_67_5.pth",
+    "model_name": "Baseline_RelativeHumidityLe67_5",
+    "checkpoint_path": "best_baseline_model_relative_humidity_le_67_5.pth",
 
     # === Stage2 特定配置 ===
     "stage2_new_condition_feature_column": "時", # Stage2 新條件的欄位名
@@ -89,7 +89,7 @@ CONFIG = {
         # 範例：篩選出所有假日的資料 (holiday == 1)
         "feature_filter": {
             "column": "相對溼度",      # 要過濾的特徵欄位
-            "operator": ">",         # 運算符 (e.g., "==", ">", "<=")
+            "operator": "<=",         # 運算符 (e.g., "==", ">", "<=")
             "value": 67.5                # 閾值
         },
         
@@ -1140,11 +1140,42 @@ if __name__ == '__main__':
         scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=CONFIG["lr_scheduler_factor"], 
                                       patience=CONFIG["lr_scheduler_patience"], min_lr=CONFIG["lr_scheduler_min_lr"])
         
+        # --- [修改] 檢查並載入已存在的檢查點 ---
         best_val_loss = float('inf')
         early_stopping_counter = 0
         start_epoch = 1
-        
         model_checkpoint_path = CONFIG["checkpoint_full_path"]
+
+        if os.path.exists(model_checkpoint_path):
+            logger.info(f"發現已存在的檢查點檔案: {model_checkpoint_path}，將載入並繼續訓練。")
+            try:
+                # 載入檢查點
+                checkpoint = torch.load(model_checkpoint_path, map_location=CONFIG["device"], weights_only=False)
+                
+                # 還原模型、優化器、學習率排程器的狀態
+                baseline_model.load_state_dict(checkpoint['ddpm_state_dict'])
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                
+                # 更新訓練進度變數
+                start_epoch = checkpoint['epoch'] + 1
+                best_val_loss = checkpoint['best_val_loss']
+                
+                # 重置早停計數器，給予模型新的機會來改善
+                early_stopping_counter = 0
+                
+                logger.info(f"成功載入檢查點。將從 Epoch {start_epoch} 開始訓練，目前最佳驗證損失為: {best_val_loss:.5f}")
+                
+            except Exception as e:
+                logger.error(f"載入檢查點失敗: {e}。將刪除毀損檔案並重新開始訓練。")
+                os.remove(model_checkpoint_path) # 刪除可能已毀損的檔案
+                # 如果載入失敗，則重置為初始狀態
+                best_val_loss = float('inf')
+                early_stopping_counter = 0
+                start_epoch = 1
+        else:
+            logger.info(f"未發現檢查點檔案於 {model_checkpoint_path}，將從頭開始訓練。")
+        # --- 修改結束 ---
 
         for epoch in range(start_epoch, CONFIG["epochs"] + 1):
             baseline_model.train()

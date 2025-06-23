@@ -29,12 +29,12 @@ CONFIG = {
     'features_to_use': None  # 使用所有特徵的範例，取消此行註解以啟用
 }
 ENABLE_EXTERNAL_FILTER = True
-result_dir = r"C:\thesis\code\result_lgb\Std_Exceed_Negative_Top50"
+result_dir = r"C:\thesis\code\result_lgb\Std_Exceed_Positive_Top50"
 #result_dir = r"C:\thesis\code\result_lgb"
 # 外部檔案路徑和篩選條件 (僅在 ENABLE_EXTERNAL_FILTER 為 True 時才會使用)
 external_filter_file = r"C:\thesis\code\DIFFUSION_TREE\results_ddpm_stage3\Stage3_WeekdayLe4\analysis_error\stage3_error_analysis_4_ways.xlsx"
 filter_column = "分組(超標時數Std)"
-filter_value = "StdExceed: Negative Top 50"
+filter_value = "StdExceed: Positive Top 50"
 # LightGBM 參數
 ind_tree_params = {
             'objective': 'regression',
@@ -589,11 +589,16 @@ feature_names = X_train.columns.tolist()
 english_feature_names = [feature_mapping.get(name, name) for name in feature_names]
 
 # 創建 LightGBM 數據集並指定英文特徵名稱
+cat_features = [feature_mapping[f] for f in X.columns if f in all_possible_cat_features_chinese and f in feature_mapping] # 確保 cat_features 已定義
+
 train_data_shared = lgb.Dataset(X_train_expanded, label=y_train_expanded, 
-                                feature_name=english_feature_names)
+                                feature_name=english_feature_names,
+                                categorical_feature=cat_features) 
+
 valid_data_shared = lgb.Dataset(X_test_expanded, label=y_test_expanded, 
                                 reference=train_data_shared, 
-                                feature_name=english_feature_names)
+                                feature_name=english_feature_names,
+                                categorical_feature=cat_features) 
 #%%
 # 訓練共享模型
 print("開始訓練共享模型以預測所有網格...")
@@ -750,7 +755,17 @@ if 'shared_model' in locals() and 'X_test_expanded' in locals() and 'feature_map
 
             if best_split_info:
                 threshold = best_split_info['threshold']
-                print(f"搜尋結果：特徵 '{top_feature_name_chi}' 產生最高 Split Gain 的規則是 '{top_feature_name_chi} <= {threshold:.4f}' (Gain: {max_gain_found:.2f})，出現在第 {tree_index_with_max_gain} 棵樹中。")
+                
+                # 檢查這個 SHAP 最高分的特徵是否為類別特徵
+                # cat_features 變數應該在此處是可用的
+                is_top_feature_categorical = top_feature_name_eng in cat_features
+
+                if is_top_feature_categorical:
+                    # 如果是類別特徵，使用 '==' 並且不進行數字格式化
+                    print(f"搜尋結果：特徵 '{top_feature_name_chi}' 產生最高 Split Gain 的規則是 '{top_feature_name_chi} == {threshold}' (Gain: {max_gain_found:.2f})，出現在第 {tree_index_with_max_gain} 棵樹中。")
+                else:
+                    # 如果是數值特徵，則維持原本的 '<=' 和數字格式化
+                    print(f"搜尋結果：特徵 '{top_feature_name_chi}' 產生最高 Split Gain 的規則是 '{top_feature_name_chi} <= {threshold:.4f}' (Gain: {max_gain_found:.2f})，出現在第 {tree_index_with_max_gain} 棵樹中。")
             else:
                 print(f"搜尋結果：在整個模型中未找到任何使用 '{top_feature_name_chi}' 的分裂。")
         print("--- 自動化分析結束 ---\n")

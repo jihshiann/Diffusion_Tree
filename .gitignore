@@ -431,3 +431,6 @@ FodyWeavers.xsd
 /results_ddpm_baseline/Baseline_MonthMe10
 /results_ddpm_stage4/Stage4_MonthMe10
 /results_ddpm_stage4/Stage4_RelativeHumidityM67_5
+/results_ddpm_baseline/Baseline_RelativeHumidityLe70_5
+/results_ddpm_stage4
+/results_ddpm_baseline/Baseline_UVIndexLe0

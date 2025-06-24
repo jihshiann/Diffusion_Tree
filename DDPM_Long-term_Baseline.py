@@ -50,13 +50,13 @@ CONFIG = {
         "時", 
         "holiday", 
         "weekday", 
-        "總雲量"
+        "紫外線指數"
     ],
     "condition_input_channels": 4, 
     
     # === Baseline 專家模型配置 ===
-    "model_name": "Baseline_TotalCloudCoverM0",
-    "checkpoint_path": "best_baseline_model_total_cloud_cover_m_0.pth",
+    "model_name": "Baseline_UVIndexLe0",
+    "checkpoint_path": "best_baseline_model_uv_index_le_0.pth",
 
     # === Stage2 特定配置 ===
     "stage2_new_condition_feature_column": "時", # Stage2 新條件的欄位名
@@ -88,13 +88,13 @@ CONFIG = {
         # --- "feature" 模式配置 (新邏輯) ---
         # 範例：篩選出所有假日的資料 (holiday == 1)
         "feature_filter": {
-            "column": "總雲量",      # 要過濾的特徵欄位
-            "operator": ">",         # 運算符 (e.g., "==", ">", "<=")
-            "value": 0                # 閾值
+            "column": "紫外線指數",      # 要過濾的特徵欄位
+            "operator": "<=",         # 運算符 (e.g., "==", ">", "<=")
+            "value": 6               # 閾值
         },
         
         # 指定用於【模型條件輸入】的組合特徵欄位名稱 (此設定不變)
-        "grid_feature_source_column": "總雲量"
+        "grid_feature_source_column": "紫外線指數"
     },
     
     # --- DDPM 擴散參數 ---
@@ -118,7 +118,7 @@ CONFIG = {
     # --- 評估參數 ---
     "eval_batch_size": 256,
     "fid_batch_size": 256,
-    "fid_num_samples": 256,
+    "fid_num_samples": 128,
     "mape_threshold": 1.0,
 
     # --- 路徑與儲存 ---

@@ -84,27 +84,27 @@ CONFIG = {
 
         # --- 特徵模式參數 (mode='feature' 時啟用) ---
         "feature_params": {
-            "model_name": "Stage4_RelativeHumidityLe67_5",
-            "checkpoint_path": "best_stage4_model_relative_humidity_le_67_5.pth",
+            "model_name": "Stage4_UVIndexLe0",
+            "checkpoint_path": "best_stage4_model_uv_index_le_0.pth",
             # 這三個欄位用來篩選資料
-            "new_condition_feature_column": "相對溼度", 
-            "new_conditional_operator": "<",
-            "new_conditional_value": 67.5,
+            "new_condition_feature_column": "紫外線指數", 
+            "new_conditional_operator": "<=",
+            "new_conditional_value": 0,
             # 這個欄位的值會被當作模型的條件輸入
-            "grid_feature_source_column": "相對溼度" 
+            "grid_feature_source_column": "紫外線指數" 
         }
     },
-    "baseline_model_path" : r"C:\thesis\code\DIFFUSION_TREE\results_ddpm_baseline\Baseline_RelativeHumidityLe67_5\best_baseline_model_relative_humidity_le_67_5.pth",
+    "baseline_model_path" : r"C:\thesis\code\DIFFUSION_TREE\results_ddpm_baseline\Baseline_UVIndexLe0\best_baseline_model_uv_index_le_0.pth",
     "baseline_feature_columns": [
         "時", 
         "holiday", 
         "weekday", 
-        "相對溼度", 
+        "紫外線指數", 
     ],
 
     "coordinate_filter": {
         "enabled": True, # 設為 True 來啟用此功能
-        "file_path": r"C:\thesis\code\DIFFUSION_TREE\results_ddpm_stage3\Stage3_WeekdayLe4\analysis_error\raw_error_sum_group0_RawError_Pos_Top50.xlsx", # 包含 R 和 C 欄位的 Excel 檔案
+        "file_path": r"C:\thesis\code\DIFFUSION_TREE\results_ddpm_stage3\Stage3_WeekdayLe4\analysis_error\raw_exceed_hours_group2_RawExceed_Neg_Top20.xlsx", # 包含 R 和 C 欄位的 Excel 檔案
         "r_col": "R", # Excel 中代表「列」的欄位名
         "c_col": "C"  # Excel 中代表「行」的欄位名
     },
@@ -3114,6 +3114,7 @@ if __name__ == '__main__':
         # 現在我們有了權威結果，進入迴圈來分別產生「全地圖」和「篩選後」的報告。
 #%%
         logger.info(f"===== STAGE 4B: 開始基於已評估結果產出報告 =====")
+        all_eval_mode_summaries = {}
         # 迴圈的意義: i=0 (全地圖), i=1 (原始篩選), i=2 (擴散篩選)
         for eval_mode in ['full_map', 'filtered', 'filtered_expanded']:
             
@@ -3287,6 +3288,8 @@ if __name__ == '__main__':
                 except Exception as e:
                     logger.error(f"儲存 JSON 檔案失敗: {e}")
 
+            all_eval_mode_summaries[eval_mode] = summary_metrics_for_export
+
             # --- 步驟 4: 繪圖 ---
             if 'stage4_model' in combined_error_grids and 'baseline_model' in combined_error_grids and \
                combined_error_grids['stage4_model'] and combined_error_grids['baseline_model']:
@@ -3415,6 +3418,59 @@ if __name__ == '__main__':
             excel_path = os.path.join(CONFIG["stage4_model_save_dir"], f"{current_prefix}_comparison_report.xlsx")
             df_export.to_excel(excel_path, index=False, sheet_name="Full_Comparison")
             logger.info(f"報告已匯出至 Excel: {excel_path}")
+
+            logger.info("===== Generating Final Summary Tables =====")
+    
+        # 檢查是否有收集到數據
+        if all_eval_mode_summaries:
+            # 定義指標的順序和顯示名稱
+            metric_keys_order = ['mse', 'mae', 'mape_avg_grid', 'smape_avg_grid', 'mape_overall', 'smape_overall', 'stde_avg_grid', 'stde_overall', 'fid']
+            metric_display_names = {
+                'mse': 'MSE', 'mae': 'MAE', 'mape_avg_grid': 'MAPE (AvgGrid)', 'smape_avg_grid': 'SMAPE (AvgGrid)',
+                'mape_overall': 'MAPE (Overall)', 'smape_overall': 'SMAPE (Overall)',
+                'stde_avg_grid': 'STDE (AvgGrid)', 'stde_overall': 'STDE (Overall)', 'fid': 'FID'
+            }
+
+            # --- 準備 S4 vs S3 表格的數據 ---
+            s4_vs_s3_data = {}
+            for mode, summary in all_eval_mode_summaries.items():
+                if 'Diff(S4-S3)' in summary:
+                    s4_vs_s3_data[mode] = summary['Diff(S4-S3)']
+            
+            # --- 準備 S4 vs Baseline 表格的數據 ---
+            s4_vs_bl_data = {}
+            for mode, summary in all_eval_mode_summaries.items():
+                if 'Diff(S4-Baseline)' in summary:
+                    s4_vs_bl_data[mode] = summary['Diff(S4-Baseline)']
+
+            # 轉換為 Pandas DataFrame
+            df_s4_s3 = pd.DataFrame(s4_vs_s3_data).reindex(metric_keys_order)
+            df_s4_s3.index = [metric_display_names.get(i, i) for i in df_s4_s3.index]
+            df_s4_s3.columns = ['Full Map', 'Filtered', 'Filtered Expanded']
+            
+            df_s4_bl = pd.DataFrame(s4_vs_bl_data).reindex(metric_keys_order)
+            df_s4_bl.index = [metric_display_names.get(i, i) for i in df_s4_bl.index]
+            df_s4_bl.columns = ['Full Map', 'Filtered', 'Filtered Expanded']
+
+            # 定義一個函式，用於將每行的最小值設為粗體
+            def highlight_min_in_row(s):
+                is_min = s == s.min()
+                return ['font-weight: bold' if v else '' for v in is_min]
+
+            # 應用樣式
+            styled_s4_s3 = df_s4_s3.style.apply(highlight_min_in_row, axis=1).set_caption("Stage 4 vs. Stage 3 模型誤差差異比較").format("{:.4f}")
+            styled_s4_bl = df_s4_bl.style.apply(highlight_min_in_row, axis=1).set_caption("Stage 4 vs. Baseline 模型誤差差異比較").format("{:.4f}")
+
+            # 將兩個帶有樣式的表格儲存到同一個 Excel 檔案的不同工作表中
+            summary_excel_path = os.path.join(CONFIG["stage4_model_save_dir"], "final_summary_tables.xlsx")
+            try:
+                with pd.ExcelWriter(summary_excel_path, engine='openpyxl') as writer:
+                    styled_s4_s3.to_excel(writer, sheet_name='S4_vs_S3_Diff', index=True)
+                    styled_s4_bl.to_excel(writer, sheet_name='S4_vs_Baseline_Diff', index=True)
+                logger.info(f"最終摘要表格已儲存至: {summary_excel_path}")
+            except Exception as e:
+                logger.error(f"儲存最終摘要表格失敗: {e}")
+
 
     logger.info(f"===== DDPM 多階段流程 (含Stage4) 結束 =====")
 # %%

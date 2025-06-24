@@ -532,7 +532,7 @@ plot_grid_map(
     grid_map_info=grid_map_info, cmap='coolwarm', cbar_label="Accumulated Normalized Error",
     vmin=-max_abs_norm_error, vmax=max_abs_norm_error
 )
-top_index = 50 
+top_index = 20 
 pos_errors = error_df[error_df['normalized_error_sum'] >= 0].sort_values(by='normalized_error_sum', ascending=False)
 neg_errors = error_df[error_df['normalized_error_sum'] < 0].sort_values(by='normalized_error_sum', ascending=True)
 top_pos = pos_errors.head(top_index); other_pos = pos_errors.iloc[top_index:]
@@ -568,19 +568,19 @@ plot_grid_map(
     config=CONFIG, grid_map_info=grid_map_info, cmap='coolwarm', is_categorical=False,
     cbar_label="Directional Count of Hours Exceeding 1 StdDev", vmin=-max_abs_std_exceed, vmax=max_abs_std_exceed
 )
-top_n_exceed = 50
+
 exceed_df['dominant_hours'] = exceed_df[['pos_std_exceed_hours', 'neg_std_exceed_hours']].max(axis=1)
 pos_dom_std = exceed_df[exceed_df['dominant_type_std'] == 'pos'].sort_values(by='dominant_hours', ascending=False)
 neg_dom_std = exceed_df[exceed_df['dominant_type_std'] == 'neg'].sort_values(by='dominant_hours', ascending=False)
-top_pos_std = pos_dom_std.head(top_n_exceed); other_pos_std = pos_dom_std.iloc[top_n_exceed:]
-top_neg_std = neg_dom_std.head(top_n_exceed); other_neg_std = neg_dom_std.iloc[top_n_exceed:]
+top_pos_std = pos_dom_std.head(top_index); other_pos_std = pos_dom_std.iloc[top_index:]
+top_neg_std = neg_dom_std.head(top_index); other_neg_std = neg_dom_std.iloc[top_index:]
 group_grid_std = np.full(grid_indices.shape, -1, dtype=int)
 group_grid_std[top_pos_std.index] = 0; group_grid_std[other_pos_std.index] = 1
 group_grid_std[top_neg_std.index] = 2; group_grid_std[other_neg_std.index] = 3
 exceed_df['group_id'] = group_grid_std
 group_labels_std = {
-    0: f'StdExceed_Pos_Top{top_n_exceed}', 1: 'StdExceed_Pos_Others',
-    2: f'StdExceed_Neg_Top{top_n_exceed}', 3: 'StdExceed_Neg_Others',
+    0: f'StdExceed_Pos_Top{top_index}', 1: 'StdExceed_Pos_Others',
+    2: f'StdExceed_Neg_Top{top_index}', 3: 'StdExceed_Neg_Others',
 }
 exceed_df['group_label'] = exceed_df['group_id'].map(group_labels_std)
 plot_grid_map(
@@ -613,18 +613,18 @@ plot_grid_map(
     grid_map_info=grid_map_info, cmap='coolwarm', is_categorical=False,
     cbar_label="Accumulated Raw Error (Prediction - Actual)", vmin=-max_abs_raw_error, vmax=max_abs_raw_error
 )
-top_n_mae = 50
+
 pos_dom_mae = mae_df[mae_df['dominant_type_mae'] == 'pos'].sort_values(by='signed_raw_error_sum', ascending=False)
 neg_dom_mae = mae_df[mae_df['dominant_type_mae'] == 'neg'].sort_values(by='signed_raw_error_sum', ascending=True)
-top_pos_mae = pos_dom_mae.head(top_n_mae); other_pos_mae = pos_dom_mae.iloc[top_n_mae:]
-top_neg_mae = neg_dom_mae.head(top_n_mae); other_neg_mae = neg_dom_mae.iloc[top_n_mae:]
+top_pos_mae = pos_dom_mae.head(top_index); other_pos_mae = pos_dom_mae.iloc[top_index:]
+top_neg_mae = neg_dom_mae.head(top_index); other_neg_mae = neg_dom_mae.iloc[top_index:]
 group_grid_mae = np.full(grid_indices.shape, -1, dtype=int)
 group_grid_mae[top_pos_mae.index] = 0; group_grid_mae[other_pos_mae.index] = 1
 group_grid_mae[top_neg_mae.index] = 2; group_grid_mae[other_neg_mae.index] = 3
 mae_df['group_id'] = group_grid_mae
 group_labels_mae = {
-    0: f'RawError_Pos_Top{top_n_mae}', 1: 'RawError_Pos_Others',
-    2: f'RawError_Neg_Top{top_n_mae}', 3: 'RawError_Neg_Others',
+    0: f'RawError_Pos_Top{top_index}', 1: 'RawError_Pos_Others',
+    2: f'RawError_Neg_Top{top_index}', 3: 'RawError_Neg_Others',
 }
 mae_df['group_label'] = mae_df['group_id'].map(group_labels_mae)
 plot_grid_map(
@@ -651,19 +651,19 @@ plot_grid_map(
     grid_map_info=grid_map_info, cmap='coolwarm', is_categorical=False,
     cbar_label=f"Directional Count of Hours |Error| > {raw_exceed_threshold}", vmin=-max_abs_raw_exceed, vmax=max_abs_raw_exceed
 )
-top_n_raw_exceed = 50
+
 raw_exceed_df['dominant_hours'] = raw_exceed_df[['pos_raw_exceed_hours', 'neg_raw_exceed_hours']].max(axis=1)
 pos_dom_raw = raw_exceed_df[raw_exceed_df['dominant_type_raw_exceed'] == 'pos'].sort_values(by='dominant_hours', ascending=False)
 neg_dom_raw = raw_exceed_df[raw_exceed_df['dominant_type_raw_exceed'] == 'neg'].sort_values(by='dominant_hours', ascending=False)
-top_pos_raw = pos_dom_raw.head(top_n_raw_exceed); other_pos_raw = pos_dom_raw.iloc[top_n_raw_exceed:]
-top_neg_raw = neg_dom_raw.head(top_n_raw_exceed); other_neg_raw = neg_dom_raw.iloc[top_n_raw_exceed:]
+top_pos_raw = pos_dom_raw.head(top_index); other_pos_raw = pos_dom_raw.iloc[top_index:]
+top_neg_raw = neg_dom_raw.head(top_index); other_neg_raw = neg_dom_raw.iloc[top_index:]
 group_grid_raw_exceed = np.full(grid_indices.shape, -1, dtype=int)
 group_grid_raw_exceed[top_pos_raw.index] = 0; group_grid_raw_exceed[other_pos_raw.index] = 1
 group_grid_raw_exceed[top_neg_raw.index] = 2; group_grid_raw_exceed[other_neg_raw.index] = 3
 raw_exceed_df['group_id'] = group_grid_raw_exceed
 group_labels_raw_exceed = {
-    0: f'RawExceed_Pos_Top{top_n_raw_exceed}', 1: 'RawExceed_Pos_Others',
-    2: f'RawExceed_Neg_Top{top_n_raw_exceed}', 3: 'RawExceed_Neg_Others',
+    0: f'RawExceed_Pos_Top{top_index}', 1: 'RawExceed_Pos_Others',
+    2: f'RawExceed_Neg_Top{top_index}', 3: 'RawExceed_Neg_Others',
 }
 raw_exceed_df['group_label'] = raw_exceed_df['group_id'].map(group_labels_raw_exceed)
 plot_grid_map(

@@ -29,12 +29,10 @@ CONFIG = {
     'features_to_use': None  # 使用所有特徵的範例，取消此行註解以啟用
 }
 ENABLE_EXTERNAL_FILTER = True
-result_dir = r"C:\thesis\code\result_lgb\Std_Exceed_Positive_Top50"
+result_dir = r"C:\thesis\code\result_lgb\std_exceed_group2_StdExceed_Neg_Top20"
 #result_dir = r"C:\thesis\code\result_lgb"
 # 外部檔案路徑和篩選條件 (僅在 ENABLE_EXTERNAL_FILTER 為 True 時才會使用)
-external_filter_file = r"C:\thesis\code\DIFFUSION_TREE\results_ddpm_stage3\Stage3_WeekdayLe4\analysis_error\stage3_error_analysis_4_ways.xlsx"
-filter_column = "分組(超標時數Std)"
-filter_value = "StdExceed: Positive Top 50"
+external_filter_file = r"C:\thesis\code\DIFFUSION_TREE\results_ddpm_stage3\Stage3_WeekdayLe4\analysis_error\std_exceed_group2_StdExceed_Neg_Top20.xlsx"
 # LightGBM 參數
 ind_tree_params = {
             'objective': 'regression',
@@ -189,43 +187,72 @@ if ENABLE_EXTERNAL_FILTER:
     print(f"\n--- 外部檔案網格篩選已啟用 ---")
     print(f"讀取檔案: {external_filter_file}")
     
-    # 讀取 Excel 檔案
-    # 如果檔案路徑或名稱錯誤，程式將在此處停止並報錯
-    df_filter = pd.read_excel(external_filter_file)
-    
-    # 根據條件篩選資料
-    # 如果欄位名稱錯誤，程式將在此處停止並報錯
-    filtered_df = df_filter[df_filter[filter_column] == filter_value]
-    
-    if filtered_df.empty:
-        print(f"警告: 在檔案中找不到符合條件 '{filter_column}' == '{filter_value}' 的資料。腳本將繼續使用所有先前定義的網格。")
-    else:
-        # 從篩選後的資料中提取經緯度，並建立一個目標座標字串的集合
-        desired_coords_set = set()
-        for index, row in filtered_df.iterrows():
-            # 如果 '經度' 或 '緯度' 欄位不存在，程式將在此處停止並報錯
-            lon = row['經度']
-            lat = row['緯度']
-            coord_str = f"({lon}, {lat})"
-            desired_coords_set.add(coord_str)
-            
-        print(f"從篩選檔案中成功讀取 {len(desired_coords_set)} 組唯一的目標經緯度。")
+    try:
+        # 讀取 Excel 檔案
+        df_filter = pd.read_excel(external_filter_file)
+        
+        # 根據您的需求，假設Excel中的欄位是 'lon' 和 'lat'
+        if df_filter.empty:
+            print(f"警告: 篩選檔案 '{external_filter_file}' 為空或讀取失敗。")
+        else:
+            # 從篩選後的資料中提取經緯度，並建立一個目標座標字串的集合
+            desired_coords_set = set()
+            # 確保 'lon' 和 'lat' 欄位存在
+            if 'lon' not in df_filter.columns or 'lat' not in df_filter.columns:
+                print("錯誤: 篩選檔案中未找到 'lon' 或 'lat' 欄位。請檢查檔案內容。")
+            else:
+                for index, row in df_filter.iterrows():
+                    lon = row['lon']
+                    lat = row['lat']
+                    coord_str = f"({lon}, {lat})"
+                    desired_coords_set.add(coord_str)
+                
+                print(f"從篩選檔案中成功讀取 {len(desired_coords_set)} 組唯一的目標經緯度。")
 
-        original_target_count = len(target_columns)
-        
-        # 過濾 target_columns，只保留存在於 desired_coords_set 中的座標
-        filtered_target_columns = [tc for tc in target_columns if tc in desired_coords_set]
-        
-        if not filtered_target_columns and original_target_count > 0:
-             print("警告: 外部檔案中的座標與原始資料中的座標格式或數值不符，沒有匹配到任何網格。")
-        
-        # 更新 target_columns 為篩選後的列表
-        target_columns = sorted(list(set(filtered_target_columns)))
-        print(f"座標點已根據外部檔案篩選。數量從 {original_target_count} 更新為 {len(target_columns)}。")
-        if original_target_count > 0 and len(target_columns) == 0:
-            print("=> 重要提示：篩選後沒有剩餘的目標網格可以執行，程式可能會在後續步驟中出錯。")
-        
-        print(f"--- 外部檔案網格篩選結束 ---\n")
+                original_target_count = len(target_columns)
+                
+                # 過濾 target_columns，只保留存在於 desired_coords_set 中的座標
+                filtered_target_columns = [tc for tc in target_columns if tc in desired_coords_set]
+                
+                if not filtered_target_columns and original_target_count > 0:
+                     print("警告: 外部檔案中的座標與原始資料中的座標格式或數值不符，沒有匹配到任何網格。")
+                
+                # 更新 target_columns 為篩選後的列表
+                target_columns = sorted(list(set(filtered_target_columns)))
+                print(f"座標點已根據外部檔案篩選。數量從 {original_target_count} 更新為 {len(target_columns)}。")
+                
+                # =============== 新增的繪圖程式碼 START ===============
+                if target_columns:
+                    print("正在繪製篩選後網格點的地理分佈圖...")
+                    # 解析座標點以進行繪圖
+                    plot_lons = [parse_coord_string(c)[0] for c in target_columns]
+                    plot_lats = [parse_coord_string(c)[1] for c in target_columns]
+                    
+                    plt.figure(figsize=(10, 8))
+                    plt.scatter(plot_lons, plot_lats, s=20, alpha=0.8, label=f"篩選出的 {len(target_columns)} 個網格點")
+                    plt.xlabel("經度 (Longitude)")
+                    plt.ylabel("緯度 (Latitude)")
+                    plt.title("外部檔案篩選後之網格點地理分佈")
+                    plt.legend()
+                    plt.grid(True)
+                    plt.ticklabel_format(useOffset=False, style='plain', axis='both')
+                    
+                    # 儲存圖檔
+                    filtered_points_map_path = os.path.join(result_dir, "external_filter_selected_points_map.png")
+                    plt.savefig(filtered_points_map_path, dpi=300, bbox_inches="tight")
+                    plt.close()
+                    print(f"篩選後的網格點地圖已儲存至: {filtered_points_map_path}")
+                # =============== 新增的繪圖程式碼 END ===============
+
+                if original_target_count > 0 and len(target_columns) == 0:
+                    print("=> 重要提示：篩選後沒有剩餘的目標網格可以執行，程式可能會在後續步驟中出錯。")
+                
+                print(f"--- 外部檔案網格篩選結束 ---\n")
+
+    except FileNotFoundError:
+        print(f"錯誤: 找不到篩選檔案 '{external_filter_file}'。請檢查路徑是否正確。")
+    except Exception as e:
+        print(f"讀取或處理篩選檔案時發生錯誤: {e}")
 
 else:
     print("\n--- 外部檔案網格篩選已停用。將使用所有先前定義的網格進行分析。---\n")

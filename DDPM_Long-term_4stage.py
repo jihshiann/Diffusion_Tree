@@ -84,29 +84,32 @@ CONFIG = {
 
         # --- 特徵模式參數 (mode='feature' 時啟用) ---
         "feature_params": {
-            "model_name": "Stage4_UVIndexLe0",
-            "checkpoint_path": "best_stage4_model_uv_index_le_0.pth",
+            "model_name": "Stage4_RelativeHumidityLe705",
+            "checkpoint_path": "best_stage4_relative_humidity_Le_70_5.pth",
             # 這三個欄位用來篩選資料
-            "new_condition_feature_column": "紫外線指數", 
+            "new_condition_feature_column": "相對溼度", 
             "new_conditional_operator": "<=",
-            "new_conditional_value": 0,
+            "new_conditional_value": 70.5,
             # 這個欄位的值會被當作模型的條件輸入
-            "grid_feature_source_column": "紫外線指數" 
+            "grid_feature_source_column": "相對溼度" 
         }
     },
-    "baseline_model_path" : r"C:\thesis\code\DIFFUSION_TREE\results_ddpm_baseline\Baseline_UVIndexLe0\best_baseline_model_uv_index_le_0.pth",
+    "baseline_model_path" : r"C:\thesis\code\DIFFUSION_TREE\results_ddpm_baseline\Baseline_RelativeHumidityLe675\best_baseline_model_relative_humidity_Le_67_5.pth",
     "baseline_feature_columns": [
         "時", 
         "holiday", 
         "weekday", 
-        "紫外線指數", 
+        "相對溼度", 
     ],
 
     "coordinate_filter": {
         "enabled": True, # 設為 True 來啟用此功能
-        "file_path": r"C:\thesis\code\DIFFUSION_TREE\results_ddpm_stage3\Stage3_WeekdayLe4\analysis_error\raw_exceed_hours_group2_RawExceed_Neg_Top20.xlsx", # 包含 R 和 C 欄位的 Excel 檔案
-        "r_col": "R", # Excel 中代表「列」的欄位名
-        "c_col": "C"  # Excel 中代表「行」的欄位名
+        "file_path": r"C:\thesis\code\DIFFUSION_TREE\results_ddpm_stage3\Stage3_WeekdayLe4\analysis_error\raw_exceed_hours_group0_RawExceed_Pos_Top50.xlsx", 
+        "mapping_table_path": r"C:\thesis\code\DIFFUSION_TREE\results_ddpm_long-term\hungarian_grid_mapping_table.xlsx",
+        "r_col": "R",
+        "c_col": "C",
+        "lon_col": "lon",  
+        "lat_col": "lat"   
     },
 
     # --- DDPM 擴散參數 ---
@@ -2303,62 +2306,104 @@ if __name__ == '__main__':
     expanded_grid_indices_flat = None
     if CONFIG["coordinate_filter"].get("enabled", False):
         logger.info("Coordinate filter is ENABLED. Loading filter file...")
-        filter_path = CONFIG["coordinate_filter"]["file_path"]
-        r_col, c_col = CONFIG["coordinate_filter"]["r_col"], CONFIG["coordinate_filter"]["c_col"]
+        cfg_filter = CONFIG["coordinate_filter"]
+        filter_path = cfg_filter["file_path"]
         
         if not os.path.exists(filter_path):
             logger.error(f"Coordinate filter file not found: {filter_path}. Disabling filter.")
         else:
             try:
                 filter_df = pd.read_excel(filter_path)
-                if r_col not in filter_df.columns or c_col not in filter_df.columns:
-                    raise ValueError(f"Filter file '{filter_path}' is missing required columns: '{r_col}' or '{c_col}'.")
-                
                 H, W = CONFIG["H"], CONFIG["W"]
                 filtered_grid_mask_hw = np.zeros((H, W), dtype=bool)
+                filtered_coords = set()
+
+                r_col, c_col = cfg_filter["r_col"], cfg_filter["c_col"]
+                lon_col, lat_col = cfg_filter["lon_col"], cfg_filter["lat_col"]
+
+                # --- 【核心修改】檢查欄位是否存在「並且」含有有效數值 ---
+
+                # 檢查 R/C 欄位是否有效 (存在且至少有一行非空)
+                has_valid_rc = False
+                if r_col in filter_df.columns and c_col in filter_df.columns:
+                    if not filter_df[[r_col, c_col]].dropna().empty:
+                        has_valid_rc = True
                 
-                filtered_coords = set(zip(filter_df[r_col], filter_df[c_col]))
-                for r, c in filtered_coords:
-                    if 0 <= r < H and 0 <= c < W:
-                        filtered_grid_mask_hw[r, c] = True
+                # 檢查 lon/lat 欄位是否有效 (存在且至少有一行非空)
+                has_valid_lonlat = False
+                if lon_col in filter_df.columns and lat_col in filter_df.columns:
+                    if not filter_df[[lon_col, lat_col]].dropna().empty:
+                        has_valid_lonlat = True
+
+                # --- 根據檢查結果執行對應邏輯 ---
+                if has_valid_rc:
+                    logger.info(f"偵測到有效的 R/C 欄位 ('{r_col}', '{c_col}')。將使用網格索引進行篩選。")
+                    # 在使用前，先移除空值，確保資料乾淨
+                    clean_rc_df = filter_df[[r_col, c_col]].dropna()
+                    filtered_coords = set(zip(clean_rc_df[r_col], clean_rc_df[c_col]))
+
+                elif has_valid_lonlat:
+                    logger.info(f"未找到有效的 R/C 資料。偵測到有效的 lon/lat 欄位 ('{lon_col}', '{lat_col}')。將使用經緯度匹配。")
+                    
+                    mapping_table_path = cfg_filter.get("mapping_table_path")
+                    if not mapping_table_path or not os.path.exists(mapping_table_path):
+                        raise FileNotFoundError(f"對應表路徑未設定或無效: {mapping_table_path}")
+                    
+                    mapping_df = pd.read_excel(mapping_table_path)
+                    required_mapping_cols = {lon_col, lat_col, r_col, c_col}
+                    if not required_mapping_cols.issubset(mapping_df.columns):
+                        raise ValueError(f"對應表 '{mapping_table_path}' 中缺少必要的欄位。需要: {required_mapping_cols}")
+                    
+                    # 在使用前，先移除空值
+                    clean_lonlat_df = filter_df[[lon_col, lat_col]].dropna()
+                    
+                    merged_df = pd.merge(
+                        clean_lonlat_df, 
+                        mapping_df[[lon_col, lat_col, r_col, c_col]], 
+                        on=[lon_col, lat_col], 
+                        how='inner'
+                    )
+                    
+                    if merged_df.empty:
+                        logger.warning("在對應表中，沒有找到任何與篩選檔案匹配的經緯度座標。")
+                        filtered_coords = set()
+                    else:
+                        filtered_coords = set(zip(merged_df[r_col], merged_df[c_col]))
+                        logger.info(f"成功將 {len(clean_lonlat_df)} 個經緯度點匹配到 {len(filtered_coords)} 個不重複的 (R, C) 網格點。")
+
+                else:
+                    raise ValueError(f"篩選檔案 '{filter_path}' 中找不到含有有效數據的 '{r_col}'/'{c_col}' 或 '{lon_col}'/'{lat_col}' 欄位組合。")
+
+                # --- 後續的遮罩建立邏輯保持不變 ---
+                if filtered_coords:
+                    for r, c in filtered_coords:
+                        if 0 <= r < H and 0 <= c < W:
+                            filtered_grid_mask_hw[int(r), int(c)] = True # 確保索引是整數
                 
                 filtered_grid_indices_flat = np.where(filtered_grid_mask_hw.flatten())[0]
                 
                 if len(filtered_grid_indices_flat) == 0:
-                    logger.warning("Coordinate filter is enabled, but no valid coordinates were loaded. Disabling filter.")
+                    logger.warning("Coordinate filter is enabled, but no valid coordinates were identified. Disabling filter.")
                     filtered_grid_mask_hw = None
                     filtered_grid_indices_flat = None
                 else:
                     logger.info(f"Loaded {len(filtered_grid_indices_flat)} coordinates to filter for evaluation.")
-
                     if filtered_grid_mask_hw is not None:
                         logger.info("正在根據原始篩選點，建立擴散後的 3x3 網格遮罩...")
                         H, W = CONFIG["H"], CONFIG["W"]
-                        # 先複製原始遮罩，確保原始點也被包含
                         expanded_grid_mask_hw = filtered_grid_mask_hw.copy()
-                        
-                        # 找出原始遮罩中所有 True 的點的座標
                         original_rows, original_cols = np.where(filtered_grid_mask_hw)
-
-                        # 遍歷每一個原始點
                         for r, c in zip(original_rows, original_cols):
-                            # 擴散到 3x3 的鄰域 (包含中心點)
-                            for dr in range(-1, 2):  # dr 會是 -1, 0, 1
-                                for dc in range(-1, 2):  # dc 會是 -1, 0, 1
+                            for dr in range(-1, 2):
+                                for dc in range(-1, 2):
                                     nr, nc = r + dr, c + dc
-                                    
-                                    # 確保鄰近點的座標沒有超出網格邊界
                                     if 0 <= nr < H and 0 <= nc < W:
                                         expanded_grid_mask_hw[nr, nc] = True
-                        
-                        # 計算擴散後遮罩的扁平化索引
                         expanded_grid_indices_flat = np.where(expanded_grid_mask_hw.flatten())[0]
-                        
-                        logger.info(f"原始遮罩包含 {len(original_rows)} 個網格點。")
-                        logger.info(f"擴散後的遮罩包含 {len(expanded_grid_indices_flat)} 個網格點。")
+                        logger.info(f"原始遮罩包含 {len(original_rows)} 個網格點。擴散後的遮罩包含 {len(expanded_grid_indices_flat)} 個網格點。")
 
             except Exception as e:
-                logger.error(f"Failed to load coordinate filter, disabling feature. Error: {e}")
+                logger.error(f"Failed to load coordinate filter, disabling feature. Error: {e}", exc_info=True)
                 filtered_grid_mask_hw = None
                 filtered_grid_indices_flat = None
     else:

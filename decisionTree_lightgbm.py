@@ -9,6 +9,7 @@ from collections import deque
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 from sklearn.multioutput import MultiOutputRegressor
+import re
 import time
 
 # ================== CONFIG 設定區塊 ==================
@@ -28,8 +29,8 @@ CONFIG = {
     ],
     'features_to_use': None  # 使用所有特徵的範例，取消此行註解以啟用
 }
-ENABLE_EXTERNAL_FILTER = True
-result_dir = r"C:\thesis\code\result_lgb\std_exceed_group2_StdExceed_Neg_Top20"
+ENABLE_EXTERNAL_FILTER = False
+result_dir = r"C:\thesis\code\result_lgb\250624"
 #result_dir = r"C:\thesis\code\result_lgb"
 # 外部檔案路徑和篩選條件 (僅在 ENABLE_EXTERNAL_FILTER 為 True 時才會使用)
 external_filter_file = r"C:\thesis\code\DIFFUSION_TREE\results_ddpm_stage3\Stage3_WeekdayLe4\analysis_error\std_exceed_group2_StdExceed_Neg_Top20.xlsx"
@@ -420,141 +421,141 @@ target_mse = {}
 target_models = {}
 target_best_tree_index = {}
 
-# print(f"訓練單獨模型...")
-# individual_models_dir = os.path.join(result_dir, "individual_target_models") 
+print(f"訓練單獨模型...")
+individual_models_dir = os.path.join(result_dir, "individual_target_models") 
 
-# for target in target_columns: # 此迴圈現在只會遍歷篩選後的 target_columns
-#     print(f"\n處理目標網格: {target}")
-#     # 產生模型檔案路徑 (確保檔案名稱合法)
-#     safe_target_filename = "".join(c if c.isalnum() else "_" for c in target)
-#     model_path = os.path.join(individual_models_dir, f"model_{safe_target_filename}.txt")
+for target in target_columns: # 此迴圈現在只會遍歷篩選後的 target_columns
+    print(f"\n處理目標網格: {target}")
+    # 產生模型檔案路徑 (確保檔案名稱合法)
+    safe_target_filename = "".join(c if c.isalnum() else "_" for c in target)
+    model_path = os.path.join(individual_models_dir, f"model_{safe_target_filename}.txt")
 
-#     if os.path.exists(model_path):
-#         print(f"  載入已存在的模型: {model_path}")
-#         lgb_model = lgb.Booster(model_file=model_path)
-#         # 載入模型後，重新預測以計算評估指標
-#         y_pred = lgb_model.predict(X_test_tree, num_iteration=lgb_model.current_iteration()) # 使用 current_iteration() 或 best_iteration (如果可用)
+    if os.path.exists(model_path):
+        print(f"  載入已存在的模型: {model_path}")
+        lgb_model = lgb.Booster(model_file=model_path)
+        # 載入模型後，重新預測以計算評估指標
+        y_pred = lgb_model.predict(X_test_tree, num_iteration=lgb_model.current_iteration()) # 使用 current_iteration() 或 best_iteration (如果可用)
         
-#         # 更新相關字典
-#         target_models[target] = lgb_model
-#         target_mae[target] = mean_absolute_error(y_test[target], y_pred)
-#         target_mse[target] = mean_squared_error(y_test[target], y_pred)
+        # 更新相關字典
+        target_models[target] = lgb_model
+        target_mae[target] = mean_absolute_error(y_test[target], y_pred)
+        target_mse[target] = mean_squared_error(y_test[target], y_pred)
         
-#         model_dict_loaded = lgb_model.dump_model()
-#         tree_info_loaded = model_dict_loaded["tree_info"]
-#         # 假設最佳樹是基於 split_gain 最高的 (通常 LightGBM 會儲存所有樹)
-#         # 如果只存了 best_iteration 對應的樹，則 tree_info 可能只有一個元素
-#         # 這裡我們假設需要從多棵樹中選 split_gain 最高的
-#         split_gains_loaded = [tree_info_loaded[i]["tree_structure"].get("split_gain", 0) for i in range(len(tree_info_loaded))]
-#         if not split_gains_loaded: # 以防萬一 tree_info 為空或沒有 split_gain
-#             print(f"警告: 載入的模型 {target} 沒有有效的 split_gain。將使用索引 0。")
-#             target_best_tree_index[target] = 0
-#         else:
-#             target_best_tree_index[target] = np.argmax(split_gains_loaded)
+        model_dict_loaded = lgb_model.dump_model()
+        tree_info_loaded = model_dict_loaded["tree_info"]
+        # 假設最佳樹是基於 split_gain 最高的 (通常 LightGBM 會儲存所有樹)
+        # 如果只存了 best_iteration 對應的樹，則 tree_info 可能只有一個元素
+        # 這裡我們假設需要從多棵樹中選 split_gain 最高的
+        split_gains_loaded = [tree_info_loaded[i]["tree_structure"].get("split_gain", 0) for i in range(len(tree_info_loaded))]
+        if not split_gains_loaded: # 以防萬一 tree_info 為空或沒有 split_gain
+            print(f"警告: 載入的模型 {target} 沒有有效的 split_gain。將使用索引 0。")
+            target_best_tree_index[target] = 0
+        else:
+            target_best_tree_index[target] = np.argmax(split_gains_loaded)
         
-#         print(f"  模型 {target} MAE: {target_mae[target]:.4f}, MSE: {target_mse[target]:.4f}")
-#         # 不需要繪製學習曲線，因為模型已訓練
-#         # SHAP 和 tree plot 仍可基於載入模型生成
+        print(f"  模型 {target} MAE: {target_mae[target]:.4f}, MSE: {target_mse[target]:.4f}")
+        # 不需要繪製學習曲線，因為模型已訓練
+        # SHAP 和 tree plot 仍可基於載入模型生成
 
-#     else:
-#         print(f"  為 {target} 訓練新模型...")
-#         train_data = lgb.Dataset(X_train_tree, label=y_train[target], categorical_feature=cat_features)
-#         test_data = lgb.Dataset(X_test_tree, label=y_test[target], reference=train_data, categorical_feature=cat_features)
+    else:
+        print(f"  為 {target} 訓練新模型...")
+        train_data = lgb.Dataset(X_train_tree, label=y_train[target], categorical_feature=cat_features)
+        test_data = lgb.Dataset(X_test_tree, label=y_test[target], reference=train_data, categorical_feature=cat_features)
         
-#         evals_result = {}
-#         lgb_model = lgb.train(
-#             ind_tree_params,
-#             train_data,
-#             num_boost_round=10000,
-#             valid_sets=[test_data],
-#             valid_names=["valid_0"],
-#             callbacks=[lgb.early_stopping(stopping_rounds=10, verbose=-1), 
-#                        lgb.record_evaluation(evals_result),
-#                        lgb.log_evaluation(100)]
-#         )
-#         y_pred = lgb_model.predict(X_test_tree, num_iteration=lgb_model.best_iteration)
+        evals_result = {}
+        lgb_model = lgb.train(
+            ind_tree_params,
+            train_data,
+            num_boost_round=10000,
+            valid_sets=[test_data],
+            valid_names=["valid_0"],
+            callbacks=[lgb.early_stopping(stopping_rounds=10, verbose=-1), 
+                       lgb.record_evaluation(evals_result),
+                       lgb.log_evaluation(100)]
+        )
+        y_pred = lgb_model.predict(X_test_tree, num_iteration=lgb_model.best_iteration)
         
-#         # 儲存模型
-#         lgb_model.save_model(model_path)
-#         print(f"  模型已儲存至: {model_path}")
+        # 儲存模型
+        lgb_model.save_model(model_path)
+        print(f"  模型已儲存至: {model_path}")
 
-#         predictions[target] = y_pred # predictions 字典似乎沒有在後續使用，但保留以防萬一
-#         target_models[target] = lgb_model
-#         target_mae[target] = mean_absolute_error(y_test[target], y_pred)
-#         target_mse[target] = mean_squared_error(y_test[target], y_pred)
+        predictions[target] = y_pred # predictions 字典似乎沒有在後續使用，但保留以防萬一
+        target_models[target] = lgb_model
+        target_mae[target] = mean_absolute_error(y_test[target], y_pred)
+        target_mse[target] = mean_squared_error(y_test[target], y_pred)
 
-#         model_dict_trained = lgb_model.dump_model()
-#         tree_info_trained = model_dict_trained["tree_info"]
-#         split_gains_trained = [tree_info_trained[i]["tree_structure"].get("split_gain", 0) for i in range(len(tree_info_trained))]
-#         if not split_gains_trained:
-#              print(f"警告: 新訓練的模型 {target} 沒有有效的 split_gain。將使用索引 0。")
-#              target_best_tree_index[target] = 0
-#         else:
-#             target_best_tree_index[target] = np.argmax(split_gains_trained)
+        model_dict_trained = lgb_model.dump_model()
+        tree_info_trained = model_dict_trained["tree_info"]
+        split_gains_trained = [tree_info_trained[i]["tree_structure"].get("split_gain", 0) for i in range(len(tree_info_trained))]
+        if not split_gains_trained:
+             print(f"警告: 新訓練的模型 {target} 沒有有效的 split_gain。將使用索引 0。")
+             target_best_tree_index[target] = 0
+        else:
+            target_best_tree_index[target] = np.argmax(split_gains_trained)
 
-#         if "valid_0" in evals_result and "l2" in evals_result["valid_0"]:
-#             plt.figure(figsize=(8, 5))
-#             plt.plot(evals_result['valid_0']['l2'], label="Validation MSE", color="blue")
-#             plt.xlabel("Iterations")
-#             plt.ylabel("Error")
-#             plt.title(f"Learning Curve ({target})")
-#             plt.legend()
-#             learning_curve_path = os.path.join(result_dir, "learning_curve", f"{safe_target_filename}.png")
-#             plt.savefig(learning_curve_path, dpi=300, bbox_inches="tight")
-#             plt.close()
-#         else:
-#             print(f"無法繪製 {target} 的學習曲線。")
+        if "valid_0" in evals_result and "l2" in evals_result["valid_0"]:
+            plt.figure(figsize=(8, 5))
+            plt.plot(evals_result['valid_0']['l2'], label="Validation MSE", color="blue")
+            plt.xlabel("Iterations")
+            plt.ylabel("Error")
+            plt.title(f"Learning Curve ({target})")
+            plt.legend()
+            learning_curve_path = os.path.join(result_dir, "learning_curve", f"{safe_target_filename}.png")
+            plt.savefig(learning_curve_path, dpi=300, bbox_inches="tight")
+            plt.close()
+        else:
+            print(f"無法繪製 {target} 的學習曲線。")
 
-#     # 以下部分對載入或新訓練的模型都執行
-#     # 檢查 target_models 是否包含當前 target，以防在篩選後某些 target 沒有模型被載入或訓練
-#     if target not in target_models:
-#         print(f"警告: 目標 {target} 未在 target_models 中找到，可能在之前的步驟中被跳過。跳過此目標的後續處理。")
-#         # 確保 geo_coords 和 grid_ids 即使在跳過時也可能需要更新，取決於它們的用途
-#         # 如果它們嚴格對應已處理的模型，則此處不應添加
-#         # all_target_rules_info 的填充邏輯在後續會處理這種情況
-#         continue # 跳到下一個 target
+    # 以下部分對載入或新訓練的模型都執行
+    # 檢查 target_models 是否包含當前 target，以防在篩選後某些 target 沒有模型被載入或訓練
+    if target not in target_models:
+        print(f"警告: 目標 {target} 未在 target_models 中找到，可能在之前的步驟中被跳過。跳過此目標的後續處理。")
+        # 確保 geo_coords 和 grid_ids 即使在跳過時也可能需要更新，取決於它們的用途
+        # 如果它們嚴格對應已處理的模型，則此處不應添加
+        # all_target_rules_info 的填充邏輯在後續會處理這種情況
+        continue # 跳到下一個 target
 
-#     current_model_dict = target_models[target].dump_model()
-#     current_tree_info = current_model_dict["tree_info"]
-#     current_best_tree_idx = target_best_tree_index[target]
+    current_model_dict = target_models[target].dump_model()
+    current_tree_info = current_model_dict["tree_info"]
+    current_best_tree_idx = target_best_tree_index[target]
 
-#     # 確保 current_best_tree_idx 在 current_tree_info 的有效範圍內
-#     if current_best_tree_idx >= len(current_tree_info):
-#         print(f"警告: 目標 {target} 的 best_tree_index ({current_best_tree_idx}) 超出 tree_info 範圍 ({len(current_tree_info)})。將使用索引 0。")
-#         current_best_tree_idx = 0
-#         target_best_tree_index[target] = 0 # 更新儲存的索引
-#         if not current_tree_info: # 如果 tree_info 為空，則無法繼續繪圖或分析
-#             print(f"錯誤: 目標 {target} 的 tree_info 為空，跳過此目標的後續處理。")
-#             geo_coords.append(target) 
-#             grid_ids.append(target)
-#             # 為 all_target_rules_info 設置預設值 -> 這部分由後續的 all_target_rules_info 填充邏輯處理
-#             continue
+    # 確保 current_best_tree_idx 在 current_tree_info 的有效範圍內
+    if current_best_tree_idx >= len(current_tree_info):
+        print(f"警告: 目標 {target} 的 best_tree_index ({current_best_tree_idx}) 超出 tree_info 範圍 ({len(current_tree_info)})。將使用索引 0。")
+        current_best_tree_idx = 0
+        target_best_tree_index[target] = 0 # 更新儲存的索引
+        if not current_tree_info: # 如果 tree_info 為空，則無法繼續繪圖或分析
+            print(f"錯誤: 目標 {target} 的 tree_info 為空，跳過此目標的後續處理。")
+            geo_coords.append(target) 
+            grid_ids.append(target)
+            # 為 all_target_rules_info 設置預設值 -> 這部分由後續的 all_target_rules_info 填充邏輯處理
+            continue
 
 
-#     plt.figure(figsize=(30, 18))
-#     lgb.plot_tree(target_models[target], tree_index=current_best_tree_idx, show_info=['split_gain', 'data_count'])
-#     plt.title(f"Best Decision Tree for {target} (Highest split_gain)")
-#     tree_plot_path = os.path.join(result_dir, "tree", f"{safe_target_filename}.png")
-#     plt.savefig(tree_plot_path, dpi=900, bbox_inches="tight")
-#     plt.close()
+    plt.figure(figsize=(30, 18))
+    lgb.plot_tree(target_models[target], tree_index=current_best_tree_idx, show_info=['split_gain', 'data_count'])
+    plt.title(f"Best Decision Tree for {target} (Highest split_gain)")
+    tree_plot_path = os.path.join(result_dir, "tree", f"{safe_target_filename}.png")
+    plt.savefig(tree_plot_path, dpi=900, bbox_inches="tight")
+    plt.close()
 
-#     explainer = shap.TreeExplainer(target_models[target])
-#     shap_values = explainer.shap_values(X_test_tree) # 注意：SHAP 值應基於 X_test_tree (英文特徵名)
-#     shap_summary_path = os.path.join(result_dir, "shap_summary", f"{safe_target_filename}.png")
-#     plt.figure(figsize=(10, 6))
-#     shap.summary_plot(shap_values, X_test_tree, show=False) # X_test_tree
-#     plt.savefig(shap_summary_path, dpi=300, bbox_inches="tight")
-#     plt.close()
+    explainer = shap.TreeExplainer(target_models[target])
+    shap_values = explainer.shap_values(X_test_tree) # 注意：SHAP 值應基於 X_test_tree (英文特徵名)
+    shap_summary_path = os.path.join(result_dir, "shap_summary", f"{safe_target_filename}.png")
+    plt.figure(figsize=(10, 6))
+    shap.summary_plot(shap_values, X_test_tree, show=False) # X_test_tree
+    plt.savefig(shap_summary_path, dpi=300, bbox_inches="tight")
+    plt.close()
 
-#     shap_bar_path = os.path.join(result_dir, "shap_bar", f"{safe_target_filename}.png")
-#     plt.figure(figsize=(10, 6))
-#     shap.summary_plot(shap_values, X_test_tree, plot_type="bar", show=False) # X_test_tree
-#     plt.savefig(shap_bar_path, dpi=300, bbox_inches="tight")
-#     plt.close()
+    shap_bar_path = os.path.join(result_dir, "shap_bar", f"{safe_target_filename}.png")
+    plt.figure(figsize=(10, 6))
+    shap.summary_plot(shap_values, X_test_tree, plot_type="bar", show=False) # X_test_tree
+    plt.savefig(shap_bar_path, dpi=300, bbox_inches="tight")
+    plt.close()
 
-#     # 提取規則的部分依賴於 target_models 和 target_best_tree_index，這些已經被正確設定
-#     geo_coords.append(target) 
-#     grid_ids.append(target)
+    # 提取規則的部分依賴於 target_models 和 target_best_tree_index，這些已經被正確設定
+    geo_coords.append(target) 
+    grid_ids.append(target)
     
 shared_result_dir = os.path.join(result_dir, "shared_model")
 
@@ -1080,7 +1081,7 @@ try:
 except ImportError:
     print("警告: 未安裝 'openpyxl'。Excel 檔案未儲存。請執行 'pip install openpyxl'")
 
-# 新分群邏輯開始
+# 分群邏輯開始
 
 # 輔助函數：從節點字典中提取規則 (特徵索引, 閾值), 增益及節點本身
 def get_rule_and_gain_node(node_dict):
@@ -1091,7 +1092,7 @@ def get_rule_and_gain_node(node_dict):
         return rule, gain, node_dict # Return node_dict as well
     return None, -float('inf'), None # Consistent return for invalid/leaf nodes
 
-# 新增輔助函數：獲取指定深度按增益排序的節點資訊
+# 輔助函數：獲取指定深度按增益排序的節點資訊
 def get_nodes_info_at_depth_sorted_by_gain(tree_structure, target_depth):
     """
     遍歷樹到目標深度，收集該深度的分裂節點信息 (規則、增益、節點本身)，
@@ -1131,7 +1132,7 @@ def get_nodes_info_at_depth_sorted_by_gain(tree_structure, target_depth):
     
     return nodes_info_list
 
-# 新增輔助函數：獲取父節點的子節點資訊，按增益排序
+# 輔助函數：獲取父節點的子節點資訊，按增益排序
 def get_children_info_sorted_by_gain(parent_node_dict):
     """
     獲取父節點的子節點中，有效的子節點資訊 (規則、增益、節點字典)，按增益降序排序。
@@ -1155,7 +1156,6 @@ def get_children_info_sorted_by_gain(parent_node_dict):
     
     children_info.sort(key=lambda x: x['gain'], reverse=True)
     return children_info
-
 
 # 輔助函數：為單一目標提取 R1, R2, R3 規則及其節點資訊 (新定義)
 all_target_rules_info = {} 
@@ -1540,4 +1540,203 @@ for group_id in unique_group_ids:
 print("所有處理完成。")
 
 
+# %%
+
+# 新分群邏輯
+# 輔助函數: 創建安全的文件名
+def sanitize_filename(name):
+    """將規則字串轉換為安全的檔案名稱。"""
+    name = name.replace(" ", "_").replace("<=", "le").replace("==", "eq").replace(">", "gt")
+    name = re.sub(r'[\\/*?:"<>|]', "", name)
+    return name[:100] # 限制檔案名稱長度
+
+# 輔助函數: 執行分群、儲存結果和繪圖
+def run_grouping_and_generate_outputs(grouping_name, rule_to_targets_map, base_result_dir):
+    """
+    根據給定的分群規則和目標，產生所有必要的輸出檔案。
+
+    Args:
+        grouping_name (str): 此分群方法的名稱，將用作資料夾名稱 (例如 'grouping_exact_rule')。
+        rule_to_targets_map (dict): 一個字典，key 是規則元組，value 是屬於該規則的座標點列表。
+        base_result_dir (str): 基礎的結果儲存路徑。
+    """
+    print(f"\n--- 開始執行分群: {grouping_name} ---")
+    grouping_dir = os.path.join(base_result_dir, grouping_name)
+    os.makedirs(grouping_dir, exist_ok=True)
+
+    # 準備整合 Excel 的資料
+    summary_data = []
+    all_lons, all_lats, all_group_ids = [], [], []
+    group_id_counter = 0
+    
+    # 按照規則的字串表示法排序，確保每次執行順序一致
+    # 使用 try-except 處理 None 規則可能無法比較的狀況
+    try:
+        group_rules = sorted(rule_to_targets_map.keys(), key=lambda r: str(r))
+    except TypeError:
+        group_rules = list(rule_to_targets_map.keys())
+
+
+    for rule in group_rules:
+        targets = rule_to_targets_map[rule]
+        if not targets: continue
+
+        rule_str = format_rule_to_string(rule, feature_names_english, reverse_mapping, cat_features)
+        summary_data.append({
+            "規則": rule_str,
+            "座標數量": len(targets),
+            "座標": ", ".join(sorted(targets))
+        })
+
+        # 準備整合地圖的資料
+        for target_str in targets:
+            lon, lat = parse_coord_string(target_str)
+            if lon is not None:
+                all_lons.append(lon)
+                all_lats.append(lat)
+                all_group_ids.append(group_id_counter)
+        group_id_counter += 1
+
+    # 儲存整合 Excel
+    summary_df = pd.DataFrame(summary_data)
+    summary_excel_path = os.path.join(grouping_dir, f"{grouping_name}_summary.xlsx")
+    summary_df.to_excel(summary_excel_path, index=False, engine='openpyxl')
+    print(f"整合 Excel 已儲存至: {summary_excel_path}")
+
+    # 繪製並儲存整合地圖
+    num_groups = len(set(all_group_ids))
+    if num_groups > 0:
+        cmap = plt.cm.get_cmap('viridis', num_groups)
+        plt.figure(figsize=(12, 10))
+        scatter = plt.scatter(all_lons, all_lats, c=all_group_ids, cmap=cmap, s=50, alpha=0.8)
+        plt.ticklabel_format(useOffset=False, style='plain', axis='both')
+        plt.xlabel("經度 (Longitude)")
+        plt.ylabel("緯度 (Latitude)")
+        plt.title(f"{grouping_name} - 地理分佈圖")
+        
+        # 建立圖例
+        legend_labels = [
+            format_rule_to_string(r, feature_names_english, reverse_mapping, cat_features) 
+            for r in group_rules if r in rule_to_targets_map and rule_to_targets_map[r]
+        ]
+        handles, _ = scatter.legend_elements(prop="colors", num=num_groups)
+        if len(handles) == len(legend_labels):
+            plt.legend(handles, legend_labels, title="群組規則", bbox_to_anchor=(1.05, 1), loc='upper left')
+
+        summary_map_path = os.path.join(grouping_dir, f"{grouping_name}_summary_map.png")
+        plt.savefig(summary_map_path, dpi=300, bbox_inches="tight")
+        plt.close()
+        print(f"整合地圖已儲存至: {summary_map_path}")
+
+    # 為每個群組產生獨立檔案
+    print("正在為每個群組產生獨立檔案...")
+    # 獲取所有點的經緯度以作背景
+    background_lons = [parse_coord_string(t)[0] for t in target_columns if parse_coord_string(t)[0] is not None]
+    background_lats = [parse_coord_string(t)[1] for t in target_columns if parse_coord_string(t)[1] is not None]
+
+    group_id_counter = 0
+    for rule in group_rules:
+        targets = rule_to_targets_map[rule]
+        if not targets: continue
+
+        rule_str = format_rule_to_string(rule, feature_names_english, reverse_mapping, cat_features)
+        safe_rule_name = sanitize_filename(rule_str)
+
+        # 準備獨立 Excel
+        group_data = []
+        group_lons, group_lats = [], []
+        for target_str in targets:
+            lon, lat = parse_coord_string(target_str)
+            if lon is not None:
+                group_lons.append(lon)
+                group_lats.append(lat)
+                group_data.append({"R": "", "C": "", "lon": lon, "lat": lat})
+        group_df = pd.DataFrame(group_data)
+        group_excel_path = os.path.join(grouping_dir, f"{safe_rule_name}.xlsx")
+        group_df.to_excel(group_excel_path, index=False, engine='openpyxl')
+
+        # 準備獨立地圖
+        if group_lons: # 只有在群組中有點時才繪圖
+            plt.figure(figsize=(12, 10))
+            plt.scatter(background_lons, background_lats, c='lightgray', s=30, alpha=0.5, label='所有其他點')
+            plt.scatter(group_lons, group_lats, color=cmap.colors[group_id_counter], s=60, alpha=0.9, label=f'群組: {rule_str}')
+            plt.ticklabel_format(useOffset=False, style='plain', axis='both')
+            plt.xlabel("經度 (Longitude)")
+            plt.ylabel("緯度 (Latitude)")
+            plt.title(f"群組地理分佈: {rule_str}")
+            plt.legend()
+            plt.grid(True)
+            group_map_path = os.path.join(grouping_dir, f"{safe_rule_name}.png")
+            plt.savefig(group_map_path, dpi=300, bbox_inches="tight")
+            plt.close()
+        
+        group_id_counter += 1
+    print(f"{grouping_name} 的所有獨立檔案已產生完畢。")
+
+all_target_root_rules = {}
+print("\n提取各目標點的根節點規則...")
+for target in target_columns:
+    rule = None # 預設規則為 None
+    if target in target_models:
+        model_dump = target_models[target].dump_model()
+        best_tree_idx = target_best_tree_index.get(target)
+        if best_tree_idx is not None and best_tree_idx < len(model_dump["tree_info"]):
+            best_tree_structure = model_dump["tree_info"][best_tree_idx]["tree_structure"]
+            # 從原有的階層式分群邏輯中，我們知道 r1_root 代表根節點
+            # 這裡我們直接從 all_target_rules_info 提取，確保邏輯一致
+            if target in all_target_rules_info:
+                 rule = all_target_rules_info[target]['r1_root']['rule']
+    all_target_root_rules[target] = rule
+
+
+# --- 方法1: 嚴格規則分群 (Exact Rule Grouping) ---
+print("\n" + "="*50)
+print("處理新分群方法 1: 嚴格規則分群")
+print("="*50)
+exact_rule_to_targets = {}
+for target, rule in all_target_root_rules.items():
+    if rule not in exact_rule_to_targets:
+        exact_rule_to_targets[rule] = []
+    exact_rule_to_targets[rule].append(target)
+
+# 呼叫主函式來產生輸出
+run_grouping_and_generate_outputs(
+    grouping_name="grouping_exact_rule", 
+    rule_to_targets_map=exact_rule_to_targets, 
+    base_result_dir=result_dir
+)
+
+
+# --- 方法2: 相似規則分群 (Similar Rule Grouping) ---
+print("\n" + "="*50)
+print("處理新分群方法 2: 相似規則分群")
+print("="*50)
+
+# 使用已有的 merge_individual_rules_and_count 函式來合併規則
+_, target_to_merged_rule = merge_individual_rules_and_count(
+    all_target_root_rules, 
+    cat_features, 
+    1.5, 
+    feature_names_english
+)
+
+# 根據合併後的規則重新建立群組
+similar_rule_to_targets = {}
+for target, merged_rule in target_to_merged_rule.items():
+    if merged_rule not in similar_rule_to_targets:
+        similar_rule_to_targets[merged_rule] = []
+    similar_rule_to_targets[merged_rule].append(target)
+
+# 呼叫主函式來產生輸出
+run_grouping_and_generate_outputs(
+    grouping_name="grouping_similar_rule",
+    rule_to_targets_map=similar_rule_to_targets,
+    base_result_dir=result_dir
+)
+
+
+print("\n所有新分群任務已完成。")
+print(f"請檢查以下資料夾中的結果: ")
+print(f"1. {os.path.join(result_dir, 'grouping_exact_rule')}")
+print(f"2. {os.path.join(result_dir, 'grouping_similar_rule')}")
 # %%

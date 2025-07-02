@@ -306,6 +306,38 @@ class PeopleFlowDatasetCondition(Dataset):
                 selected_real_coords_np_for_grid_def,
                 self.grid_target_coords
             )
+            logger.info("正在產生匈牙利演算法網格對應表...")
+            # 建立一個從感測器名稱到其詳細資訊的查詢字典，以提高效率
+            sensor_info_dict = {info['name']: {'lon': info['lon'], 'lat': info['lat']} for info in self.selected_sensor_info}
+            
+            mapping_data = []
+            # 遍歷排序後的流量欄位 (其索引 'flat_idx' 代表網格的平面索引)
+            for flat_idx, col_name in enumerate(self.sorted_flow_columns):
+                # 從網格映射表中獲取 (R, C) 座標
+                r_idx, c_idx = self.grid_idx_to_rc_map.get(flat_idx, (None, None))
+                
+                # 從查詢字典中獲取經緯度
+                sensor_details = sensor_info_dict.get(col_name, {'lon': None, 'lat': None})
+                
+                mapping_data.append({
+                    'R': r_idx,
+                    'C': c_idx,
+                    'lon': sensor_details['lon'],
+                    'lat': sensor_details['lat'],
+                    'sensor_name': col_name  # 也儲存感測器名稱以供核對
+                })
+            
+            # 建立 DataFrame 並儲存為 Excel 檔案
+            df_mapping = pd.DataFrame(mapping_data)
+            # 檔案會儲存在 CONFIG 中指定的 save_dir 目錄下
+            mapping_excel_path = os.path.join(self.config["save_dir"], "hungarian_grid_mapping_table.xlsx")
+            try:
+                # 確保欄位順序
+                df_mapping[['R', 'C', 'lon', 'lat', 'sensor_name']].to_excel(mapping_excel_path, index=False)
+                logger.info(f"匈牙利演算法對應表已成功儲存至: {mapping_excel_path}")
+            except Exception as e:
+                logger.error(f"儲存匈牙利演算法對應表時發生錯誤: {e}")
+                
             plot_path = os.path.join(self.config["save_dir"], self.config.get("plot_grid_mapping_path", "grid_mapping_visualization.png"))
             self._plot_grid_mapping(
                 self.grid_idx_to_rc_map,

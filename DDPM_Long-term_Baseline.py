@@ -50,13 +50,13 @@ CONFIG = {
         "時", 
         "holiday", 
         "weekday", 
-        "相對溼度"
+        "date_combined"
     ],
     "condition_input_channels": 4, 
     
     # === Baseline 專家模型配置 ===
-    "model_name": "Baseline_RelativeHumidityLe705",
-    "checkpoint_path": "best_baseline_model_relative_humidity_Le_70_5.pth",
+    "model_name": "Baseline_Christmas",
+    "checkpoint_path": "best_baseline_model_christmas.pth",
 
     # === Stage2 特定配置 ===
     "stage2_new_condition_feature_column": "時", # Stage2 新條件的欄位名
@@ -75,11 +75,11 @@ CONFIG = {
     # === 過濾規則：STAGE4 專家模型 ===
     "stage4_config": {
         # --- 模式選擇: "event" 或 "feature" ---
-        "mode": "feature",  # <--- 在此切換模式: "event" (依日期) 或 "feature" (依特徵)
+        "mode": "event",  # <--- 在此切換模式: "event" (依日期) 或 "feature" (依特徵)
         
         # --- "event" 模式配置 (原邏輯) ---
         "event_filter": {
-            "file_path": r"C:\thesis\code\Taipei_CF\ArenaEvents.xlsx",
+            "file_path": r"C:\thesis\code\Taipei_CF\Christmas.xlsx",
             "year_col": "年",
             "month_col": "月",
             "day_col": "日"
@@ -94,7 +94,7 @@ CONFIG = {
         },
         
         # 指定用於【模型條件輸入】的組合特徵欄位名稱 (此設定不變)
-        "grid_feature_source_column": "相對溼度"
+        "grid_feature_source_column": "date_combined"
     },
     
     # --- DDPM 擴散參數 ---

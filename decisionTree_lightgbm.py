@@ -11,26 +11,19 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error
 from sklearn.multioutput import MultiOutputRegressor
 import re
 import time
+import matplotlib
+matplotlib.use('Agg')
 
 # ================== CONFIG 設定區塊 ==================
 CONFIG = {
     # 在此處指定要用於模型訓練的特徵（中文名稱）。
     # 將您想使用的特徵名稱加入到下面的列表中。
     # 如果要使用 `feature_mapping` 中的所有特徵，請將此列表設為 None。
-    'features_to_use': [
-        '時',
-        '日',
-        '月',
-        'weekday',      
-        'ArenaEvents',
-        'ArenaEvents_concert',
-        'ArenaEvents_others',
-        'hoilday'
-    ],
-    'features_to_use': None  # 使用所有特徵的範例，取消此行註解以啟用
+    'features_to_use': ['hoilday', 'Lantern', 'weekday'],
+    #'features_to_use': None  # 使用所有特徵的範例，取消此行註解以啟用
 }
 ENABLE_EXTERNAL_FILTER = False
-result_dir = r"C:\thesis\code\result_lgb\250624"
+result_dir = r"C:\thesis\code\result_lgb\Lantern"
 #result_dir = r"C:\thesis\code\result_lgb"
 # 外部檔案路徑和篩選條件 (僅在 ENABLE_EXTERNAL_FILTER 為 True 時才會使用)
 external_filter_file = r"C:\thesis\code\DIFFUSION_TREE\results_ddpm_stage3\Stage3_WeekdayLe4\analysis_error\std_exceed_group2_StdExceed_Neg_Top20.xlsx"
@@ -38,25 +31,44 @@ external_filter_file = r"C:\thesis\code\DIFFUSION_TREE\results_ddpm_stage3\Stage
 ind_tree_params = {
             'objective': 'regression',
             'metric': ['l2', 'l1'],
-            'boosting_type': 'gbdt',
-            'num_leaves': 63,
+            'num_leaves': 31,
             'learning_rate': 0.01,
-            'feature_fraction': 0.9,
-            'seed': 42
+            'feature_fraction': 0.9,  
+            'num_iterations': 1000,
+            'seed': 42,
+             # --- 以下為 GOSS 修改部分 ---
+            'boosting_type': 'goss',            # 1. 新增：指定使用 GOSS 演算法
+            'top_rate': 0.2,                    # 3. 新增：保留梯度最大 (誤差最大) 的前 20% 樣本
+            'other_rate': 0.1,                  # 3. 新增：從剩餘的 80% 樣本中，隨機抽樣 10%
         }
 #num_boost_round
+# shared_params = {
+#     'objective': 'regression',          # 任務目標：設定為 'regression' (回歸)，模型將以最小化L2損失（均方誤差）為目標進行學習。
+#     'metric': ['l2', 'l1'],               # 評估指標：在訓練過程中，同時監控 'l2' (MSE, 均方誤差) 和 'l1' (MAE, 平均絕對誤差) 這兩個指標。
+#     'learning_rate': 0.01,                 # 學習率：每次迭代（每棵樹）的步長縮減。較小的值有助於防止過擬合，但通常需要更多的迭代次數。
+#     'num_leaves': 31,                     # 每棵樹的最大葉子節點數：控制樹模型複雜度的主要參數。值越大，樹越複雜，越容易過擬合。31是一個常見的預設值。
+#     'min_data_in_leaf': 20,               # 每個葉子節點上最少的數據筆數：用於防止過擬合。如果一次分裂後，某個葉子節點的數據量少於此值，則不會進行這次分裂。
+#     'feature_fraction': 0.9,              # 特徵抽樣比例：在建立每棵樹之前，隨機選取90%的特徵。這可以加速訓練並有助於防止過擬合。
+#     'bagging_fraction': 0.8,              # 數據抽樣比例（不進行重採樣）：在每次迭代時，隨機選取80%的數據來訓練當前的樹。這有助於防止過擬合，也稱為子抽樣 (subsampling)。
+#     'bagging_freq': 5,                    # 數據抽樣頻率：每隔5次迭代執行一次數據抽樣（bagging）。
+#     'verbose': -1,                        # 控制輸出的詳細程度：-1 代表 'silent'（靜默模式），在訓練過程中不打印任何訊息。
+#     'num_iterations': 10000,               # 總迭代次數（樹的數量）：模型將建立的總樹木數量。這是 'n_estimators' 的別名。
+#     'early_stopping_rounds': 10,          # 提早停止的迭代次數：如果在驗證集上的評估指標連續50次迭代都沒有改善，訓練將會提早停止。此參數需要提供驗證集才能生效。
+# }
 shared_params = {
-    'objective': 'regression',          # 任務目標：設定為 'regression' (回歸)，模型將以最小化L2損失（均方誤差）為目標進行學習。
-    'metric': ['l2', 'l1'],               # 評估指標：在訓練過程中，同時監控 'l2' (MSE, 均方誤差) 和 'l1' (MAE, 平均絕對誤差) 這兩個指標。
-    'learning_rate': 0.01,                 # 學習率：每次迭代（每棵樹）的步長縮減。較小的值有助於防止過擬合，但通常需要更多的迭代次數。
-    'num_leaves': 63,                     # 每棵樹的最大葉子節點數：控制樹模型複雜度的主要參數。值越大，樹越複雜，越容易過擬合。31是一個常見的預設值。
-    'min_data_in_leaf': 20,               # 每個葉子節點上最少的數據筆數：用於防止過擬合。如果一次分裂後，某個葉子節點的數據量少於此值，則不會進行這次分裂。
-    'feature_fraction': 0.9,              # 特徵抽樣比例：在建立每棵樹之前，隨機選取90%的特徵。這可以加速訓練並有助於防止過擬合。
-    'bagging_fraction': 0.8,              # 數據抽樣比例（不進行重採樣）：在每次迭代時，隨機選取80%的數據來訓練當前的樹。這有助於防止過擬合，也稱為子抽樣 (subsampling)。
-    'bagging_freq': 5,                    # 數據抽樣頻率：每隔5次迭代執行一次數據抽樣（bagging）。
-    'verbose': -1,                        # 控制輸出的詳細程度：-1 代表 'silent'（靜默模式），在訓練過程中不打印任何訊息。
-    'num_iterations': 10000,               # 總迭代次數（樹的數量）：模型將建立的總樹木數量。這是 'n_estimators' 的別名。
-    'early_stopping_rounds': 10,          # 提早停止的迭代次數：如果在驗證集上的評估指標連續50次迭代都沒有改善，訓練將會提早停止。此參數需要提供驗證集才能生效。
+    'objective': 'regression',
+    'metric': ['l2', 'l1'],
+    'learning_rate': 0.01,
+    'num_leaves': 31,
+    'min_data_in_leaf': 20,
+    'feature_fraction': 0.9,
+    'verbose': -1,
+    'num_iterations': 1000,
+    'early_stopping_rounds': 10,
+    # --- 以下為 GOSS 修改部分 ---
+    'boosting_type': 'goss',            # 1. 新增：指定使用 GOSS 演算法
+    'top_rate': 0.2,                    # 3. 新增：保留梯度最大 (誤差最大) 的前 20% 樣本
+    'other_rate': 0.1,                  # 3. 新增：從剩餘的 80% 樣本中，隨機抽樣 10%
 }
 # ========================================================
 
@@ -91,12 +103,12 @@ feature_mapping = {
     '能見度': 'Visibility',
     '紫外線指數': 'UV_Index',
     '總雲量': 'Total_Cloud_Cover',
-    #'hoilday': 'Holiday',
-    #'weekday': 'Weekday',
+    'hoilday': 'Holiday',
+    'weekday': 'Weekday',
     #'年': 'Year',
     '月': 'Month',
     '日': 'Day',
-    #'時': 'Hour',
+    '時': 'Hour',
     'ArenaEvents': 'ArenaEvents',
     'ArenaEvents_concert': 'ArenaEvents_concert',
     'ArenaEvents_others': 'ArenaEvents_others',
@@ -296,7 +308,7 @@ X_test_tree = X_test.rename(columns=feature_mapping)
 
 # 動態定義類別特徵列表 (cat_features)
 # 首先定義所有可能的類別特徵（中文名）
-all_possible_cat_features_chinese = ['hoilday', 'ArenaEvents', 'ArenaEvents_concert', 'ArenaEvents_others', 'TombSweeping', '月', '日'] # 根據您的 feature_mapping 調整
+all_possible_cat_features_chinese = ['hoilday', 'ArenaEvents', 'ArenaEvents_concert', 'ArenaEvents_others', 'TombSweeping', '月', '日','Christmas'] # 根據您的 feature_mapping 調整
 # 從最終使用的特徵中，篩選出哪些是類別特徵
 selected_cat_features_chinese = [f for f in X.columns if f in all_possible_cat_features_chinese]
 # 將它們轉換為英文名，供 LightGBM 使用
@@ -420,7 +432,7 @@ target_mae = {}
 target_mse = {}
 target_models = {}
 target_best_tree_index = {}
-
+#%%
 print(f"訓練單獨模型...")
 individual_models_dir = os.path.join(result_dir, "individual_target_models") 
 
@@ -466,7 +478,7 @@ for target in target_columns: # 此迴圈現在只會遍歷篩選後的 target_c
         lgb_model = lgb.train(
             ind_tree_params,
             train_data,
-            num_boost_round=10000,
+            num_boost_round=1000,
             valid_sets=[test_data],
             valid_names=["valid_0"],
             callbacks=[lgb.early_stopping(stopping_rounds=10, verbose=-1), 
@@ -533,6 +545,7 @@ for target in target_columns: # 此迴圈現在只會遍歷篩選後的 target_c
 
 
     plt.figure(figsize=(30, 18))
+
     lgb.plot_tree(target_models[target], tree_index=current_best_tree_idx, show_info=['split_gain', 'data_count'])
     plt.title(f"Best Decision Tree for {target} (Highest split_gain)")
     tree_plot_path = os.path.join(result_dir, "tree", f"{safe_target_filename}.png")
@@ -556,7 +569,7 @@ for target in target_columns: # 此迴圈現在只會遍歷篩選後的 target_c
     # 提取規則的部分依賴於 target_models 和 target_best_tree_index，這些已經被正確設定
     geo_coords.append(target) 
     grid_ids.append(target)
-    
+ #%%   
 shared_result_dir = os.path.join(result_dir, "shared_model")
 
 # 建立必要的子目錄
@@ -621,12 +634,14 @@ cat_features = [feature_mapping[f] for f in X.columns if f in all_possible_cat_f
 
 train_data_shared = lgb.Dataset(X_train_expanded, label=y_train_expanded, 
                                 feature_name=english_feature_names,
-                                categorical_feature=cat_features) 
+                                categorical_feature=cat_features,
+                                free_raw_data=False) 
 
 valid_data_shared = lgb.Dataset(X_test_expanded, label=y_test_expanded, 
                                 reference=train_data_shared, 
                                 feature_name=english_feature_names,
-                                categorical_feature=cat_features) 
+                                categorical_feature=cat_features,
+                                free_raw_data=False) 
 #%%
 # 訓練共享模型
 print("開始訓練共享模型以預測所有網格...")
@@ -1344,6 +1359,8 @@ print(f"分群完成，共形成 {len(final_eight_groups_details)} 個最終群�
 
 # 整理並匯出分群結果
 output_data = []
+hierarchical_grouping_dir = os.path.join(result_dir, "grouping_hierarchical")
+os.makedirs(hierarchical_grouping_dir, exist_ok=True)
 for i, (targets_in_group, group_rules_dict) in enumerate(final_eight_groups_details):
     # 確保所有規則鍵都存在
     r1_str = format_rule_to_string(group_rules_dict.get('r1_root'), feature_names_english, reverse_mapping, cat_features)
@@ -1413,10 +1430,25 @@ for i, (targets_in_group, group_rules_dict) in enumerate(final_eight_groups_deta
         "組內座標數量": len(targets_in_group),
         "組內所有座標": ", ".join(sorted(targets_in_group)) if targets_in_group else ""
     })
+    if targets_in_group:
+        group_id = i + 1
+        individual_group_data = []
+        for target_str in targets_in_group:
+            try:
+                lon, lat = parse_coord_string(target_str)
+                # 欄位與方法二、三保持一致
+                individual_group_data.append({"R": "", "C": "", "lon": lon, "lat": lat})
+            except ValueError:
+                pass # 忽略無法解析的座標
+        
+        individual_df = pd.DataFrame(individual_group_data)
+        # 檔案會存到我們第一步建立的資料夾中
+        individual_excel_path = os.path.join(hierarchical_grouping_dir, f"hierarchical_grouping_group_{group_id}.xlsx")
+        individual_df.to_excel(individual_excel_path, index=False, engine='openpyxl')
 
 output_df = pd.DataFrame(output_data)
-output_csv_path = os.path.join(result_dir, "hierarchical_grouping_results.csv")
-output_excel_path = os.path.join(result_dir, "hierarchical_grouping_results.xlsx")
+output_csv_path = os.path.join(hierarchical_grouping_dir, "hierarchical_grouping_summary.csv")
+output_excel_path = os.path.join(hierarchical_grouping_dir, "hierarchical_grouping_summary.xlsx")
 
 output_df.to_csv(output_csv_path, index=False, encoding='utf-8-sig')
 print(f"階層式分群結果已儲存至 CSV: {output_csv_path}")
@@ -1498,7 +1530,7 @@ else:
         plt.legend(custom_handles, custom_labels, title="群組")
 
 
-grouping_plot_path = os.path.join(result_dir, "geo_hierarchical_grouping.png")
+grouping_plot_path = os.path.join(hierarchical_grouping_dir, "geo_hierarchical_grouping_summary.png")
 plt.savefig(grouping_plot_path, dpi=300, bbox_inches="tight")
 plt.close()
 print(f"階層式分群地理分佈圖已儲存至: {grouping_plot_path}")
@@ -1533,7 +1565,7 @@ for group_id in unique_group_ids:
     plt.grid(True)
 
     # 產生並儲存該組別的獨立圖檔
-    individual_group_plot_path = os.path.join(result_dir, f"geo_hierarchical_grouping_group_{group_id + 1}.png")
+    individual_group_plot_path = os.path.join(hierarchical_grouping_dir, f"geo_hierarchical_grouping_group_{group_id + 1}.png")
     plt.savefig(individual_group_plot_path, dpi=300, bbox_inches="tight")
     plt.close() # 關閉當前圖形，以便在下一次迴圈中創建新圖
     print(f"  組別 {group_id + 1} 的地理分佈圖已儲存至: {individual_group_plot_path}")

@@ -5,15 +5,15 @@ const DecisionTreeArchitecture = () => {
     <div className="p-6 bg-gray-50 min-h-screen flex justify-center items-center">
       <div className="bg-white shadow-xl rounded-lg p-8 w-full max-w-4xl">
         <h1 className="text-2xl font-bold text-center mb-12">
-          Decision Tree Diffusion Model Architecture
+          Hierarchical Decision Diffusion Model
         </h1>
         
         <div className="relative">
           {/* Root Node - Main Diffusion Model */}
           <div className="flex justify-center mb-8">
             <div className="bg-blue-600 text-white p-4 rounded-lg shadow-md z-10 text-center w-64">
-              <h2 className="font-semibold text-lg">Main Diffusion Model</h2>
-              <p className="text-sm">Root Decision Tree</p>
+              <h2 className="font-semibold text-lg">Main Backbone Diffusion Model</h2>
+              <p className="text-sm">Central Decision Tree Structure</p>
             </div>
           </div>
 
@@ -29,8 +29,7 @@ const DecisionTreeArchitecture = () => {
               
               {/* Branch Node */}
               <div className="bg-green-500 text-white p-4 rounded-lg shadow-md text-center">
-                <h3 className="font-semibold">Diffusion Model 1</h3>
-                <p className="text-sm">Left Decision Branch</p>
+                <h3 className="font-semibold">Branch Diffusion Model A</h3>
               </div>
 
               {/* Sub-branches */}
@@ -39,7 +38,7 @@ const DecisionTreeArchitecture = () => {
                 <div className="relative w-24">
                   <div className="absolute -top-8 left-1/2 w-1 h-8 bg-gray-300 transform -translate-x-1/2"></div>
                   <div className="bg-green-200 p-3 rounded-lg text-center">
-                    <p className="text-sm text-green-800">Sub-Model A1</p>
+                    <p className="text-sm text-green-800">Leaf Diffusion Model 1</p>
                   </div>
                 </div>
 
@@ -47,7 +46,7 @@ const DecisionTreeArchitecture = () => {
                 <div className="relative w-24">
                   <div className="absolute -top-8 left-1/2 w-1 h-8 bg-gray-300 transform -translate-x-1/2"></div>
                   <div className="bg-green-200 p-3 rounded-lg text-center">
-                    <p className="text-sm text-green-800">Sub-Model A2</p>
+                    <p className="text-sm text-green-800">Leaf Diffusion Model 2</p>
                   </div>
                 </div>
               </div>
@@ -60,8 +59,7 @@ const DecisionTreeArchitecture = () => {
               
               {/* Branch Node */}
               <div className="bg-purple-500 text-white p-4 rounded-lg shadow-md text-center">
-                <h3 className="font-semibold">Diffusion Model 2</h3>
-                <p className="text-sm">Right Decision Branch</p>
+                <h3 className="font-semibold">Branch Diffusion Model B</h3>
               </div>
 
               {/* Sub-branches */}
@@ -70,7 +68,7 @@ const DecisionTreeArchitecture = () => {
                 <div className="relative w-24">
                   <div className="absolute -top-8 left-1/2 w-1 h-8 bg-gray-300 transform -translate-x-1/2"></div>
                   <div className="bg-purple-200 p-3 rounded-lg text-center">
-                    <p className="text-sm text-purple-800">Sub-Model B1</p>
+                    <p className="text-sm text-purple-800">Leaf Diffusion Model 3</p>
                   </div>
                 </div>
 
@@ -78,7 +76,7 @@ const DecisionTreeArchitecture = () => {
                 <div className="relative w-24">
                   <div className="absolute -top-8 left-1/2 w-1 h-8 bg-gray-300 transform -translate-x-1/2"></div>
                   <div className="bg-purple-200 p-3 rounded-lg text-center">
-                    <p className="text-sm text-purple-800">Sub-Model B2</p>
+                    <p className="text-sm text-purple-800">Leaf Diffusion Model 4</p>
                   </div>
                 </div>
               </div>
